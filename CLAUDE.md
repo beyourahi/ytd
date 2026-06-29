@@ -16,6 +16,11 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
   subscription the constraint is the **usage window**, not tokens — so transcripts are
   batched (~100k tokens/call) to keep call count low. On a usage-limit hit the run
   pauses and resumes from the manifest.
+- **Reduce is paged + structured (don't revert):** reduce runs in `reduceBatchChars`-bounded
+  passes (kept principles carried forward for dedup) so the prompt can't crowd Opus's window and
+  truncate the JSON. It returns small fields (`{theme, principle, ids}` + `halalNotes`); `renderBatch`
+  (palace.ts) assembles all markdown — theme sections, sorted `[Mn]` citations, halal gate —
+  deterministically. The model does judgment; code does formatting.
 - **Resumable**: a per-channel `bun:sqlite` manifest tracks each video
   `pending → fetched → distilled → done` (+ `no_captions` / `failed`). Re-running the
   same command continues where it stopped; safe to Ctrl-C anytime.
@@ -39,7 +44,7 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
 
 ```bash
 bun install && bun link            # one-time; exposes `ytd` globally
-bun test                           # pure-function self-checks (json3, JSON extract, [Mn] scan, render, append)
+bun test                           # pure-function self-checks (json3, JSON extract, [Mn] scan, candidate chunking, render, append)
 bun run check                      # tsc --noEmit
 bun run lint                       # prettier --check . && eslint .
 bun run format                     # prettier --write .
@@ -63,6 +68,6 @@ imports (Bun). Conventional Commits, **no AI co-author**.
   `**/field-notes.md` for the max and assigns max+1.
 - A run can touch **several rooms** — one source video gets one global `[Mn]` but may be
   cited (and source-logged) in multiple rooms; each room is appended + committed separately.
-- Every room's batch ends with a `## ⚠️ Halal gate` section (the reduce prompt enforces it).
+- Every room's batch ends with a `## ⚠️ Halal gate` section (`renderBatch` always emits it, from the reduce's `halalNotes[]` — even when empty).
 - Commit message (per room): `docs(field-notes): ingest <channel> → <room>`.
 - Never write secrets/PII (the palace's pre-commit hook also blocks them).
