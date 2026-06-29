@@ -1,5 +1,7 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { claudePrompt } from "./claude.ts";
-import { DEFAULTS } from "./config.ts";
+import { DEFAULTS, RUN_DIR } from "./config.ts";
 
 export interface Transcript {
 	id: string;
@@ -49,6 +51,41 @@ export function extractJson<T>(text: string): T | null {
 		}
 	}
 	return null;
+}
+
+/**
+ * Run a prompt and parse its JSON, retrying on a non-conforming sample. The prompt
+ * reliably produces valid JSON, but `claude -p` is sampled — an occasional response
+ * adds a preamble/postscript or a half-truncated code fence that defeats extractJson.
+ * One bad sample shouldn't abort a whole run, so retry a few times; on total failure
+ * dump the last raw response to ~/.ytd/run/<label>.fail.txt so we're never blind again.
+ * A genuine claude error (or usage limit) is surfaced immediately, not retried as a parse fail.
+ */
+async function claudeJson<T>(
+	prompt: string,
+	valid: (o: T) => boolean,
+	label: string,
+	attempts = 3
+): Promise<{ obj?: T; limited?: boolean; error?: string }> {
+	let lastText = "";
+	for (let a = 1; a <= attempts; a++) {
+		const res = await claudePrompt(prompt);
+		if (res.limited) return { limited: true };
+		if (!res.ok) return { error: res.error };
+		lastText = res.text ?? "";
+		const obj = extractJson<T>(lastText);
+		if (obj && valid(obj)) return { obj };
+		// non-conforming sample — try again with a fresh draw
+	}
+	try {
+		mkdirSync(RUN_DIR, { recursive: true });
+		writeFileSync(join(RUN_DIR, `${label}.fail.txt`), lastText);
+	} catch {
+		/* best-effort diagnostics — never mask the real error */
+	}
+	return {
+		error: `could not parse ${label} JSON after ${attempts} attempts (raw saved to ~/.ytd/run/${label}.fail.txt)`
+	};
 }
 
 /** Group transcripts into batches that fit comfortably in one Opus call. */
@@ -109,14 +146,12 @@ export async function mapBatch(
 	batch: Transcript[]
 ): Promise<{ candidates: Candidate[]; limited?: boolean; error?: string }> {
 	const prompt = `${MAP_INSTRUCTIONS}\n\n=== TRANSCRIPTS ===\n\n${renderTranscripts(batch)}`;
-	const res = await claudePrompt(prompt);
-	if (res.limited) return { candidates: [], limited: true };
-	if (!res.ok) return { candidates: [], error: res.error };
+	const r = await claudeJson<Candidate[]>(prompt, (a) => Array.isArray(a), "map");
+	if (r.limited) return { candidates: [], limited: true };
+	if (r.error || !r.obj) return { candidates: [], error: r.error ?? "could not parse map JSON" };
 
-	const arr = extractJson<Candidate[]>(res.text ?? "");
-	if (!Array.isArray(arr)) return { candidates: [], error: "could not parse map JSON" };
 	const ids = new Set(batch.map((b) => b.id));
-	return { candidates: arr.filter((c) => c?.principle && ids.has(c.sourceId)) };
+	return { candidates: r.obj.filter((c) => c?.principle && ids.has(c.sourceId)) };
 }
 
 function reducePrompt(
@@ -183,16 +218,15 @@ export async function reduce(
 
 	for (let i = 0; i < chunks.length; i++) {
 		onPass?.(i + 1, chunks.length);
-		const res = await claudePrompt(reducePrompt(channel, allFieldNotes, chunks[i], keptTitles));
-		if (res.limited) return { limited: true };
-		if (!res.ok) return { error: res.error };
+		const pass = await claudeJson<ReduceOutput>(
+			reducePrompt(channel, allFieldNotes, chunks[i], keptTitles),
+			(o) => Array.isArray(o.rooms),
+			`reduce-pass-${i + 1}`
+		);
+		if (pass.limited) return { limited: true };
+		if (pass.error || !pass.obj) return { error: pass.error ?? "reduce failed" };
 
-		const obj = extractJson<ReduceOutput>(res.text ?? "");
-		if (!obj || !Array.isArray(obj.rooms)) {
-			return { error: `could not parse reduce JSON (pass ${i + 1}/${chunks.length})` };
-		}
-
-		for (const r of obj.rooms) {
+		for (const r of pass.obj.rooms) {
 			if (!r || typeof r.room !== "string" || !Array.isArray(r.principles)) continue;
 			const principles = r.principles.filter(
 				(p) =>
