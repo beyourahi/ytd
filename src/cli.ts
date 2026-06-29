@@ -178,9 +178,11 @@ async function main(): Promise<void> {
 	const candidates = loadCandidates(slug);
 	if (!candidates.length) return finalReport(manifest, null);
 
-	// 4. DISTILL — reduce: auto-route to a room + dedupe vs ALL palace notes + halal-gate
+	// 4. DISTILL — reduce: smart-route + dedupe vs palace notes + halal-gate (bounded passes)
 	console.log(`  distill·reduce over ${candidates.length} candidate principles ...`);
-	const red = await reduce(candidates, slug, await loadAllFieldNotes());
+	const red = await reduce(candidates, slug, await loadAllFieldNotes(), (pass, total) =>
+		console.log(`  distill·reduce pass ${pass}/${total} ...`)
+	);
 	if (red.limited) return pauseForLimit(manifest);
 	if (red.error || !red.out) {
 		console.error(`reduce failed: ${red.error}`);
@@ -188,7 +190,10 @@ async function main(): Promise<void> {
 	}
 
 	const titles = new Map(manifest.all().map((v) => [v.id, v.title ?? v.id]));
-	const contributing = red.out.contributingVideoIds.filter((id) => titles.has(id));
+	// every videoId that contributed at least one kept principle, in first-seen order
+	const contributing = [
+		...new Set(red.out.rooms.flatMap((r) => r.principles.flatMap((p) => p.ids)))
+	].filter((id) => titles.has(id));
 
 	if (!contributing.length) {
 		for (const v of manifest.byStatus("distilled")) manifest.setStatus(v.id, "done");
@@ -205,7 +210,9 @@ async function main(): Promise<void> {
 	const written: Room[] = [];
 	for (const rb of red.out.rooms) {
 		if (!(ROOMS as readonly string[]).includes(rb.room)) continue;
-		if (!/\{\{id:/.test(rb.batchMarkdown)) continue; // skip a room with no real citations
+		// keep only principles that cite at least one resolvable [Mn]; skip empty rooms
+		const principles = rb.principles.filter((p) => p.ids.some((id) => idToM.has(id)));
+		if (!principles.length) continue;
 		const room = rb.room as Room;
 		const path = await appendBatch({
 			room,
@@ -214,7 +221,8 @@ async function main(): Promise<void> {
 			dateStr,
 			idToM,
 			titles,
-			batchMarkdown: rb.batchMarkdown
+			principles,
+			halalNotes: rb.halalNotes
 		});
 		await commitPalace(room, slug);
 		console.log(`   → ${path}`);

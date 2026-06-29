@@ -25,6 +25,11 @@ export const DEFAULTS = {
 	// to minimize the NUMBER of `claude -p` calls (usage windows, not tokens, are the limit).
 	// ~4 chars/token → 400k chars ≈ 100k tokens, comfortable inside Opus's 1M context.
 	mapBatchChars: 400_000,
+	// reduce runs in bounded passes so the prompt (candidates + all room field-notes)
+	// never crowds Opus's 200k window — that left no room for the answer and the JSON
+	// came back truncated. ~180k chars of candidates/pass keeps input well under budget.
+	// ponytail: 180k assumes the 4 target rooms' notes stay < ~120k tokens; excerpt them if they ever balloon.
+	reduceBatchChars: 180_000,
 	sleepRequests: 1, // yt-dlp --sleep-requests, gentle on the residential IP
 	// Failed fetches are retried at the end of the fetch phase before the report.
 	retryRounds: 3,

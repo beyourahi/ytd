@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { json3ToText } from "../src/fetch.ts";
-import { extractJson } from "../src/distill.ts";
+import { chunkCandidates, extractJson, type Candidate } from "../src/distill.ts";
 import { maxMInText, renderBatch, safeAppend } from "../src/palace.ts";
 
 test("json3ToText concatenates segments and drops timing/whitespace", () => {
@@ -27,7 +27,7 @@ test("extractJson survives code fences and surrounding prose", () => {
 	expect(extractJson<number[]>("here: [1,2,3] done")).toEqual([1, 2, 3]);
 });
 
-test("renderBatch maps {{id}}→global [Mn], lists only cited sources for the room", () => {
+test("renderBatch groups by theme, cites global [Mn] sorted, lists only cited sources", () => {
 	const out = renderBatch({
 		room: "content",
 		channel: "testchan",
@@ -36,21 +36,40 @@ test("renderBatch maps {{id}}→global [Mn], lists only cited sources for the ro
 		idToM: new Map([
 			["AAA", 51],
 			["BBB", 52],
-			["CCC", 53] // global id NOT cited in this room's body
+			["CCC", 53] // global id NOT cited in this room → must not appear
 		]),
 		titles: new Map([
 			["AAA", "Vid A"],
 			["BBB", "Vid B"],
 			["CCC", "Vid C"]
 		]),
-		batchMarkdown: "## A. Theme\n- one {{id:AAA}}\n- two {{id:BBB}} {{id:AAA}}\n"
+		principles: [
+			{ theme: "Theme", principle: "one", ids: ["AAA"] },
+			{ theme: "Theme", principle: "two", ids: ["BBB", "AAA"] } // out-of-order ids → sorted
+		],
+		halalNotes: []
 	});
 	expect(out).toContain("# ═══ testchan → content");
+	expect(out).toContain("## A. Theme");
 	expect(out).toContain('**[M51]** "Vid A"');
 	expect(out).toContain("- one [M51]");
-	expect(out).toContain("- two [M52] [M51]");
+	expect(out).toContain("- two [M51] [M52]"); // ids sorted by [Mn]
+	expect(out).toContain("## ⚠️ Halal gate"); // present even when halalNotes is empty
 	expect(out).not.toContain("{{id:");
 	expect(out).not.toContain("M53"); // CCC is not cited here → not in this room's sources
+});
+
+test("chunkCandidates splits by char budget, keeps every candidate exactly once", () => {
+	const cands: Candidate[] = Array.from({ length: 10 }, (_, i) => ({
+		principle: `p${i}`,
+		detail: "x".repeat(100),
+		theme: "t",
+		sourceId: `v${i}`
+	}));
+	const chunks = chunkCandidates(cands, 300); // each candidate ~140 chars → ~2 per chunk
+	expect(chunks.length).toBeGreaterThan(1);
+	expect(chunks.flat().length).toBe(10); // nothing dropped or duplicated
+	expect(chunks.flat().map((c) => c.principle)).toEqual(cands.map((c) => c.principle));
 });
 
 test("safeAppend is append-only and integrity-checked", async () => {

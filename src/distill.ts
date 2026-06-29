@@ -1,4 +1,5 @@
 import { claudePrompt } from "./claude.ts";
+import { DEFAULTS } from "./config.ts";
 
 export interface Transcript {
 	id: string;
@@ -13,14 +14,22 @@ export interface Candidate {
 	sourceId: string;
 }
 
-export interface RoomBatch {
+/** One kept principle, room-scoped. The model returns small structured fields; the
+ *  markdown (themed sections, [Mn] citations, halal-gate) is rendered downstream. */
+export interface ReducedPrinciple {
+	theme: string; // 2-4 word topic, used to group into sections
+	principle: string; // one terse, applicable sentence
+	ids: string[]; // the videoId(s) this principle is drawn from
+}
+
+export interface ReducedRoom {
 	room: string; // content | craft | business | design-systems
-	batchMarkdown: string;
+	principles: ReducedPrinciple[];
+	halalNotes: string[]; // anything borderline reframed/rejected, and why
 }
 
 export interface ReduceOutput {
-	contributingVideoIds: string[];
-	rooms: RoomBatch[]; // wisdom smart-routed across one or more palace rooms
+	rooms: ReducedRoom[]; // wisdom smart-routed across one or more palace rooms
 }
 
 /** Best-effort JSON extraction from a model response (handles code fences / stray prose). */
@@ -61,6 +70,26 @@ export function batchTranscripts(transcripts: Transcript[], maxChars: number): T
 	return batches;
 }
 
+/** Split candidates into reduce passes that fit comfortably in one Opus call alongside
+ *  the existing field-notes — bounding input so the answer never gets truncated. */
+export function chunkCandidates(candidates: Candidate[], maxChars: number): Candidate[][] {
+	const chunks: Candidate[][] = [];
+	let cur: Candidate[] = [];
+	let size = 0;
+	for (const c of candidates) {
+		const len = JSON.stringify(c).length + 1;
+		if (size + len > maxChars && cur.length) {
+			chunks.push(cur);
+			cur = [];
+			size = 0;
+		}
+		cur.push(c);
+		size += len;
+	}
+	if (cur.length) chunks.push(cur);
+	return chunks;
+}
+
 const MAP_INSTRUCTIONS = `You are distilling YouTube transcripts into applicable principles for a personal knowledge base ("field notes").
 
 For the transcripts below, extract every genuinely useful, ACTIONABLE principle, mental model, tactic, framework, or non-obvious insight a creator/operator could apply. Ignore filler, intros/outros, sponsor reads, self-promotion, and small talk. Prefer specific, concrete, transferable wisdom over generic advice.
@@ -90,10 +119,19 @@ export async function mapBatch(
 	return { candidates: arr.filter((c) => c?.principle && ids.has(c.sourceId)) };
 }
 
-function reducePrompt(channel: string, allFieldNotes: string, candidates: Candidate[]): string {
+function reducePrompt(
+	channel: string,
+	allFieldNotes: string,
+	candidates: Candidate[],
+	alreadyKept: string[]
+): string {
+	const keptBlock = alreadyKept.length
+		? `\n=== ALREADY KEPT EARLIER THIS RUN (do NOT repeat or restate these) ===\n${alreadyKept.map((p) => `- ${p}`).join("\n")}\n`
+		: "";
+
 	return `You are merging distilled principles into Rahi's mind-palace "field notes" — a curated, high-signal knowledge base.
 
-GOVERNING RULE — HALAL GATE (highest priority). Rahi is a practicing Muslim who follows the Qur'an and the authentic Sunnah only. Every principle you keep MUST be halal wisdom (ḥikmah). Drop or reframe anything that depends on or promotes the haram (riba/interest, gambling, deception/gharar, immodesty, music-as-an-end, dishonest persuasion, etc.). Keep the transferable insight; discard the haram framing. End your output with a "## ⚠️ Halal gate" section noting anything borderline you reframed or rejected and why (cite Qur'an/Sunnah where the evidence is clear; say so plainly when it is not).
+GOVERNING RULE — HALAL GATE (highest priority). Rahi is a practicing Muslim who follows the Qur'an and the authentic Sunnah only. Every principle you keep MUST be halal wisdom (ḥikmah). Drop or reframe anything that depends on or promotes the haram (riba/interest, gambling, deception/gharar, immodesty, music-as-an-end, dishonest persuasion, etc.). Keep the transferable insight; discard the haram framing.
 
 ROUTING — smartly split the kept principles ACROSS Rahi's palace rooms by what each principle is actually about. Most channels land mostly in ONE room, but send any principle that clearly belongs elsewhere to its own room (the SAME source video may appear in several rooms). Rooms:
 - "content": creator economy, content/social-media strategy, audience growth, brand, marketing, copywriting, storytelling
@@ -102,51 +140,79 @@ ROUTING — smartly split the kept principles ACROSS Rahi's palace rooms by what
 - "design-systems": visual design, UI/UX, typography, layout, design tokens, brand visual identity
 Only include a room that actually has ≥1 kept principle. If everything fits one room, return just that one.
 
-DEDUPE — ONLY NET-NEW. ALL of Rahi's existing field notes (every room) are below. Do NOT repeat anything already covered anywhere there. Merge near-duplicate candidates into a single sharp principle. Keep only genuinely new, non-obvious, applicable wisdom. Quality over quantity — a tight set of strong principles beats a long redundant list. It is fine to keep very few (or zero) if little is net-new.
+DEDUPE — ONLY NET-NEW. ALL of Rahi's existing field notes are below. Do NOT repeat anything already covered there, nor anything in "ALREADY KEPT EARLIER THIS RUN". Merge near-duplicate candidates into a single sharp principle. Keep only genuinely new, non-obvious, applicable wisdom. Quality over quantity — a tight set of strong principles beats a long redundant list. It is fine to keep very few (or zero) if little is net-new.
 
-OUTPUT — return ONLY a JSON object (no prose, no code fence) with exactly two keys:
+OUTPUT — return ONLY a JSON object (no prose, no code fence) of this exact shape:
 {
-  "contributingVideoIds": ["<videoId>", ...],
   "rooms": [
-    { "room": "<content|craft|business|design-systems>", "batchMarkdown": "<themed sections for THIS room only>" }
+    {
+      "room": "<content|craft|business|design-systems>",
+      "principles": [
+        { "theme": "<2-4 word topic>", "principle": "<ONE terse, specific, applicable sentence>", "ids": ["<videoId>", ...] }
+      ],
+      "halalNotes": ["<short note on anything borderline you reframed or rejected, and why — cite Qur'an/Sunnah where the evidence is clear; say so plainly when it is not>"]
+    }
   ]
 }
-"contributingVideoIds" = every videoId that contributed at least one KEPT principle (across all rooms).
-Each room's "batchMarkdown" = themed sections for THAT room only:
-## A. <Theme title>
-- <principle — specific, applicable, terse>. {{id:VIDEOID}}
-- ...
-## ⚠️ Halal gate
-- <notes for this room's principles>
-
-Put a "## ⚠️ Halal gate" section inside EACH room's batchMarkdown (covering that room's principles). Cite each bullet with the literal token {{id:VIDEOID}} using the REAL videoId (a bullet synthesised from several videos may carry several {{id:...}} tokens). Do NOT invent [M..] numbers — use only {{id:...}} tokens; the numbering is assigned downstream.
+RULES for the JSON:
+- "principle" is plain text — NO markdown, NO [M..] numbers, NO citation tokens. Keep it to one sentence.
+- "ids" lists the REAL videoId(s) the principle came from (a principle synthesised from several videos lists several). Use only ids that appear in the candidates below.
+- "halalNotes" may be [] if nothing was borderline.
+- Group related principles by giving them the same "theme" — they become one section downstream.
 
 CHANNEL: ${channel}
-
-=== EXISTING FIELD NOTES — ALL ROOMS (do not duplicate anything here) ===
+${keptBlock}
+=== EXISTING FIELD NOTES — TARGET ROOMS (do not duplicate anything here) ===
 ${allFieldNotes || "(none yet)"}
 
 === CANDIDATE PRINCIPLES (JSON) ===
 ${JSON.stringify(candidates)}`;
 }
 
+/** Reduce in bounded passes (input never crowds the context window), carrying kept
+ *  principle titles forward so later passes still dedup. Merges per room. */
 export async function reduce(
 	candidates: Candidate[],
 	channel: string,
-	allFieldNotes: string
+	allFieldNotes: string,
+	onPass?: (pass: number, total: number) => void
 ): Promise<{ out?: ReduceOutput; limited?: boolean; error?: string }> {
-	const res = await claudePrompt(reducePrompt(channel, allFieldNotes, candidates));
-	if (res.limited) return { limited: true };
-	if (!res.ok) return { error: res.error };
+	const chunks = chunkCandidates(candidates, DEFAULTS.reduceBatchChars);
+	const byRoom = new Map<string, ReducedRoom>();
+	const keptTitles: string[] = [];
 
-	const obj = extractJson<ReduceOutput>(res.text ?? "");
-	if (
-		!obj ||
-		!Array.isArray(obj.contributingVideoIds) ||
-		!Array.isArray(obj.rooms) ||
-		!obj.rooms.every((r) => r && typeof r.room === "string" && typeof r.batchMarkdown === "string")
-	) {
-		return { error: "could not parse reduce JSON" };
+	for (let i = 0; i < chunks.length; i++) {
+		onPass?.(i + 1, chunks.length);
+		const res = await claudePrompt(reducePrompt(channel, allFieldNotes, chunks[i], keptTitles));
+		if (res.limited) return { limited: true };
+		if (!res.ok) return { error: res.error };
+
+		const obj = extractJson<ReduceOutput>(res.text ?? "");
+		if (!obj || !Array.isArray(obj.rooms)) {
+			return { error: `could not parse reduce JSON (pass ${i + 1}/${chunks.length})` };
+		}
+
+		for (const r of obj.rooms) {
+			if (!r || typeof r.room !== "string" || !Array.isArray(r.principles)) continue;
+			const principles = r.principles.filter(
+				(p) =>
+					p &&
+					typeof p.principle === "string" &&
+					p.principle.trim() &&
+					typeof p.theme === "string" &&
+					Array.isArray(p.ids) &&
+					p.ids.length > 0
+			);
+			if (!principles.length) continue;
+			const room = byRoom.get(r.room) ?? { room: r.room, principles: [], halalNotes: [] };
+			room.principles.push(...principles);
+			if (Array.isArray(r.halalNotes)) {
+				room.halalNotes.push(...r.halalNotes.filter((n) => typeof n === "string" && n.trim()));
+			}
+			byRoom.set(r.room, room);
+			for (const p of principles) keptTitles.push(p.principle);
+		}
 	}
-	return { out: obj };
+
+	return { out: { rooms: [...byRoom.values()] } };
 }

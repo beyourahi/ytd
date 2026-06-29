@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { PALACE_DIR, type Room } from "./config.ts";
+import type { ReducedPrinciple } from "./distill.ts";
 
 export interface RenderInput {
 	room: Room;
@@ -9,7 +10,8 @@ export interface RenderInput {
 	dateStr: string;
 	idToM: Map<string, number>; // GLOBAL videoId → [Mn] (shared across rooms this run)
 	titles: Map<string, string>; // videoId → title
-	batchMarkdown: string; // body with {{id:VIDEOID}} citation placeholders
+	principles: ReducedPrinciple[]; // structured, room-scoped (theme/principle/ids)
+	halalNotes: string[]; // halal-gate notes for this room's principles
 }
 
 export function fieldNotesPath(room: Room): string {
@@ -41,25 +43,51 @@ export async function globalMaxM(): Promise<number> {
 	return max;
 }
 
-/** Pure: build ONE room's field-notes section (no file IO). Substitutes the {{id:..}}
- *  citations to their GLOBAL [Mn] and emits a Sources-logged block listing only the
- *  videos actually cited in THIS room — in the palace's exact style. */
+/** Pure: build ONE room's field-notes section (no file IO) from structured principles.
+ *  Groups by theme into lettered sections, cites each bullet with the GLOBAL [Mn], and
+ *  emits a Sources-logged block listing only the videos cited in THIS room — palace style. */
 export function renderBatch(o: RenderInput): string {
-	// videos cited in this room's body, de-duped, in [Mn] order
-	const cited: string[] = [];
-	const seen = new Set<string>();
-	for (const m of o.batchMarkdown.matchAll(/\{\{id:([\w-]+)\}\}/g)) {
-		const id = m[1];
-		if (!seen.has(id) && o.idToM.has(id)) {
-			seen.add(id);
-			cited.push(id);
-		}
-	}
-	cited.sort((a, b) => o.idToM.get(a)! - o.idToM.get(b)!);
+	// ids → "[M51] [M52]" (known ids only, de-duped, sorted by [Mn])
+	const cite = (ids: string[]): string =>
+		[...new Set(ids)]
+			.filter((id) => o.idToM.has(id))
+			.map((id) => o.idToM.get(id)!)
+			.sort((a, b) => a - b)
+			.map((m) => `[M${m}]`)
+			.join(" ");
 
-	const body = o.batchMarkdown.replace(/\{\{id:([\w-]+)\}\}/g, (_, id: string) =>
-		o.idToM.has(id) ? `[M${o.idToM.get(id)}]` : `[?${id}]`
-	);
+	// group principles by theme, preserving first-seen order
+	const order: string[] = [];
+	const byTheme = new Map<string, ReducedPrinciple[]>();
+	for (const p of o.principles) {
+		const theme = p.theme.trim() || "General";
+		if (!byTheme.has(theme)) {
+			byTheme.set(theme, []);
+			order.push(theme);
+		}
+		byTheme.get(theme)!.push(p);
+	}
+
+	const sections = order
+		.map((theme, i) => {
+			const label = i < 26 ? String.fromCharCode(65 + i) : String(i + 1);
+			const bullets = byTheme
+				.get(theme)!
+				.map((p) => `- ${p.principle.trim()} ${cite(p.ids)}`.trimEnd())
+				.join("\n");
+			return `## ${label}. ${theme}\n${bullets}`;
+		})
+		.join("\n\n");
+
+	const halal = o.halalNotes.length
+		? o.halalNotes.map((n) => `- ${n.trim()}`).join("\n")
+		: "- Nothing borderline; all kept principles are general halal wisdom (ḥikmah).";
+	const body = `${sections}\n\n## ⚠️ Halal gate\n${halal}`;
+
+	// videos cited in this room, de-duped, in [Mn] order
+	const cited = [...new Set(o.principles.flatMap((p) => p.ids))]
+		.filter((id) => o.idToM.has(id))
+		.sort((a, b) => o.idToM.get(a)! - o.idToM.get(b)!);
 
 	const sources = cited
 		.map(
