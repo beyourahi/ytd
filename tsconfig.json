@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"lib": ["ESNext"],
+		"module": "ESNext",
+		"target": "ESNext",
+		"moduleResolution": "bundler",
+		"types": ["bun-types"],
+		"strict": true,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"allowImportingTsExtensions": true,
+		"resolveJsonModule": true,
+		"forceConsistentCasingInFileNames": true,
+		"noEmit": true
+	},
+	"include": ["src", "test"]
+}
