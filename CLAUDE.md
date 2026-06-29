@@ -16,11 +16,15 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
   subscription the constraint is the **usage window**, not tokens — so transcripts are
   batched (~100k tokens/call) to keep call count low. On a usage-limit hit the run
   pauses and resumes from the manifest.
-- **Reduce is paged + structured (don't revert):** reduce runs in `reduceBatchChars`-bounded
-  passes (kept principles carried forward for dedup) so the prompt can't crowd Opus's window and
-  truncate the JSON. It returns small fields (`{theme, principle, ids}` + `halalNotes`); `renderBatch`
-  (palace.ts) assembles all markdown — theme sections, sorted `[Mn]` citations, halal gate —
-  deterministically. The model does judgment; code does formatting.
+- **Reduce is structured + retried (don't revert):** every `claude -p` JSON call goes through
+  `claudeJson` (distill.ts), which **retries on a non-conforming sample** and dumps the last raw
+  response to `~/.ytd/run/<label>.fail.txt` on total failure. This is the real fix for the historic
+  `could not parse reduce JSON` aborts — the prompt reliably yields valid JSON, but a single chatty
+  or truncated draw used to kill the whole run. Reduce also runs in `reduceBatchChars`-bounded passes
+  (kept principles carried forward for dedup) — this bounds each call's **output** size, not input
+  (the full prompt is only ~133k tokens, well inside Opus's 200k window). It returns small fields
+  (`{theme, principle, ids}` + `halalNotes`); `renderBatch` (palace.ts) assembles all markdown — theme
+  sections, sorted `[Mn]` citations, halal gate — deterministically. The model does judgment; code does formatting.
 - **Resumable**: a per-channel `bun:sqlite` manifest tracks each video
   `pending → fetched → distilled → done` (+ `no_captions` / `failed`). Re-running the
   same command continues where it stopped; safe to Ctrl-C anytime.
@@ -32,6 +36,19 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
   (neutral cwd for `claude -p`).
 - **Palace writes are append-only** with a read-back integrity check, one commit per
   batch (git = the undo button). The palace's own `post-commit` hook does the push.
+
+## Source layout
+
+`src/`, ~1k lines, no runtime deps. Each file owns one phase:
+
+- `cli.ts` — orchestrator: enumerate → fetch (+retry) → distill → route → append + commit, with progress + the end report.
+- `enumerate.ts` — yt-dlp channel listing → `{id, title}` across the videos + shorts tabs.
+- `fetch.ts` — yt-dlp per-video json3 captions → plain-text cache; `json3ToText` strips timing.
+- `manifest.ts` — per-channel `bun:sqlite` `Manifest`: the `pending → fetched → distilled → done` (+ `no_captions`/`failed`) state machine.
+- `distill.ts` — map/reduce: `mapBatch`, `reduce`, `claudeJson` (retry+dump), `batchTranscripts`/`chunkCandidates`/`extractJson`.
+- `claude.ts` — `claudePrompt`: single-turn tool-free `claude -p` wrapper + usage-limit detection.
+- `palace.ts` — `renderBatch` / `globalMaxM` / `appendBatch` (integrity-checked) / `commitPalace`.
+- `config.ts` — `DEFAULTS`, `~/.ytd` + palace paths, `ROOMS`, `jsRuntimeArgs`.
 
 ## Dependencies
 
