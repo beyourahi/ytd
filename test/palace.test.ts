@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
-import { json3ToText } from "../src/fetch.ts";
+import { json3ToText, infoSections } from "../src/fetch.ts";
 import { chunkCandidates, extractJson, type Candidate } from "../src/distill.ts";
 import { maxMInText, renderBatch, safeAppend } from "../src/palace.ts";
 import { parseVideoId, resolveSingleMeta } from "../src/enumerate.ts";
@@ -16,6 +16,22 @@ test("json3ToText concatenates segments and drops timing/whitespace", () => {
 		]
 	});
 	expect(json3ToText(raw)).toBe("hello world again");
+});
+
+test("infoSections appends description + only the pinned comment, tolerates junk", () => {
+	const raw = JSON.stringify({
+		description: "  Resources: https://x.com  ",
+		comments: [
+			{ text: "great vid", is_pinned: false },
+			{ text: "  Full notes: https://notes.io  ", is_pinned: true }
+		]
+	});
+	const out = infoSections(raw);
+	expect(out).toBe(
+		"[DESCRIPTION]\nResources: https://x.com\n\n[PINNED COMMENT]\nFull notes: https://notes.io"
+	);
+	expect(infoSections("{not json")).toBe(""); // never throws
+	expect(infoSections(JSON.stringify({ comments: [{ text: "hi" }] }))).toBe(""); // no pinned, no desc
 });
 
 test("maxMInText finds the global max across [Mn] and [M-00n]", () => {

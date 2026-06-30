@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { CACHE_DIR, DEFAULTS, jsRuntimeArgs } from "./config.ts";
 
@@ -16,6 +16,33 @@ export function json3ToText(raw: string): string {
 		}
 	}
 	return parts.join("").replace(/\s+/g, " ").trim();
+}
+
+interface InfoJson {
+	description?: string;
+	comments?: { text?: string; is_pinned?: boolean }[];
+}
+
+/**
+ * Pull the off-screen context yt-dlp's --write-info-json/--write-comments captured:
+ * the video description and the creator's pinned comment — where the resources/links
+ * narration says are "in the description" actually live, and what purely-visual Shorts
+ * say in text instead of audio. Returns a labeled block to append after the spoken
+ * transcript, or "" if neither exists. Never throws (a bad info.json just yields "").
+ */
+export function infoSections(raw: string): string {
+	let data: InfoJson;
+	try {
+		data = JSON.parse(raw) as InfoJson;
+	} catch {
+		return "";
+	}
+	const out: string[] = [];
+	const desc = data.description?.trim();
+	if (desc) out.push(`[DESCRIPTION]\n${desc}`);
+	const pinned = data.comments?.find((c) => c.is_pinned)?.text?.trim();
+	if (pinned) out.push(`[PINNED COMMENT]\n${pinned}`);
+	return out.join("\n\n");
 }
 
 export interface FetchResult {
@@ -44,6 +71,13 @@ export async function fetchTranscript(slug: string, id: string): Promise<FetchRe
 			"en.*",
 			"--sub-format",
 			"json3",
+			// Off-screen context: description + top comments (for the pinned one) into the
+			// info.json. Description is ~free; --write-comments costs ~1 extra request/video —
+			// drop it (and the extractor-args) for description-only if a channel feels slow.
+			"--write-info-json",
+			"--write-comments",
+			"--extractor-args",
+			"youtube:comment_sort=top;max_comments=20,20,0",
 			"--no-warnings",
 			"--sleep-requests",
 			String(DEFAULTS.sleepRequests),
@@ -64,10 +98,26 @@ export async function fetchTranscript(slug: string, id: string): Promise<FetchRe
 		break;
 	}
 
+	// Caption track (primary signal) — may be absent.
+	let caption = "";
 	if (file) {
-		const text = json3ToText(await Bun.file(file).text());
-		await Bun.write(join(dir, `${id}.txt`), text);
+		caption = json3ToText(await Bun.file(file).text());
 		rmSync(file, { force: true });
+	}
+
+	// Off-screen context from the same fetch: description + pinned comment. Augments the
+	// transcript, and when captions are absent can stand in for them so the video isn't
+	// skipped outright (e.g. text-only Shorts, narration-light tutorials).
+	let sections = "";
+	const infoPath = join(dir, `${id}.info.json`);
+	if (existsSync(infoPath)) {
+		sections = infoSections(await Bun.file(infoPath).text());
+		rmSync(infoPath, { force: true });
+	}
+
+	const combined = [caption, sections].filter(Boolean).join("\n\n");
+	if (combined) {
+		await Bun.write(join(dir, `${id}.txt`), combined);
 		return { id, ok: true };
 	}
 
