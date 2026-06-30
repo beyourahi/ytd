@@ -136,22 +136,60 @@ Output ONLY a JSON array (no prose, no code fence). Each item:
 
 If a transcript contains nothing applicable, contribute nothing for it.`;
 
+const MAP_GLEAN_INSTRUCTIONS = `You already extracted principles from the transcripts below — they are listed under ALREADY EXTRACTED. Do a careful SECOND pass and surface genuinely useful, ACTIONABLE principles, mental models, tactics, frameworks, or non-obvious insights the first pass MISSED — the kind easy to skip when reading a large batch once.
+
+Same filters: ignore filler, intros/outros, sponsor reads, self-promotion, and small talk; prefer specific, concrete, transferable wisdom over generic advice. Do NOT repeat or merely restate anything under ALREADY EXTRACTED — return only NET-NEW principles.
+
+Output ONLY a JSON array (no prose, no code fence). Each item:
+{"principle":"<short imperative title>","detail":"<1-2 sentences, specific and applicable>","theme":"<2-4 word topic>","sourceId":"<the exact videoId it came from>"}
+
+If the first pass already caught everything useful, return [].`;
+
 function renderTranscripts(batch: Transcript[]): string {
 	return batch
 		.map((t) => `### videoId: ${t.id}\n# Title: ${t.title}\n${t.text}`)
 		.join("\n\n---\n\n");
 }
 
+function gleanPrompt(transcripts: string, kept: Candidate[]): string {
+	const already = kept.length
+		? kept.map((c) => `- [${c.sourceId}] ${c.principle}`).join("\n")
+		: "(nothing yet)";
+	return `${MAP_GLEAN_INSTRUCTIONS}\n\n=== ALREADY EXTRACTED ===\n${already}\n\n=== TRANSCRIPTS ===\n\n${transcripts}`;
+}
+
 export async function mapBatch(
 	batch: Transcript[]
 ): Promise<{ candidates: Candidate[]; limited?: boolean; error?: string }> {
-	const prompt = `${MAP_INSTRUCTIONS}\n\n=== TRANSCRIPTS ===\n\n${renderTranscripts(batch)}`;
-	const r = await claudeJson<Candidate[]>(prompt, (a) => Array.isArray(a), "map");
-	if (r.limited) return { candidates: [], limited: true };
-	if (r.error || !r.obj) return { candidates: [], error: r.error ?? "could not parse map JSON" };
-
+	const transcripts = renderTranscripts(batch);
 	const ids = new Set(batch.map((b) => b.id));
-	return { candidates: r.obj.filter((c) => c?.principle && ids.has(c.sourceId)) };
+
+	const first = await claudeJson<Candidate[]>(
+		`${MAP_INSTRUCTIONS}\n\n=== TRANSCRIPTS ===\n\n${transcripts}`,
+		(a) => Array.isArray(a),
+		"map"
+	);
+	if (first.limited) return { candidates: [], limited: true };
+	if (first.error || !first.obj)
+		return { candidates: [], error: first.error ?? "could not parse map JSON" };
+	const kept = first.obj.filter((c) => c?.principle && ids.has(c.sourceId));
+
+	// Second "what did I miss?" pass — a single sampled first draw skips long-tail principles
+	// buried in a big batch; gleaning over the same transcripts recovers them. Resilience rules:
+	// a usage-limit discards the batch (videos stay "fetched" → resume re-maps it cleanly), but a
+	// glean parse failure must NOT throw away a good first pass — just keep the first-pass set.
+	const glean = await claudeJson<Candidate[]>(
+		gleanPrompt(transcripts, kept),
+		(a) => Array.isArray(a),
+		"map-glean"
+	);
+	if (glean.limited) return { candidates: [], limited: true };
+	const extra = (glean.obj ?? []).filter((c) => c?.principle && ids.has(c.sourceId));
+
+	// ponytail: env-gated one-liner — see how much the glean pass actually recovers per batch.
+	if (process.env.YTD_DEBUG_MAP)
+		console.error(`  [map] first pass: ${kept.length} · glean added: ${extra.length}`);
+	return { candidates: [...kept, ...extra] };
 }
 
 function reducePrompt(

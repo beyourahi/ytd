@@ -21,10 +21,13 @@ export const DEFAULTS = {
 	tabs: ["videos", "shorts"] as const,
 	// Distillation always runs on Opus via Rahi's Claude Max subscription.
 	model: "opus",
-	// ~chars per distill map batch. With the Max subscription, cost is flat — we batch
-	// to minimize the NUMBER of `claude -p` calls (usage windows, not tokens, are the limit).
-	// ~4 chars/token → 400k chars ≈ 100k tokens, comfortable inside Opus's 1M context.
-	mapBatchChars: 400_000,
+	// ~chars per distill map batch. Cost is flat on the Max subscription, so this is NOT a
+	// token budget — it's a RECALL knob. Fewer transcripts per Opus call means each one
+	// competes less for attention, so fewer long-tail principles get lost-in-the-middle.
+	// 150k chars ≈ 37k tokens ≈ ~8 transcripts/call. Paired with the map "what did I miss?"
+	// glean pass (distill.ts mapBatch), this trades more `claude -p` calls for higher recall.
+	// Raise it to cut call count against a usage window; lower it for even higher recall.
+	mapBatchChars: 150_000,
 	// reduce runs in bounded passes — NOT for input budget (the full candidate set +
 	// all field-notes is only ~133k tokens, well inside Opus's 200k window) but to keep
 	// each call's OUTPUT small: fewer candidates/pass → fewer kept principles → less risk
