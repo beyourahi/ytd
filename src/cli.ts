@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "nod
 import { join } from "node:path";
 import { CACHE_DIR, DATA_DIR, DEFAULTS, ROOMS, type Room } from "./config.ts";
 import { Manifest } from "./manifest.ts";
-import { channelSlug, enumerateChannel } from "./enumerate.ts";
+import { enumerate } from "./enumerate.ts";
 import { fetchTranscript } from "./fetch.ts";
 import { batchTranscripts, mapBatch, reduce, type Candidate, type Transcript } from "./distill.ts";
 import { appendBatch, commitPalace, fieldNotesPath, globalMaxM } from "./palace.ts";
@@ -109,8 +109,8 @@ function pauseForLimit(manifest: Manifest): void {
 
 async function main(): Promise<void> {
 	const channelUrl = process.argv[2];
-	if (!channelUrl || !/youtube\.com\//.test(channelUrl)) {
-		console.error("Usage: ytd <youtube-channel-url>");
+	if (!channelUrl || !/youtube\.com\/|youtu\.be\//.test(channelUrl)) {
+		console.error("Usage: ytd <youtube-url>   (channel, video, or Short)");
 		process.exit(1);
 	}
 	if (!(await onPath("yt-dlp"))) {
@@ -122,19 +122,18 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 
-	const slug = channelSlug(channelUrl);
+	// 1. ENUMERATE — a channel/playlist url lists its videos+shorts tabs; a single
+	//    video/Short url resolves to one item (+ a creator-matched slug) instead.
+	console.log("Enumerating ...");
+	const { slug, channel, items, perTab } = await enumerate(channelUrl);
 	const manifest = new Manifest(slug);
-
-	// 1. ENUMERATE — videos + shorts
-	console.log(`Enumerating ${slug} ...`);
-	const { items, perTab } = await enumerateChannel(channelUrl, DEFAULTS.tabs);
 	if (!items.length) {
-		console.error("No videos found — check the channel URL.");
+		console.error("No videos found — check the URL.");
 		process.exit(1);
 	}
 	manifest.addVideos(items);
 	console.log(
-		`  ${items.length} videos (${Object.entries(perTab)
+		`  ${slug}: ${items.length} video(s) (${Object.entries(perTab)
 			.map(([k, v]) => `${k}:${v}`)
 			.join(", ")})`
 	);
@@ -216,7 +215,7 @@ async function main(): Promise<void> {
 		const room = rb.room as Room;
 		const path = await appendBatch({
 			room,
-			channel: slug,
+			channel,
 			channelUrl,
 			dateStr,
 			idToM,
@@ -224,7 +223,7 @@ async function main(): Promise<void> {
 			principles,
 			halalNotes: rb.halalNotes
 		});
-		await commitPalace(room, slug);
+		await commitPalace(room, channel);
 		console.log(`   → ${path}`);
 		written.push(room);
 	}

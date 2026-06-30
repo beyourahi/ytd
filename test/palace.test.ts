@@ -5,6 +5,7 @@ import { rmSync } from "node:fs";
 import { json3ToText } from "../src/fetch.ts";
 import { chunkCandidates, extractJson, type Candidate } from "../src/distill.ts";
 import { maxMInText, renderBatch, safeAppend } from "../src/palace.ts";
+import { parseVideoId, resolveSingleMeta } from "../src/enumerate.ts";
 
 test("json3ToText concatenates segments and drops timing/whitespace", () => {
 	const raw = JSON.stringify({
@@ -78,4 +79,58 @@ test("safeAppend is append-only and integrity-checked", async () => {
 	await safeAppend(p, "\nAPPENDED\n");
 	expect(await Bun.file(p).text()).toBe("ORIGINAL CONTENT\n\nAPPENDED\n");
 	rmSync(p, { force: true });
+});
+
+test("parseVideoId pulls the id from single-media urls, null for channels/playlists", () => {
+	const yes: [string, string][] = [
+		["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://youtu.be/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/live/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://m.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://music.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc&index=2&t=30s", "dQw4w9WgXcQ"],
+		["https://youtu.be/dQw4w9WgXcQ?si=AbC_dEf-123&t=43", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/watch?list=PLabc&v=dQw4w9WgXcQ", "dQw4w9WgXcQ"],
+		["https://www.youtube.com/shorts/aB3_xY7-Qz1", "aB3_xY7-Qz1"]
+	];
+	for (const [url, id] of yes) expect(parseVideoId(url)).toBe(id);
+
+	const no = [
+		"https://www.youtube.com/@veritasium",
+		"https://www.youtube.com/@veritasium/videos",
+		"https://www.youtube.com/@veritasium/shorts", // the Shorts TAB, not a single Short
+		"https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA", // 24-char id must not yield a false 11
+		"https://www.youtube.com/c/Veritasium",
+		"https://www.youtube.com/user/1veritasium",
+		"https://www.youtube.com/playlist?list=PLFs4vir_WsTwEd-nJgVJCZ"
+	];
+	for (const url of no) expect(parseVideoId(url)).toBeNull();
+});
+
+test("resolveSingleMeta splits key/display/title and degrades safely", () => {
+	const id = "VJ-pI3kiF-g";
+	// happy path: handle → slug + channel both the @handle, real title kept
+	expect(resolveSingleMeta("https://www.youtube.com/@orenmeetsworld\tHow I Built It", id)).toEqual({
+		slug: "orenmeetsworld",
+		channel: "orenmeetsworld",
+		title: "How I Built It"
+	});
+	// uploader_url missing ("NA") but title present → id is the key, "unknown" the display
+	expect(resolveSingleMeta("NA\tSome Title", id)).toEqual({
+		slug: id,
+		channel: "unknown",
+		title: "Some Title"
+	});
+	// title "NA" → blank title, handle still resolves
+	expect(resolveSingleMeta("https://www.youtube.com/@x\tNA", id)).toEqual({
+		slug: "x",
+		channel: "x",
+		title: ""
+	});
+	// empty stdout (a blocked/failed metadata call) → key=id, display="unknown", never the raw id
+	const blocked = resolveSingleMeta("", id);
+	expect(blocked).toEqual({ slug: id, channel: "unknown", title: "" });
+	expect(blocked.channel).not.toBe(id);
 });
