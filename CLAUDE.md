@@ -1,7 +1,8 @@
 # ytd
 
 Local Bun + TypeScript CLI. Paste a YouTube **channel, video, or Short** URL → it fetches each
-video's transcript, distills the genuinely useful + **net-new** wisdom (deduped against the
+video's transcript (plus its **description + pinned comment** for the off-screen links/resources
+the audio only points at), distills the genuinely useful + **net-new** wisdom (deduped against the
 channel and against the mind palace), passes it through the **halal gate**, and
 **smart-routes** it across one or more best-fit rooms' `field-notes.md` (content / craft /
 business / design-systems) with shared global `[Mn]` ids + a commit per room. One command, no flags.
@@ -31,6 +32,17 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
 - **Resumable**: a per-channel `bun:sqlite` manifest tracks each video
   `pending → fetched → distilled → done` (+ `no_captions` / `failed`). Re-running the
   same command continues where it stopped; safe to Ctrl-C anytime.
+- **Off-screen context captured (`fetch.ts`):** the same yt-dlp call also writes the video's
+  `info.json` (`--write-info-json --write-comments`, top 20); `infoSections` appends the
+  **description** and the **pinned comment** (the only one flagged `is_pinned`) to the cached
+  `.txt` under `[DESCRIPTION]` / `[PINNED COMMENT]` markers — this is where creators put the
+  links/resources the narration only gestures at, and it lets a no-caption video still distil
+  off its description instead of being skipped. Description is ~free; `--write-comments` adds
+  ~1 request/video (drop it + the extractor-args for description-only if a channel feels slow).
+  Degrades gracefully: yt-dlp writes the `info.json` _after_ subtitles, so a video with many
+  English sub-tracks that trips a 429 mid-fetch keeps its captions but loses the augmentation
+  (a retry round usually recovers it). Channel-repeated boilerplate is dropped by the existing
+  net-new dedup, so no filtering is needed.
 - **Failures retried, then reported:** the fetch phase processes all videos, then retries
   the failures a few more rounds; whatever still won't fetch is listed in a simple end report
   (separately from videos that genuinely have no captions).
@@ -42,11 +54,11 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
 
 ## Source layout
 
-`src/`, ~1k lines, no runtime deps. Each file owns one phase:
+`src/`, ~1.2k lines, no runtime deps. Each file owns one phase:
 
 - `cli.ts` — orchestrator: enumerate → fetch (+retry) → distill → route → append + commit, with progress + the end report.
 - `enumerate.ts` — `enumerate` dispatches by url shape: a channel/playlist → `enumerateChannel` (yt-dlp listing across videos+shorts); a single video/Short/live/embed url → `parseVideoId` + one metadata call, with `resolveSingleMeta` splitting the unique **slug** (manifest/cache key) from the creator **channel** display label (so the id-as-key fallback never shows a raw id as the creator). One source video keyed to the creator's @handle slug dedupes against a full-channel ingest.
-- `fetch.ts` — yt-dlp per-video json3 captions → plain-text cache; `json3ToText` strips timing.
+- `fetch.ts` — yt-dlp per-video json3 captions → plain-text cache; `json3ToText` strips timing, `infoSections` appends the description + pinned comment (off-screen links) so even a no-caption video can distil.
 - `manifest.ts` — per-channel `bun:sqlite` `Manifest`: the `pending → fetched → distilled → done` (+ `no_captions`/`failed`) state machine.
 - `distill.ts` — map/reduce: `mapBatch` (extract + a "what did I miss?" glean second pass), `reduce`, `claudeJson` (retry+dump), `batchTranscripts`/`chunkCandidates`/`extractJson`.
 - `claude.ts` — `claudePrompt`: single-turn tool-free `claude -p` wrapper + usage-limit detection.
@@ -64,7 +76,7 @@ business / design-systems) with shared global `[Mn]` ids + a commit per room. On
 
 ```bash
 bun install && bun link            # one-time; exposes `ytd` globally
-bun test                           # pure-function self-checks (json3, JSON extract, [Mn] scan, chunking, render, append, parseVideoId, resolveSingleMeta)
+bun test                           # pure-function self-checks (json3, infoSections, JSON extract, [Mn] scan, chunking, render, append, parseVideoId, resolveSingleMeta)
 bun run check                      # tsc --noEmit
 bun run lint                       # prettier --check . && eslint .
 bun run format                     # prettier --write .
