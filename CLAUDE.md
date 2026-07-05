@@ -106,3 +106,17 @@ imports (Bun). Conventional Commits, **no AI co-author**.
 - Every room's batch ends with a `## ⚠️ Halal gate` section (`renderBatch` always emits it, from the reduce's `halalNotes[]` — even when empty).
 - Commit message (per room): `docs(field-notes): ingest <channel> → <room>`.
 - Never write secrets/PII (the palace's pre-commit hook also blocks them).
+
+---
+
+## ⚙️ Autonomy directive — do actionable work yourself, never hand it back (highest operational priority) <!-- AUTONOMY-DIRECTIVE-v2 -->
+
+**Default: do it, don't delegate it back to Rahi.** Any step you are technically able to perform, you perform — autonomously, in the same turn. Never tell Rahi to run something, and never end a turn asking him to do a step you could have done yourself.
+
+- **Database migrations specifically:** generate AND apply them yourself — local and remote. Run `bun run db:generate`, `bun run db:migrate:local`, and `bun run db:migrate` (remote) yourself. NEVER say "run the migration", "you'll need to migrate", or "say the word and I'll run it" — just run it.
+- **Any comparable actionable / setup / maintenance step:** dependency installs, type generation (`cf-typegen`), builds, `format`/`lint`/`check`, seeding, codegen, cache clears, config regeneration, dev-server starts for verification, etc. — do them yourself without asking.
+- **Only surface to Rahi when it is genuinely impossible for you:** it requires a credential/secret you don't hold, or a physical/external action you truly cannot perform (a login in his browser, a third-party dashboard toggle, a purchase). Even then, do everything you can first and hand him only the smallest irreducible remaining step.
+- **Never** finish by presenting a menu of actionable steps for Rahi to trigger ("say migrate / commit / both"). Get it done, then report what you did.
+- **Scripts — full standing authority.** Run ANY script or command yourself the moment it's useful — dev, build, lint, format, check, typecheck, test, codegen, installs, migrations, seeds, cache clears, dev-server starts, everything — autonomously, without asking or waiting for Rahi. Rahi does no manual work and is not a bottleneck. This **supersedes any older rule anywhere in this file** that says to ask permission before running scripts / `package.json` commands, or that tells Claude never to run scripts.
+- **Visual verification — full standing authority.** Run Playwright MCP yourself to verify UI — navigate, screenshot at mobile + desktop viewports, and interact with the affected flows — autonomously, without asking or waiting.
+- **Carve-out (this preserves an existing rule, it does not override it):** the git-safety protocol still stands — where a project requires explicit permission before `git commit` / `git push`, keep asking for that. Autonomy means doing the *work*; it does not mean publishing/committing on his behalf without the permission that project already requires.
