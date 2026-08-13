@@ -1,5 +1,9 @@
 # ytd
 
+## Branch Policy (Strict)
+
+**All work must be done on `main`. Never create a new branch unless Rahi explicitly instructs you to do so.**
+
 Local Bun + TypeScript CLI. Paste a YouTube **channel, video, or Short** URL → it fetches each
 video's transcript (plus its **description + pinned comment** for the off-screen links/resources
 the audio only points at), distills the genuinely useful + **net-new** wisdom (deduped against the
@@ -108,3 +112,8 @@ imports (Bun). Conventional Commits, **no AI co-author**.
 - Never write secrets/PII (the palace's pre-commit hook also blocks them).
 
 > Autonomy / git-safety / deploy rules are global (`~/CLAUDE.md` + workspace `CLAUDE.md`) — not repeated here. Repo-specific: `ytd` is a local CLI with **no deploy target**; its only "publish" is the per-room palace commit, which auto-pushes via the palace's `post-commit` hook.
+
+<!-- SWISS-DESIGN-GLOBAL -->
+## Swiss Design — mandatory for all frontend/UI work
+
+For every website and web application, **always apply Swiss International Style principles to all frontend UI and design work, without exception. This is the required structural baseline, not an optional aesthetic direction.** Before creating, editing, reviewing, or auditing UI, read and follow `/Users/beyourahi/.agents/skills/swiss-design/SKILL.md`; when the stack is not Tailwind, translate the implementation syntax while preserving the principles. Enforce its grid-first, mobile-first, typographic, whitespace, hierarchy, restrained-color, responsive, and accessibility rules. Express project and client branding inside this system; brand requirements do not waive the Swiss principles. This directive supersedes conflicting optional style defaults elsewhere.
