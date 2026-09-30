@@ -8,14 +8,14 @@
   "minGapEvidence": 2,
   "maxTranscripts": 100,
   "analysis": {
-    "agent": null,
-    "model": null,
-    "effort": null
+    "agent": "codex",
+    "model": "gpt-6.1-sol",
+    "effort": "medium"
   },
   "synthesis": {
-    "agent": null,
-    "model": null,
-    "effort": null
+    "agent": "codex",
+    "model": "gpt-6.1-sol",
+    "effort": "high"
   },
   "discovery": {
     "harnesses": [
