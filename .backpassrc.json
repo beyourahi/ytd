@@ -5,17 +5,37 @@
   ],
   "budgetTokens": 5000,
   "skillsDir": ".agents/skills",
-  "minGapEvidence": 2,
+  "minGapEvidence": 3,
+  "gapLedgerMaxAge": "60d",
   "maxTranscripts": 100,
+  "sampleHalfLife": "7d",
   "analysis": {
-    "agent": "codex",
-    "model": "gpt-6.1-sol",
+    "agent": null,
+    "model": null,
     "effort": "medium"
   },
   "synthesis": {
-    "agent": "codex",
-    "model": "gpt-6.1-sol",
+    "agent": null,
+    "model": null,
     "effort": "high"
+  },
+  "ladders": {
+    "analysis": [
+      {
+        "model": "openai-codex/gpt-6.1-sol",
+        "agents": [
+          "pi"
+        ]
+      }
+    ],
+    "synthesis": [
+      {
+        "model": "openai-codex/gpt-6.1-sol",
+        "agents": [
+          "pi"
+        ]
+      }
+    ]
   },
   "discovery": {
     "harnesses": [
