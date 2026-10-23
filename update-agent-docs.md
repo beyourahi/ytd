@@ -34,16 +34,16 @@ Apply the `claude-md-improver` skill to `CLAUDE.md`:
 
 ## Step 3: Sync AGENTS.md
 
-After CLAUDE.md has been updated, propagate the same changes into AGENTS.md 
+After CLAUDE.md has been updated, propagate the same changes into AGENTS.md
 in the same directory:
 
 - Read the newly updated CLAUDE.md.
-- Update AGENTS.md so its commands, gotchas, patterns, and structure match 
+- Update AGENTS.md so its commands, gotchas, patterns, and structure match
   what CLAUDE.md now says.
-- Rewrite any Claude- or Anthropic-specific references into agent-agnostic 
-  phrasing (e.g. "the AI coding agent" / "the assistant") — AGENTS.md must 
+- Rewrite any Claude- or Anthropic-specific references into agent-agnostic
+  phrasing (e.g. "the AI coding agent" / "the assistant") — AGENTS.md must
   never mention Claude or Anthropic by name.
-- Preserve AGENTS.md's own formatting conventions; only sync substance, not 
+- Preserve AGENTS.md's own formatting conventions; only sync substance, not
   Claude-specific wording.
 - If no AGENTS.md exists in this directory, skip this step and note it.
 

@@ -1,55 +1,40 @@
 {
-  "memoryFiles": [
-    "AGENTS.md",
-    "CLAUDE.md"
-  ],
-  "budgetTokens": 5000,
-  "skillsDir": ".agents/skills",
-  "minGapEvidence": 3,
-  "gapLedgerMaxAge": "60d",
-  "maxTranscripts": 100,
-  "sampleHalfLife": "7d",
-  "analysis": {
-    "agent": null,
-    "model": null,
-    "effort": "medium"
-  },
-  "synthesis": {
-    "agent": null,
-    "model": null,
-    "effort": "high"
-  },
-  "ladders": {
-    "analysis": [
-      {
-        "model": "openai-codex/gpt-6.1-sol",
-        "agents": [
-          "pi"
-        ]
-      }
-    ],
-    "synthesis": [
-      {
-        "model": "openai-codex/gpt-6.1-sol",
-        "agents": [
-          "pi"
-        ]
-      }
-    ]
-  },
-  "discovery": {
-    "harnesses": [
-      "claude",
-      "codex",
-      "pi",
-      "opencode",
-      "grok",
-      "cursor",
-      "hermes"
-    ],
-    "since": "30d",
-    "worktreeGlobs": [],
-    "minUserTurns": 2
-  },
-  "jobs": 4
+	"memoryFiles": ["AGENTS.md", "CLAUDE.md"],
+	"budgetTokens": 5000,
+	"skillsDir": ".agents/skills",
+	"minGapEvidence": 3,
+	"gapLedgerMaxAge": "60d",
+	"maxTranscripts": 100,
+	"sampleHalfLife": "7d",
+	"analysis": {
+		"agent": null,
+		"model": null,
+		"effort": "medium"
+	},
+	"synthesis": {
+		"agent": null,
+		"model": null,
+		"effort": "high"
+	},
+	"ladders": {
+		"analysis": [
+			{
+				"model": "openai-codex/gpt-6.1-sol",
+				"agents": ["pi"]
+			}
+		],
+		"synthesis": [
+			{
+				"model": "openai-codex/gpt-6.1-sol",
+				"agents": ["pi"]
+			}
+		]
+	},
+	"discovery": {
+		"harnesses": ["claude", "codex", "pi", "opencode", "grok", "cursor", "hermes"],
+		"since": "30d",
+		"worktreeGlobs": [],
+		"minUserTurns": 2
+	},
+	"jobs": 4
 }
