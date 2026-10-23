@@ -1,130 +1,160 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync
+} from "node:fs";
 import { join } from "node:path";
 import { CACHE_DIR, DEFAULTS, jsRuntimeArgs } from "./config.ts";
+import { metadataItem, type VideoItem } from "./enumerate.ts";
+import { runCommand } from "./process.ts";
 
-interface Json3 {
-	events?: { segs?: { utf8?: string }[] }[];
+function record(raw: string): Record<string, unknown> | null {
+	try {
+		const value = JSON.parse(raw);
+		return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+	} catch {
+		return null;
+	}
 }
 
-/** Convert YouTube's json3 caption format to plain text, dropping all timing. */
+/** Malformed tracks cannot discard usable description/pinned-comment context. */
 export function json3ToText(raw: string): string {
-	const data = JSON.parse(raw) as Json3;
+	const data = record(raw);
 	const parts: string[] = [];
-	for (const ev of data.events ?? []) {
-		for (const seg of ev.segs ?? []) {
-			if (seg.utf8) parts.push(seg.utf8);
+	for (const event of Array.isArray(data?.events) ? data.events : []) {
+		for (const segment of Array.isArray(event?.segs) ? event.segs : []) {
+			if (typeof segment?.utf8 === "string") parts.push(segment.utf8);
 		}
 	}
 	return parts.join("").replace(/\s+/g, " ").trim();
 }
 
-interface InfoJson {
-	description?: string;
-	comments?: { text?: string; is_pinned?: boolean }[];
-}
-
-/**
- * Pull the off-screen context yt-dlp's --write-info-json/--write-comments captured:
- * the video description and the creator's pinned comment — where the resources/links
- * narration says are "in the description" actually live, and what purely-visual Shorts
- * say in text instead of audio. Returns a labeled block to append after the spoken
- * transcript, or "" if neither exists. Never throws (a bad info.json just yields "").
- */
 export function infoSections(raw: string): string {
-	let data: InfoJson;
-	try {
-		data = JSON.parse(raw) as InfoJson;
-	} catch {
-		return "";
-	}
+	const data = record(raw);
 	const out: string[] = [];
-	const desc = data.description?.trim();
+	const desc = typeof data?.description === "string" ? data.description.trim() : "";
 	if (desc) out.push(`[DESCRIPTION]\n${desc}`);
-	const pinned = data.comments?.find((c) => c.is_pinned)?.text?.trim();
+	const comments = Array.isArray(data?.comments) ? data.comments : [];
+	const pinned = comments
+		.find((c) => c?.is_pinned === true && typeof c.text === "string")
+		?.text.trim();
 	if (pinned) out.push(`[PINNED COMMENT]\n${pinned}`);
 	return out.join("\n\n");
+}
+
+export function transcriptPath(id: string, root = CACHE_DIR): string {
+	if (!/^[A-Za-z0-9_-]{11}$/.test(id)) throw new Error("Invalid video identity.");
+	return join(root, "videos", `${id}.txt`);
+}
+
+/** Same-directory rename means interrupted writes never become valid cached transcripts. */
+export function atomicCache(path: string, value: string): void {
+	const temp = `${path}.${crypto.randomUUID()}.tmp`;
+	try {
+		writeFileSync(temp, value, { mode: 0o600, flag: "wx" });
+		renameSync(temp, path);
+	} finally {
+		rmSync(temp, { force: true });
+	}
 }
 
 export interface FetchResult {
 	id: string;
 	ok: boolean;
+	metadata?: VideoItem;
 	reason?: "no_captions" | "fetch_blocked" | "yt_dlp_error";
 }
 
-/**
- * Fetch one video's English transcript via yt-dlp (from this machine's residential
- * IP) and cache it as plain text. Distinguishes "no captions exist" (skip, expected)
- * from a genuine fetch failure (retryable). Never throws — returns a result.
- */
-export async function fetchTranscript(slug: string, id: string): Promise<FetchResult> {
-	const dir = join(CACHE_DIR, slug);
-	mkdirSync(dir, { recursive: true });
-
-	const proc = Bun.spawn(
-		[
-			"yt-dlp",
-			...jsRuntimeArgs(),
-			"--skip-download",
-			"--write-subs",
-			"--write-auto-subs",
-			"--sub-langs",
-			"en.*",
-			"--sub-format",
-			"json3",
-			// Off-screen context: description + top comments (for the pinned one) into the
-			// info.json. Description is ~free; --write-comments costs ~1 extra request/video —
-			// drop it (and the extractor-args) for description-only if a channel feels slow.
-			"--write-info-json",
-			"--write-comments",
-			"--extractor-args",
-			"youtube:comment_sort=top;max_comments=20,20,0",
-			"--no-warnings",
-			"--sleep-requests",
-			String(DEFAULTS.sleepRequests),
-			"-o",
-			join(dir, `${id}.%(ext)s`),
-			`https://www.youtube.com/watch?v=${id}`
-		],
-		{ stdout: "pipe", stderr: "pipe" }
-	);
-	const stdout = await new Response(proc.stdout).text();
-	const stderr = await new Response(proc.stderr).text();
-	const code = await proc.exited;
-
-	// Find whichever en* json3 the fetch produced (manual `.en` or auto `.en-orig`/`a.en`).
-	let file: string | undefined;
-	for await (const f of new Bun.Glob(`${id}*.json3`).scan({ cwd: dir })) {
-		file = join(dir, f);
-		break;
+export async function fetchTranscript(
+	slug: string,
+	id: string,
+	options: { aliases?: string[]; signal?: AbortSignal; cacheDir?: string } = {}
+): Promise<FetchResult> {
+	const root = options.cacheDir ?? CACHE_DIR;
+	const path = transcriptPath(id, root);
+	mkdirSync(join(root, "videos"), { recursive: true });
+	const metaPath = `${path}.meta.json`;
+	if (!existsSync(path)) {
+		for (const alias of [slug, ...(options.aliases ?? [])]) {
+			if (!/^[\p{L}\p{N}_.-]+$/u.test(alias) || alias === "." || alias === "..") continue;
+			const old = join(root, alias, `${id}.txt`);
+			if (existsSync(old)) {
+				atomicCache(path, readFileSync(old, "utf8"));
+				break;
+			}
+		}
 	}
-
-	// Caption track (primary signal) — may be absent.
-	let caption = "";
-	if (file) {
-		caption = json3ToText(await Bun.file(file).text());
-		rmSync(file, { force: true });
+	if (existsSync(path) && readFileSync(path, "utf8").trim()) {
+		let metadata: VideoItem | undefined;
+		if (existsSync(metaPath))
+			metadata = metadataItem(record(readFileSync(metaPath, "utf8"))) ?? undefined;
+		return { id, ok: true, metadata };
 	}
-
-	// Off-screen context from the same fetch: description + pinned comment. Augments the
-	// transcript, and when captions are absent can stand in for them so the video isn't
-	// skipped outright (e.g. text-only Shorts, narration-light tutorials).
-	let sections = "";
-	const infoPath = join(dir, `${id}.info.json`);
-	if (existsSync(infoPath)) {
-		sections = infoSections(await Bun.file(infoPath).text());
-		rmSync(infoPath, { force: true });
+	const scratch = mkdtempSync(join(root, "videos", `.fetch-${id}-`));
+	try {
+		const result = await runCommand(
+			[
+				"yt-dlp",
+				...jsRuntimeArgs(),
+				"--skip-download",
+				"--no-playlist",
+				"--write-subs",
+				"--write-auto-subs",
+				"--sub-langs",
+				"en.*",
+				"--sub-format",
+				"json3",
+				"--write-info-json",
+				"--write-comments",
+				"--extractor-args",
+				"youtube:comment_sort=top;max_comments=20,20,0",
+				"--no-warnings",
+				"--sleep-requests",
+				String(DEFAULTS.sleepRequests),
+				"-o",
+				join(scratch, `${id}.%(ext)s`),
+				`https://www.youtube.com/watch?v=${id}`
+			],
+			{ signal: options.signal, timeoutMs: 15 * 60_000 }
+		);
+		if (result.cancelled) throw new Error("Fetch cancelled; progress preserved.");
+		let caption = "";
+		for await (const file of new Bun.Glob(`${id}*.json3`).scan({ cwd: scratch })) {
+			caption = json3ToText(readFileSync(join(scratch, file), "utf8"));
+			if (caption) break;
+		}
+		const info = join(scratch, `${id}.info.json`);
+		const raw = existsSync(info) ? readFileSync(info, "utf8") : "";
+		const metadata = metadataItem(record(raw)) ?? undefined;
+		const combined = [caption, infoSections(raw)].filter(Boolean).join("\n\n");
+		if (combined) {
+			if (metadata)
+				atomicCache(
+					metaPath,
+					JSON.stringify({
+						id: metadata.id,
+						title: metadata.title,
+						channel: metadata.creator,
+						channel_url: metadata.creatorUrl
+					})
+				);
+			atomicCache(path, combined);
+			return { id, ok: true, metadata };
+		}
+		const failure = (result.stderr + result.stdout).toLowerCase();
+		if (/sign in to confirm|not a bot|blocked|http error 4|429|forbidden/.test(failure))
+			return { id, ok: false, reason: "fetch_blocked", metadata };
+		return {
+			id,
+			ok: false,
+			metadata,
+			reason: result.code === 0 && !result.timedOut ? "no_captions" : "yt_dlp_error"
+		};
+	} finally {
+		rmSync(scratch, { recursive: true, force: true });
 	}
-
-	const combined = [caption, sections].filter(Boolean).join("\n\n");
-	if (combined) {
-		await Bun.write(join(dir, `${id}.txt`), combined);
-		return { id, ok: true };
-	}
-
-	const blob = (stderr + stdout).toLowerCase();
-	if (/sign in to confirm|not a bot|blocked|http error 4|429|forbidden/.test(blob)) {
-		return { id, ok: false, reason: "fetch_blocked" };
-	}
-	if (code === 0) return { id, ok: false, reason: "no_captions" };
-	return { id, ok: false, reason: "yt_dlp_error" };
 }

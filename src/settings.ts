@@ -1,0 +1,370 @@
+import * as prompts from "@clack/prompts";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	writeFileSync
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+	BUILT_INS,
+	discoverModels,
+	validateProfile,
+	type AgentProfile,
+	type CustomAdapter,
+	type ModelSuggestion
+} from "./agents.ts";
+
+export const SETTINGS_PATH = join(homedir(), ".ytd/config.json");
+export interface Settings {
+	version: 1;
+	selected?: AgentProfile;
+	recent: AgentProfile[];
+	adapters: Record<string, CustomAdapter>;
+}
+export function loadSettings(path = SETTINGS_PATH): Settings {
+	if (!existsSync(path)) return { version: 1, recent: [], adapters: {} };
+	const config = JSON.parse(readFileSync(path, "utf8")) as Settings;
+	if (
+		config.version !== 1 ||
+		!Array.isArray(config.recent) ||
+		!config.recent.every(validateProfile) ||
+		(config.selected && !validateProfile(config.selected)) ||
+		!config.adapters ||
+		typeof config.adapters !== "object" ||
+		Array.isArray(config.adapters)
+	)
+		throw new Error(`Invalid or unsupported settings in ${path}; original file preserved`);
+	for (const [agent, custom] of Object.entries(config.adapters))
+		if (!validateProfile({ agent, model: "validation", custom }))
+			throw new Error(`Invalid custom adapter ${agent}; settings preserved`);
+	return config;
+}
+export function saveSettings(config: Settings, path = SETTINGS_PATH): void {
+	mkdirSync(dirname(path), { recursive: true });
+	const temp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	const fd = openSync(temp, "wx", 0o600);
+	try {
+		writeFileSync(fd, JSON.stringify(config, null, "\t") + "\n");
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(temp, path);
+}
+
+export interface CliArgs {
+	command: "run" | "settings" | "add" | "help";
+	url?: string;
+	agent?: string;
+	model?: string;
+	effort?: string;
+	contextTokens?: number;
+	timeoutMs?: number;
+}
+export function parseArgs(argv: string[]): CliArgs {
+	const out: CliArgs = { command: "run" };
+	let args = [...argv];
+	if (args[0] === "settings") {
+		out.command = "settings";
+		args = args.slice(1);
+	} else if (args[0] === "agents" && args[1] === "add") {
+		out.command = "add";
+		args = args.slice(2);
+	}
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--help" || arg === "-h") {
+			out.command = "help";
+			continue;
+		}
+		if (arg.startsWith("--")) {
+			const [flag, inline] = arg.split(/=(.*)/s);
+			const keys: Record<string, "agent" | "model" | "effort" | "contextTokens" | "timeoutMs"> = {
+				"--agent": "agent",
+				"--model": "model",
+				"--effort": "effort",
+				"--context-tokens": "contextTokens",
+				"--timeout-ms": "timeoutMs"
+			};
+			const key = keys[flag];
+			if (!key) throw new Error(`Unknown argument: ${flag}`);
+			const value = inline ?? args[++i];
+			if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+			if (out[key] !== undefined) throw new Error(`${flag} was supplied more than once`);
+			if (key === "contextTokens" || key === "timeoutMs") {
+				const n = Number(value);
+				if (!Number.isSafeInteger(n) || n < (key === "contextTokens" ? 4096 : 1))
+					throw new Error(`Invalid ${flag}`);
+				out[key] = n;
+			} else out[key] = value;
+		} else if (!out.url && out.command === "run") out.url = arg;
+		else throw new Error(`Unexpected argument: ${arg}`);
+	}
+	return out;
+}
+
+export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile | undefined {
+	const previous = settings.selected;
+	const agent = args.agent ?? previous?.agent;
+	if (!agent) return undefined;
+	if (args.agent && args.agent !== previous?.agent && !args.model)
+		throw new Error("Changing agent requires --model (or choose both in ytd settings)");
+	const changed = agent !== previous?.agent;
+	const model = args.model ?? (!changed ? previous?.model : undefined);
+	if (!model) throw new Error("Select a model with --model or ytd settings");
+	const custom = settings.adapters[agent];
+	const profile: AgentProfile = {
+		agent,
+		model,
+		...(!changed && previous?.model === model
+			? {
+					contextTokens: previous.contextTokens,
+					timeoutMs: previous.timeoutMs,
+					effort: previous.effort
+				}
+			: {}),
+		...(args.effort ? { effort: args.effort } : {}),
+		...(args.contextTokens ? { contextTokens: args.contextTokens } : {}),
+		...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
+		...(custom ? { custom } : {})
+	};
+	if (!validateProfile(profile)) throw new Error(`Unknown or invalid agent/model: ${agent}`);
+	return profile;
+}
+
+type Choice = { value: string; label: string; hint?: string };
+export interface Picker {
+	text(message: string, initial?: string): Promise<string>;
+	select(
+		message: string,
+		choices: Choice[],
+		initial?: string,
+		searchable?: boolean
+	): Promise<string>;
+}
+export class Cancelled extends Error {
+	constructor() {
+		super("Cancelled; no ingestion started");
+	}
+}
+function checked<T>(value: T | symbol): T {
+	if (prompts.isCancel(value)) throw new Cancelled();
+	return value as T;
+}
+const picker: Picker = {
+	async text(message, initial) {
+		return checked<string>(
+			await prompts.text({
+				message,
+				initialValue: initial,
+				validate: (value) => (!value?.trim() ? "Enter a value" : undefined)
+			})
+		);
+	},
+	async select(message, options, initialValue, searchable = false) {
+		const maxItems = Math.max(2, Math.min(8, (process.stdout.rows ?? 24) - 8));
+		return checked<string>(
+			await (searchable
+				? prompts.autocomplete({ message, options, initialValue, maxItems })
+				: prompts.select({ message, options, initialValue, maxItems }))
+		);
+	}
+};
+export const EFFORTS: Record<string, string[]> = {
+	claude: ["low", "medium", "high", "xhigh", "max"],
+	codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
+	pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+	opencode: ["minimal", "low", "medium", "high", "max"]
+};
+
+async function chooseProfile(
+	config: Settings,
+	ui: Picker,
+	models: typeof discoverModels,
+	installed: (name: string) => boolean
+): Promise<AgentProfile> {
+	const names = [...BUILT_INS, ...Object.keys(config.adapters)].filter((name) =>
+		installed(config.adapters[name]?.executable ?? name)
+	);
+	if (!names.length)
+		throw new Error(
+			"No installed agents found. Configure one separately or add a trusted wrapper with ytd agents add."
+		);
+	const agent = await ui.select(
+		"Agent",
+		names.map((value) => ({ value, label: value })),
+		config.selected?.agent,
+		true
+	);
+	const suggestions = await models(agent);
+	const recent = config.recent.filter((p) => p.agent === agent);
+	const unique = new Map<string, ModelSuggestion>(
+		[...recent.map((p) => ({ id: p.model, contextTokens: p.contextTokens })), ...suggestions].map(
+			(m) => [m.id, m]
+		)
+	);
+	const modelChoice = await ui.select(
+		"Model",
+		[...unique.values()]
+			.map((m) => ({
+				value: m.id,
+				label: m.id,
+				hint: recent.some((p) => p.model === m.id)
+					? "recent"
+					: "suggestion; availability depends on your account"
+			}))
+			.concat([
+				{
+					value: "__exact__",
+					label: "Enter exact model ID",
+					hint: "Any text model supported by this agent and account"
+				}
+			]),
+		config.selected?.agent === agent ? config.selected.model : undefined,
+		true
+	);
+	const model =
+		modelChoice === "__exact__" ? (await ui.text("Exact model ID")).trim() : modelChoice;
+	const effortChoice = await ui.select(
+		"Effort",
+		[
+			{ value: "__default__", label: "Use configured agent default" },
+			...(EFFORTS[agent] ?? []).map((value) => ({ value, label: value })),
+			{ value: "__exact__", label: "Enter exact effort/variant" }
+		],
+		"__default__"
+	);
+	const effort =
+		effortChoice === "__exact__"
+			? (await ui.text("Exact effort/variant")).trim()
+			: effortChoice === "__default__"
+				? undefined
+				: effortChoice;
+	const contextTokens = unique.get(model)?.contextTokens;
+	const custom = config.adapters[agent];
+	return {
+		agent,
+		model,
+		...(effort ? { effort } : {}),
+		...(contextTokens ? { contextTokens } : {}),
+		...(custom ? { custom } : {})
+	};
+}
+
+export const USAGE =
+	"Usage: ytd [youtube-url] [--agent NAME --model ID] [--effort LEVEL]\n       ytd settings | ytd agents add\nAdvanced: --context-tokens N --timeout-ms N\nNon-interactive runs require a URL and a saved or explicit agent/model.";
+
+export async function resolveCli(
+	argv = process.argv.slice(2),
+	options: {
+		interactive?: boolean;
+		path?: string;
+		ui?: Picker;
+		models?: typeof discoverModels;
+		installed?: (name: string) => boolean;
+	} = {}
+): Promise<{ url: string; profile: AgentProfile } | null> {
+	const args = parseArgs(argv);
+	if (args.command === "help") {
+		console.log(USAGE);
+		return null;
+	}
+	const interactive =
+		options.interactive ??
+		Boolean(process.stdin.isTTY && process.stdout.isTTY && process.env.TERM !== "dumb");
+	const config = loadSettings(options.path);
+	const ui = options.ui ?? picker;
+	const models = options.models ?? discoverModels;
+	const installed =
+		options.installed ?? ((name: string) => Boolean(Bun.which(name, { PATH: process.env.PATH })));
+	prompts.updateSettings({
+		withGuide: false,
+		accessible: Boolean(process.env.NO_COLOR || process.env.TERM === "dumb")
+	});
+	if (args.command !== "run" && !interactive)
+		throw new Error(
+			"Settings and adapter setup require an interactive terminal; config.json remains unchanged."
+		);
+	if (args.command === "add") {
+		const name = (await ui.text("Adapter name")).trim();
+		if (
+			!/^[\w-]+$/.test(name) ||
+			BUILT_INS.includes(name as (typeof BUILT_INS)[number]) ||
+			config.adapters[name]
+		)
+			throw new Error("Choose a unique adapter name; existing adapters were preserved");
+		const executable = (await ui.text("Trusted executable path (wrapper owns isolation)")).trim();
+		if (!installed(executable)) throw new Error("Trusted executable is unavailable");
+		const json = await ui.text(
+			"Non-secret argument array as JSON; use {model} and {effort}",
+			'["--model","{model}"]'
+		);
+		const argArray: unknown = JSON.parse(json);
+		if (!Array.isArray(argArray) || !argArray.every((arg) => typeof arg === "string"))
+			throw new Error("Arguments must be a JSON array of strings, never a shell command");
+		config.adapters[name] = { executable, args: argArray };
+		saveSettings(config, options.path);
+		console.log(
+			`Added ${name}. The wrapper must read stdin, write its answer to stdout, diagnose on stderr, and exit successfully.`
+		);
+		return null;
+	}
+	let profile: AgentProfile | undefined;
+	const explicit =
+		args.agent !== undefined ||
+		args.model !== undefined ||
+		args.effort !== undefined ||
+		args.contextTokens !== undefined ||
+		args.timeoutMs !== undefined;
+	if (args.command === "settings") profile = await chooseProfile(config, ui, models, installed);
+	else {
+		try {
+			profile = profileFromArgs(args, config);
+		} catch (e) {
+			if (!interactive || explicit) throw e;
+		}
+		if (!profile && !interactive)
+			throw new Error(
+				"No saved agent/model. Supply --agent and --model; no fallback was selected."
+			);
+		if (interactive && !explicit && profile) {
+			const action = await ui.select(
+				`${profile.agent} / ${profile.model}${profile.effort ? ` / ${profile.effort}` : ""}`,
+				[
+					{ value: "run", label: "Run" },
+					{ value: "change", label: "Change agent/model" }
+				],
+				"run"
+			);
+			if (action === "change") profile = undefined;
+		}
+		if (!profile) profile = await chooseProfile(config, ui, models, installed);
+	}
+	if (!validateProfile(profile)) throw new Error("Invalid agent/model selection");
+	const url =
+		args.command === "settings"
+			? undefined
+			: (args.url ?? (interactive ? await ui.text("YouTube URL") : undefined));
+	if (args.command !== "settings" && !url) throw new Error(USAGE);
+	if (interactive && !explicit) {
+		config.selected = profile;
+		config.recent = [
+			profile,
+			...config.recent.filter(
+				(p) => p.agent !== profile.agent || p.model !== profile.model || p.effort !== profile.effort
+			)
+		].slice(0, 12);
+		saveSettings(config, options.path);
+	}
+	if (args.command === "settings") {
+		console.log(`Saved ${profile.agent} / ${profile.model}`);
+		return null;
+	}
+	return { url: url!.trim(), profile };
+}

@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "Paste a YouTube channel URL; distill every video's transcript into mind-palace field notes via Claude (Max subscription).",
+	"description": "Distill YouTube channels, playlists, videos and Shorts into verified mind-palace field notes using your selected coding agent and model.",
 	"bin": {
 		"ytd": "./src/cli.ts"
 	},
@@ -22,5 +22,8 @@
 		"prettier": "^3.9.10",
 		"typescript": "npm:@typescript/typescript6@^6.0.2",
 		"typescript-eslint": "^8.72.0"
+	},
+	"dependencies": {
+		"@clack/prompts": "^1.8.1"
 	}
 }

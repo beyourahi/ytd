@@ -1,138 +1,231 @@
+import { createHash } from "node:crypto";
 import { DEFAULTS, jsRuntimeArgs } from "./config.ts";
+import { runCommand } from "./process.ts";
 
 export interface VideoItem {
 	id: string;
 	title: string;
+	creator?: string;
+	creatorUrl?: string;
 }
 
-/** Derive a stable, filesystem-safe slug from a channel URL (prefers the @handle). */
-export function channelSlug(channelUrl: string): string {
-	const handle = channelUrl.match(/@([\w.-]+)/);
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+const HOSTS = new Set([
+	"youtube.com",
+	"www.youtube.com",
+	"m.youtube.com",
+	"music.youtube.com",
+	"youtu.be",
+	"www.youtu.be"
+]);
+
+export function youtubeUrl(value: string): URL {
+	const url = new URL(value);
+	if (!HOSTS.has(url.hostname.toLowerCase()) || !["https:", "http:"].includes(url.protocol))
+		throw new Error("Enter a YouTube channel, playlist, video, or Short URL.");
+	if (url.username || url.password || url.port) throw new Error("Invalid YouTube URL.");
+	return url;
+}
+
+/** Only recognized hosts and complete media paths can supply a video identity. */
+export function parseVideoId(value: string): string | null {
+	try {
+		const url = youtubeUrl(value);
+		const path = url.pathname.split("/").filter(Boolean);
+		const id = url.hostname.endsWith("youtu.be")
+			? path.length === 1
+				? path[0]
+				: null
+			: url.pathname === "/watch"
+				? url.searchParams.get("v")
+				: path.length === 2 &&
+					  ["shorts", "live", "embed"].includes(path[0]) &&
+					  path[1] !== "videoseries"
+					? path[1]
+					: null;
+		return id && VIDEO_ID.test(id) ? id : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Human/legacy alias only; new source storage uses a hash of the canonical URL. */
+export function channelSlug(value: string): string {
+	try {
+		const url = youtubeUrl(value);
+		const path = decodeURIComponent(url.pathname).split("/").filter(Boolean);
+		const handle = path.find((part) => part.startsWith("@"));
+		return (handle?.slice(1) || path.at(-1) || "channel")
+			.toLowerCase()
+			.replace(/[^\p{L}\p{N}_.-]+/gu, "-");
+	} catch {
+		return "channel";
+	}
+}
+
+/** Preserve aliases produced by the pre-URL-parser release, without using them as new keys. */
+export function legacyChannelSlug(value: string): string {
+	const handle = value.match(/@([\w.-]+)/);
 	if (handle) return handle[1].toLowerCase();
-	const seg = channelUrl.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? "channel";
-	return seg.toLowerCase().replace(/[^\w.-]+/g, "-");
+	const segment = value.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? "channel";
+	return segment.toLowerCase().replace(/[^\w.-]+/g, "-");
 }
 
-/**
- * Extract the 11-char video id from a single video / Short / live / embed url, or null for a
- * channel / playlist / handle url (which still routes through enumerateChannel). The marker +
- * trailing-boundary anchoring means it can't grab the first 11 chars of a 24-char `/channel/UC…`
- * id or a `list=PL…` playlist id, and `/shorts` (the tab) won't match without a trailing `/<id>`.
- * ponytail: `/embed/videoseries?list=` coincidentally has 11 id-chars so it false-matches as an
- * id — vanishingly rare, and the downstream fetch just reports no_captions; not worth guarding.
- */
-const VIDEO_ID =
-	/(?:youtu\.be\/|\/shorts\/|\/live\/|\/embed\/|[?&]v=)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])/;
-export function parseVideoId(url: string): string | null {
-	return url.match(VIDEO_ID)?.[1] ?? null;
+export function canonicalSource(value: string): string {
+	const url = youtubeUrl(value);
+	const id = parseVideoId(value);
+	if (id) return `https://www.youtube.com/watch?v=${id}`;
+	const list = url.searchParams.get("list");
+	if (url.pathname === "/playlist" || url.pathname === "/embed/videoseries") {
+		if (!list || !/^[A-Za-z0-9_-]+$/.test(list)) throw new Error("Invalid YouTube playlist.");
+		return `https://www.youtube.com/playlist?list=${list}`;
+	}
+	if (
+		!/^\/(?:@[^/]+|(?:channel|c|user)\/[^/]+)(?:\/(?:videos|shorts|streams|featured))?\/?$/.test(
+			url.pathname
+		)
+	)
+		throw new Error("Unsupported YouTube URL path.");
+	return `https://www.youtube.com${url.pathname.replace(/\/+$/, "").replace(/\/(videos|shorts|streams|featured)$/, "")}`;
 }
 
-/** Strip any trailing tab and build the per-tab listing URLs. */
-export function tabUrls(
-	channelUrl: string,
-	tabs: readonly string[]
-): { tab: string; url: string }[] {
-	const base = channelUrl.replace(/\/+$/, "").replace(/\/(videos|shorts|streams|featured)$/, "");
+export function storageIdentity(value: string): string {
+	return createHash("sha256").update(canonicalSource(value)).digest("hex");
+}
+
+export function tabUrls(value: string, tabs: readonly string[]): { tab: string; url: string }[] {
+	const base = canonicalSource(value);
+	if (new URL(base).pathname === "/playlist") return [{ tab: "playlist", url: base }];
 	return tabs.map((tab) => ({ tab, url: `${base}/${tab}` }));
 }
 
-/**
- * Enumerate every video (id + title) across the channel's videos + shorts tabs (per
- * DEFAULTS.tabs; streams are deliberately excluded). Hitting the tabs explicitly
- * matters: the channel page alone misses Shorts. Titles come free here, so the fetch
- * step never needs `--print` (which would suppress subtitle downloads).
- */
+function text(value: unknown): string {
+	return typeof value === "string" && value !== "NA" ? value.trim() : "";
+}
+
+export function metadataItem(value: unknown): VideoItem | null {
+	if (!value || typeof value !== "object") return null;
+	const row = value as Record<string, unknown>;
+	if (typeof row.id !== "string" || !VIDEO_ID.test(row.id)) return null;
+	return {
+		id: row.id,
+		title: text(row.title),
+		creator: text(row.channel) || text(row.uploader) || "unknown",
+		creatorUrl: text(row.channel_url) || text(row.uploader_url)
+	};
+}
+
 export async function enumerateChannel(
-	channelUrl: string,
-	tabs: readonly string[] = DEFAULTS.tabs
-): Promise<{ items: VideoItem[]; perTab: Record<string, number> }> {
+	value: string,
+	tabs: readonly string[] = DEFAULTS.tabs,
+	signal?: AbortSignal
+): Promise<{ items: VideoItem[]; perTab: Record<string, number>; listingFailures: string[] }> {
 	const seen = new Set<string>();
 	const items: VideoItem[] = [];
 	const perTab: Record<string, number> = {};
-
-	for (const { tab, url } of tabUrls(channelUrl, tabs)) {
-		const proc = Bun.spawn(
-			["yt-dlp", ...jsRuntimeArgs(), "--flat-playlist", "--print", "%(id)s\t%(title)s", url],
-			{ stdout: "pipe", stderr: "pipe" }
+	const listingFailures: string[] = [];
+	for (const { tab, url } of tabUrls(value, tabs)) {
+		const result = await runCommand(
+			["yt-dlp", ...jsRuntimeArgs(), "--flat-playlist", "--dump-json", url],
+			{ signal, timeoutMs: 15 * 60_000 }
 		);
-		const out = await new Response(proc.stdout).text();
-		await proc.exited; // a missing tab just yields no rows; that's fine
-
+		if (result.cancelled) throw new Error("Listing cancelled.");
+		if (result.code !== 0 || result.timedOut)
+			listingFailures.push(`${tab}: listing failed${result.timedOut ? " (timeout)" : ""}`);
 		let count = 0;
-		for (const line of out.split("\n")) {
-			const row = line.trim();
-			if (!row) continue;
+		for (const line of result.stdout.split("\n").filter(Boolean)) {
+			let item: VideoItem | null;
+			try {
+				item = metadataItem(JSON.parse(line));
+			} catch {
+				item = null;
+			}
+			if (!item) {
+				listingFailures.push(`${tab}: malformed listing row`);
+				continue;
+			}
 			count++;
-			const sep = row.indexOf("\t");
-			const id = sep >= 0 ? row.slice(0, sep) : row;
-			const title = sep >= 0 ? row.slice(sep + 1).trim() : "";
-			if (seen.has(id)) continue;
-			seen.add(id);
-			items.push({ id, title });
+			if (!seen.has(item.id)) {
+				seen.add(item.id);
+				items.push(item);
+			}
 		}
 		perTab[tab] = count;
 	}
-
-	return { items, perTab };
+	return { items, perTab, listingFailures };
 }
 
-/**
- * Parse the single-media metadata line (`uploader_url\ttitle`, split on the FIRST tab) into the
- * key/display/title triple. slug = unique manifest/cache KEY (the creator @handle, else the bare
- * id); channel = human DISPLAY (the handle, else "unknown" — never the raw id); yt-dlp prints the
- * literal "NA" for a present-but-missing field, so guard both "NA" and empty. Pure → unit-tested.
- */
 export function resolveSingleMeta(
 	out: string,
 	id: string
 ): { slug: string; channel: string; title: string } {
 	const tab = out.indexOf("\t");
-	const uploaderUrl = tab >= 0 ? out.slice(0, tab) : "";
-	const rawTitle = tab >= 0 ? out.slice(tab + 1).trim() : "";
-	const handle = uploaderUrl && uploaderUrl !== "NA" ? channelSlug(uploaderUrl) : "";
-	const title = rawTitle && rawTitle !== "NA" ? rawTitle : "";
+	const uploaderUrl = tab >= 0 ? text(out.slice(0, tab)) : "";
+	const title = tab >= 0 ? text(out.slice(tab + 1)) : "";
+	const handle = uploaderUrl ? channelSlug(uploaderUrl) : "";
 	return { slug: handle || id, channel: handle || "unknown", title };
 }
 
-/**
- * Resolve any YouTube url to a video list + a slug. A channel / playlist / handle url enumerates
- * its videos+shorts tabs (the original behavior). A single video / Short / live / embed url
- * bypasses enumeration: one yt-dlp metadata call resolves the real title + the creator's @handle,
- * so the slug matches that creator's channel manifest (a single-video ingest then dedupes against
- * a full-channel ingest — INSERT OR IGNORE keeps the already-`done` row, zero re-work) and the
- * palace entry + commit message attribute correctly. `slug` is the unique manifest/cache KEY;
- * `channel` is the human DISPLAY label (palace header + commit) — kept SEPARATE so the id-as-key
- * fallback never leaks a raw video id in as a creator name. If the metadata is unavailable the key
- * falls back to the bare id and the display to "unknown". Never throws — a failed metadata call
- * still yields one item, which the fetch phase then retries/reports as usual.
- */
 export async function enumerate(
-	url: string
-): Promise<{ slug: string; channel: string; items: VideoItem[]; perTab: Record<string, number> }> {
-	const id = parseVideoId(url);
+	value: string,
+	signal?: AbortSignal
+): Promise<{
+	slug: string;
+	channel: string;
+	items: VideoItem[];
+	perTab: Record<string, number>;
+	listingFailures: string[];
+	aliases: string[];
+}> {
+	const source = canonicalSource(value);
+	const slug = storageIdentity(source);
+	const id = parseVideoId(source);
 	if (!id) {
-		const slug = channelSlug(url);
-		return { slug, channel: slug, ...(await enumerateChannel(url, DEFAULTS.tabs)) };
+		const listing = await enumerateChannel(source, DEFAULTS.tabs, signal);
+		return {
+			slug,
+			channel: channelSlug(source),
+			...listing,
+			aliases: [
+				...new Set([
+					channelSlug(source),
+					legacyChannelSlug(value),
+					legacyChannelSlug(source),
+					...listing.items.flatMap((v) =>
+						v.creatorUrl ? [channelSlug(v.creatorUrl), legacyChannelSlug(v.creatorUrl)] : [v.id]
+					)
+				])
+			]
+		};
 	}
-
-	// Query the CANONICAL watch url, never the pasted one: a raw `&list=` makes yt-dlp expand the
-	// whole playlist (one row per entry) and break this parse. uploader_url FIRST + split on the
-	// first tab, so even a (vanishingly rare) tab inside the title can only corrupt the title.
-	const proc = Bun.spawn(
+	const result = await runCommand(
 		[
 			"yt-dlp",
 			...jsRuntimeArgs(),
 			"--skip-download",
-			"--no-warnings",
-			"--print",
-			"%(uploader_url)s\t%(title)s",
-			`https://www.youtube.com/watch?v=${id}`
+			"--no-playlist",
+			"--dump-single-json",
+			source
 		],
-		{ stdout: "pipe", stderr: "pipe" }
+		{ signal, timeoutMs: 15 * 60_000 }
 	);
-	const out = (await new Response(proc.stdout).text()).trim();
-	await proc.exited;
-
-	const { slug, channel, title } = resolveSingleMeta(out, id);
-	return { slug, channel, items: [{ id, title }], perTab: { single: 1 } };
+	if (result.cancelled) throw new Error("Listing cancelled.");
+	let item: VideoItem | null = null;
+	try {
+		item = metadataItem(JSON.parse(result.stdout));
+		if (item?.id !== id) item = null;
+	} catch {
+		/* fetch still retries this identity */
+	}
+	const alias = item?.creatorUrl ? channelSlug(item.creatorUrl) : id;
+	return {
+		slug,
+		channel: item?.creator || "unknown",
+		items: [item ?? { id, title: "", creator: "unknown" }],
+		perTab: { single: 1 },
+		listingFailures: result.code === 0 && item ? [] : ["single: metadata unavailable"],
+		aliases: [
+			...new Set([alias, id, ...(item?.creatorUrl ? [legacyChannelSlug(item.creatorUrl)] : [])])
+		]
+	};
 }
