@@ -152,6 +152,8 @@ export interface PalaceSnapshot {
 	notes: { path: string; text: string }[];
 }
 
+export class PalaceBaseChangedError extends Error {}
+
 export interface PublishInput extends Omit<RenderInput, "idToM"> {
 	runId: string;
 	expectedBase: string;
@@ -315,7 +317,9 @@ async function verifyPublished(
 		await git(root, ["ls-remote", "--exit-code", "origin", "refs/heads/main"], signal)
 	).split(/\s+/)[0];
 	if (live !== base)
-		throw new Error("Remote moved during publication verification; retry to recover receipt");
+		throw new PalaceBaseChangedError(
+			"Remote moved during publication verification; retry to recover receipt"
+		);
 	return {
 		room: input.room,
 		runId: input.runId,
@@ -407,6 +411,10 @@ export async function publishBatch(
 			["clone", "--quiet", "--branch", "main", "--single-branch", "--", origin, source],
 			options.signal
 		);
+		if ((await git(source, ["rev-parse", "HEAD"], options.signal)) !== input.expectedBase)
+			throw new PalaceBaseChangedError(
+				`Palace base changed since deduplication; recovery data: ${temp}`
+			);
 		const script = join(source, "scripts", "mind-palace-sync");
 		const help = await runCommand([script, "help"], { cwd: source, signal: options.signal });
 		if (help.code !== 0 || !help.stdout.includes("--require-unchanged-base")) {
@@ -445,6 +453,14 @@ export async function publishBatch(
 			{ cwd: source, env, signal: options.signal }
 		);
 		if (result.code !== 0 || result.timedOut || result.cancelled || result.overflow) {
+			// Classify races from canonical Git state, never subprocess error prose.
+			if (!result.timedOut && !result.cancelled && !result.overflow) {
+				const current = await loadPalaceSnapshot(root, options.signal);
+				if (current.base !== input.expectedBase)
+					throw new PalaceBaseChangedError(
+						`Palace base changed during publication; recovery data: ${temp}`
+					);
+			}
 			throw new Error(`Palace publication preserved at ${temp}: ${result.stderr || result.stdout}`);
 		}
 		const prepared = existsSync(receiptPath)

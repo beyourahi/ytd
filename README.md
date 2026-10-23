@@ -78,8 +78,9 @@ Palace publication requires the approved `scripts/mind-palace-sync` with
 `--require-unchanged-base`. It operates in isolated transactions, preserves foreign dirty/staged
 work, allocates global `[Mn]` IDs under the writer lock, and makes one commit per room/creator.
 Stable markers and remote content/commit verification recover partial publication and lost
-receipts. Remote base movement stops publication and preserves the candidate; the next run
-refreshes affected deduplication. Ingestion completes only after every intended room is
+receipts. Remote base movement automatically refreshes affected deduplication and retries
+publication up to three times, reusing unchanged comparisons and verified rooms. Continued
+movement preserves progress for the next run. Ingestion completes only after every intended room is
 remotely verified. Tests never publish experimental notes to the real Palace.
 
 ## Development

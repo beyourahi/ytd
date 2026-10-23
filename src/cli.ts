@@ -11,6 +11,7 @@ import {
 	publishBatch,
 	verifyPublication,
 	recoverPublication,
+	PalaceBaseChangedError,
 	type PublicationReceipt
 } from "./palace.ts";
 import { preflight, type AgentProfile } from "./agents.ts";
@@ -141,6 +142,31 @@ async function publishCreator(
 	source: string,
 	signal: AbortSignal
 ): Promise<PublicationReceipt[]> {
+	for (let attempt = 1; ; attempt++) {
+		signal.throwIfAborted();
+		try {
+			return await publishCreatorAttempt(manifest, profile, key, rows, source, signal);
+		} catch (error) {
+			signal.throwIfAborted();
+			if (!(error instanceof PalaceBaseChangedError)) throw error;
+			if (attempt >= 3)
+				throw new Error(
+					`Palace kept moving after ${attempt} publication attempts; progress preserved. Re-run the same command. ${error.message}`,
+					{ cause: error }
+				);
+			console.log("Palace changed; refreshing affected deduplication and retrying publication…");
+		}
+	}
+}
+
+async function publishCreatorAttempt(
+	manifest: Manifest,
+	profile: AgentProfile,
+	key: string,
+	rows: VideoRow[],
+	source: string,
+	signal: AbortSignal
+): Promise<PublicationReceipt[]> {
 	const checkpointKey = `publication:${stableHash(key)}`;
 	let plan = manifest.getCheckpoint<PublicationPlan>(checkpointKey);
 	const channel = plan?.channel ?? rows[0].channel ?? "unknown";
@@ -181,7 +207,7 @@ async function publishCreator(
 		plan.base = snapshot.base;
 		manifest.checkpoint(checkpointKey, plan);
 	}
-	if (!plan || plan.base !== snapshot.base) {
+	if (!plan || plan.notesHash !== notesHash) {
 		console.log(`Reduce ${candidates.length} candidates from ${channel}…`);
 		const result = await reduce(
 			candidates,
@@ -241,6 +267,14 @@ async function publishCreator(
 		console.log(
 			`Published and remotely verified ${receipt.path} (${receipt.commit.slice(0, 12)}).`
 		);
+		// A verified head may include a foreign commit made just after our successful push.
+		if (
+			plan.out.rooms.some(
+				(next) =>
+					next.principles.length && !plan!.receipts.some((saved) => saved.room === next.room)
+			)
+		)
+			return publishCreatorAttempt(manifest, profile, key, rows, source, signal);
 	}
 	plan.complete = true;
 	manifest.checkpoint(checkpointKey, plan);
