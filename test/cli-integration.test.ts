@@ -10,8 +10,16 @@ import { appendFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 if (process.argv[1].endsWith("yt-dlp")) {
- const metadata = {id:"dQw4w9WgXcQ",title:"Useful video",channel:"Fixture creator",channel_url:"https://youtube.com/@fixture",description:"Resources"};
- if (args.includes("--dump-single-json") || args.includes("--dump-json")) console.log(JSON.stringify(metadata));
+ const url=args.at(-1);
+ const ids=["dQw4w9WgXcQ","0Rqoe5quCJQ","W1gW1dHRsOw"];
+ const id=new URL(url).searchParams.get("v") || ids[0];
+ const item=(id)=>({id,title:"Useful video "+id,channel:process.env.YTD_FIXTURE_MULTI && id===ids[1] ? "Second creator" : "Fixture creator",channel_url:process.env.YTD_FIXTURE_MULTI && id===ids[1] ? "https://youtube.com/@second" : "https://youtube.com/@fixture",description:"Resources"});
+ const metadata=item(id);
+ if (args.includes("--dump-json") && process.env.YTD_FIXTURE_MULTI) {
+  const listed=url.includes("/playlist?") ? ids : url.endsWith("/shorts") ? [ids[2],ids[0]] : ids.slice(0,2);
+  for(const video of listed) console.log(JSON.stringify(item(video)));
+ }
+ else if (args.includes("--dump-single-json") || args.includes("--dump-json")) console.log(JSON.stringify(metadata));
  else { const template=args[args.indexOf("-o")+1]; writeFileSync(template.replace("%(ext)s","en.json3"),JSON.stringify({events:[{segs:[{utf8:"Reusable useful material"}]}]})); writeFileSync(template.replace("%(ext)s","info.json"),JSON.stringify(metadata)); }
 } else {
  const prompt=await new Response(Bun.stdin.stream()).text();
@@ -26,8 +34,9 @@ if (process.argv[1].endsWith("yt-dlp")) {
   }
   writeFileSync(process.env.YTD_FIXTURE_RACE_MARKER,"advanced");
  }
- const sourceId="dQw4w9WgXcQ";
- const p={theme:"Reliable systems",principle:"Checkpoint completed work before advancing",ids:[sourceId]};
+ const candidates=prompt.startsWith("Merge") ? JSON.parse(prompt.split("CANDIDATES:\\n")[1]) : [];
+ const sourceId=prompt.match(/videoId: ([A-Za-z0-9_-]{11})/)?.[1] || candidates[0]?.sourceId || "dQw4w9WgXcQ";
+ const p={theme:"Reliable systems",principle:"Checkpoint completed work before advancing",ids:candidates.length ? [...new Set(candidates.map(c=>c.sourceId))] : [sourceId]};
  if(prompt.startsWith("Distill")) console.log(JSON.stringify([{principle:p.principle,detail:"Commit progress atomically so interruption does not lose work.",theme:p.theme,sourceId}]));
  else if(prompt.startsWith("Carefully")) console.log("[]");
  else if(prompt.startsWith("Merge")) console.log(JSON.stringify({rooms:[{room:"content",principles:[p],halalNotes:[]},{room:"craft",principles:[p],halalNotes:[]},{room:"business",principles:[],halalNotes:["Reject the doubtful shortcut"]}]}));
@@ -81,6 +90,57 @@ function createCliFixture() {
 	const cli = join(import.meta.dir, "../src/cli.ts");
 	const command = [process.execPath, cli, "https://youtu.be/dQw4w9WgXcQ"];
 	return { ...fixture, configDir, calls, env, cli, command };
+}
+
+for (const url of ["https://youtube.com/@fixture", "https://youtube.com/playlist?list=PLfixture"]) {
+	test.skipIf(!hasPalacePrerequisite)(
+		`whole CLI publishes mixed creators from ${url} and deduplicates later URL forms`,
+		async () => {
+			const f = createCliFixture();
+			try {
+				const env = { ...f.env, YTD_FIXTURE_MULTI: "1" };
+				const result = await runCommand([process.execPath, f.cli, url], {
+					env,
+					timeoutMs: 60_000
+				});
+				expect(result.stderr).toBe("");
+				expect(result.code).toBe(0);
+				expect(result.stdout).toContain("4 room/creator publications remotely verified");
+				for (const room of ["content", "craft"]) {
+					const text = fixtureGit(f.remote, "show", `main:${room}/field-notes.md`);
+					expect(text.match(/<!-- ytd:/g)).toHaveLength(2);
+					for (const id of ["dQw4w9WgXcQ", "0Rqoe5quCJQ", "W1gW1dHRsOw"])
+						expect(text.match(new RegExp("YouTube `" + id + "`", "g"))).toHaveLength(1);
+					expect(text).toContain("Second creator");
+					expect(text).toContain("Fixture creator");
+					for (const id of [53, 54, 55]) expect(text).toContain(`[M${id}]`);
+					expect(text.match(/## ⚠️ Halal gate/g)).toHaveLength(2);
+				}
+				const calls = readFileSync(f.calls, "utf8");
+				expect(calls.split("\n").filter((line) => line.startsWith("Distill"))).toHaveLength(3);
+				const head = fixtureGit(f.remote, "rev-parse", "main");
+				for (const repeat of [
+					"https://youtube.com/playlist?list=PLfixture",
+					"https://youtube.com/@fixture/shorts",
+					"https://youtu.be/0Rqoe5quCJQ?t=10",
+					"https://youtube.com/shorts/W1gW1dHRsOw"
+				]) {
+					const rerun = await runCommand([process.execPath, f.cli, repeat], {
+						env,
+						timeoutMs: 60_000
+					});
+					expect(rerun.stderr).toBe("");
+					expect(rerun.code).toBe(0);
+					expect(readFileSync(f.calls, "utf8")).toBe(calls);
+					expect(fixtureGit(f.remote, "rev-parse", "main")).toBe(head);
+				}
+				expect(existsSync(join(f.configDir, "data", "ingest.lock"))).toBe(false);
+			} finally {
+				rmSync(f.root, { recursive: true, force: true });
+			}
+		},
+		180_000
+	);
 }
 
 test.skipIf(!hasPalacePrerequisite)(

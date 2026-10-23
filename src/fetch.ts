@@ -29,6 +29,7 @@ export function json3ToText(raw: string): string {
 		for (const segment of Array.isArray(event?.segs) ? event.segs : []) {
 			if (typeof segment?.utf8 === "string") parts.push(segment.utf8);
 		}
+		parts.push(" ");
 	}
 	return parts.join("").replace(/\s+/g, " ").trim();
 }

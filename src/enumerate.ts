@@ -130,7 +130,18 @@ export async function enumerateChannel(
 			{ signal, timeoutMs: 15 * 60_000 }
 		);
 		if (result.cancelled) throw new Error("Listing cancelled.");
-		if (result.code !== 0 || result.timedOut)
+		const errors = result.stderr.split(/\r?\n/).filter((line) => line.startsWith("ERROR:"));
+		const absentTab =
+			(tab === "videos" || tab === "shorts") &&
+			result.code === 1 &&
+			!result.timedOut &&
+			!result.overflow &&
+			!result.stdout.trim() &&
+			errors.length === 1 &&
+			errors[0].match(
+				/^ERROR: \[youtube:tab\] [^:\r\n]+: This channel does not have a (videos|shorts) tab$/
+			)?.[1] === tab;
+		if (!absentTab && (result.code !== 0 || result.timedOut || result.overflow))
 			listingFailures.push(`${tab}: listing failed${result.timedOut ? " (timeout)" : ""}`);
 		let count = 0;
 		for (const line of result.stdout.split("\n").filter(Boolean)) {
