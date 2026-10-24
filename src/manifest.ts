@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, constants } from "no
 import { join, resolve } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { DATA_DIR } from "./config.ts";
+import { Claims, acquireLegacyLock, type WaitOptions } from "./claims.ts";
 import { validSourceReview, type Candidate, type SourceHalalNote } from "./distill.ts";
 
 export type Status = "pending" | "fetched" | "distilled" | "done" | "failed" | "no_captions";
@@ -66,7 +67,33 @@ export class Manifest {
 	private db: Database;
 	private dataDir: string;
 	private slug: string;
+	private claims: Claims;
 	runId = "";
+
+	static async open(
+		channelSlug: string,
+		dataDir = DATA_DIR,
+		options: WaitOptions & { legacyRoot?: string; aliases?: string[]; sourceDir?: string } = {}
+	): Promise<Manifest> {
+		const claims = new Claims(dataDir);
+		let release: (() => void) | undefined;
+		let releaseLegacy: (() => void) | undefined;
+		let manifest: Manifest | undefined;
+		try {
+			release = await claims.acquire(["initialize"], options);
+			releaseLegacy = await acquireLegacyLock(options.legacyRoot ?? dataDir, options);
+			manifest = new Manifest(channelSlug, dataDir);
+			manifest.importLegacy(options.aliases ?? [], options.sourceDir ?? dataDir);
+			return manifest;
+		} catch (error) {
+			manifest?.close();
+			throw error;
+		} finally {
+			releaseLegacy?.();
+			release?.();
+			claims.close();
+		}
+	}
 
 	constructor(channelSlug: string, dataDir = DATA_DIR) {
 		if (!/^[a-zA-Z0-9_-]+$/.test(channelSlug)) throw new Error("Unsafe manifest identity");
@@ -75,92 +102,213 @@ export class Manifest {
 		mkdirSync(dataDir, { recursive: true });
 		const path = join(dataDir, `${channelSlug}.sqlite`);
 		this.db = new Database(path);
-		if (
-			(this.db.query("PRAGMA integrity_check").get() as { integrity_check: string })
-				.integrity_check !== "ok"
-		)
-			throw new Error(`Corrupt manifest preserved at ${path}`);
-		const version = (this.db.query("PRAGMA user_version").get() as { user_version: number })
-			.user_version;
-		if (version > 1) throw new Error("Manifest is newer than this ytd; original data preserved");
-		if (
-			version === 0 &&
-			this.db.query("SELECT name FROM sqlite_master WHERE name='videos'").get()
-		) {
-			if (!existsSync(`${path}.legacy.bak`)) this.db.run("VACUUM INTO ?", [`${path}.legacy.bak`]);
+		this.db.run("PRAGMA busy_timeout=5000");
+		this.claims = new Claims(dataDir);
+		try {
+			if (
+				(this.db.query("PRAGMA integrity_check").get() as { integrity_check: string })
+					.integrity_check !== "ok"
+			)
+				throw new Error(`Corrupt manifest preserved at ${path}`);
+			const originalVersion = (
+				this.db.query("PRAGMA user_version").get() as { user_version: number }
+			).user_version;
+			if (originalVersion > 2)
+				throw new Error("Manifest is newer than this ytd; original data preserved");
+			const backupPath =
+				originalVersion === 0 ? `${path}.legacy.bak` : `${path}.v${originalVersion}.bak`;
+			if (
+				originalVersion < 2 &&
+				this.db.query("SELECT name FROM sqlite_master WHERE name='videos'").get() &&
+				!existsSync(backupPath)
+			)
+				this.db.run("VACUUM INTO ?", [backupPath]);
+			this.db.run("PRAGMA journal_mode=WAL");
+			this.db.run("PRAGMA foreign_keys=ON");
+			this.db
+				.transaction(() => {
+					const version = (this.db.query("PRAGMA user_version").get() as { user_version: number })
+						.user_version;
+					if (version > 2)
+						throw new Error("Manifest is newer than this ytd; original data preserved");
+
+					this.db.run(
+						`CREATE TABLE IF NOT EXISTS videos (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL DEFAULT 'pending', reason TEXT)`
+					);
+					const columns = this.db.query("PRAGMA table_info(videos)").all() as { name: string }[];
+					for (const name of ["channel", "channelUrl"]) {
+						if (!columns.some((c) => c.name === name))
+							this.db.run(`ALTER TABLE videos ADD COLUMN ${name} TEXT`);
+					}
+					this.db.run(
+						`CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, profile TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`
+					);
+					const runColumns = this.db.query("PRAGMA table_info(runs)").all() as { name: string }[];
+					if (!runColumns.some((c) => c.name === "source"))
+						this.db.run("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT ''");
+					this.db.run(
+						`CREATE TABLE IF NOT EXISTS candidates (run_id TEXT NOT NULL, candidate_key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,candidate_key))`
+					);
+					this.db.run(
+						`CREATE TABLE IF NOT EXISTS checkpoints (run_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,key))`
+					);
+					this.db.run(
+						`CREATE TABLE IF NOT EXISTS receipts (key TEXT PRIMARY KEY, run_id TEXT NOT NULL, value TEXT NOT NULL)`
+					);
+					this.db.run(`CREATE TABLE IF NOT EXISTS migrations (alias TEXT PRIMARY KEY)`);
+					this.db.run(
+						"CREATE TABLE IF NOT EXISTS run_videos (run_id TEXT NOT NULL,id TEXT NOT NULL,status TEXT NOT NULL,reason TEXT,title TEXT,channel TEXT,channelUrl TEXT,PRIMARY KEY(run_id,id))"
+					);
+					const membershipColumns = this.db.query("PRAGMA table_info(run_videos)").all() as {
+						name: string;
+					}[];
+					for (const name of ["title", "channel", "channelUrl"]) {
+						if (!membershipColumns.some((column) => column.name === name)) {
+							this.db.run(`ALTER TABLE run_videos ADD COLUMN ${name} TEXT`);
+							this.db.run(
+								`UPDATE run_videos SET ${name}=(SELECT ${name} FROM videos WHERE videos.id=run_videos.id)`
+							);
+						}
+					}
+					if (version < 2) {
+						const runs = this.db.query("SELECT id,profile,status FROM runs").all() as {
+							id: string;
+							profile: string;
+							status: string;
+						}[];
+						for (const run of runs) {
+							const profile = JSON.parse(run.profile) as { source?: unknown; videoIds?: unknown };
+							this.db.run("UPDATE runs SET source=? WHERE id=?", [
+								typeof profile.source === "string" ? profile.source : "",
+								run.id
+							]);
+							const ids =
+								Array.isArray(profile.videoIds) &&
+								profile.videoIds.every((id) => typeof id === "string")
+									? (profile.videoIds as string[])
+									: this.globalVideos().map((row) => row.id);
+							for (const id of ids)
+								this.db.run(
+									"INSERT OR IGNORE INTO run_videos(run_id,id,status,reason,title,channel,channelUrl) SELECT ?,id,status,reason,title,channel,channelUrl FROM videos WHERE id=?",
+									[run.id, id]
+								);
+						}
+						this.db.run("UPDATE videos SET status='fetched',reason=NULL WHERE status='distilled'");
+					}
+					this.db.run("PRAGMA user_version=2");
+				})
+				.immediate();
+		} catch (error) {
+			this.db.close();
+			this.claims.close();
+			throw error;
 		}
-		this.db.run("PRAGMA journal_mode=WAL");
-		this.db.run("PRAGMA foreign_keys=ON");
-		this.db.transaction(() => {
-			this.db.run(
-				`CREATE TABLE IF NOT EXISTS videos (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL DEFAULT 'pending', reason TEXT)`
-			);
-			const columns = this.db.query("PRAGMA table_info(videos)").all() as { name: string }[];
-			for (const name of ["channel", "channelUrl"]) {
-				if (!columns.some((c) => c.name === name))
-					this.db.run(`ALTER TABLE videos ADD COLUMN ${name} TEXT`);
-			}
-			this.db.run(
-				`CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, profile TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`
-			);
-			this.db.run(
-				`CREATE TABLE IF NOT EXISTS candidates (run_id TEXT NOT NULL, candidate_key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,candidate_key))`
-			);
-			this.db.run(
-				`CREATE TABLE IF NOT EXISTS checkpoints (run_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(run_id,key))`
-			);
-			this.db.run(
-				`CREATE TABLE IF NOT EXISTS receipts (key TEXT PRIMARY KEY, run_id TEXT NOT NULL, value TEXT NOT NULL)`
-			);
-			this.db.run(`CREATE TABLE IF NOT EXISTS migrations (alias TEXT PRIMARY KEY)`);
-			this.db.run("PRAGMA user_version=1");
-		})();
+	}
+
+	async acquireSource(
+		source: string,
+		ids: string[],
+		options: WaitOptions = {}
+	): Promise<() => void> {
+		return this.claims.acquire(() => {
+			const saved = this.db
+				.query(
+					"SELECT rv.id FROM run_videos rv JOIN runs r ON r.id=rv.run_id WHERE r.source=? AND r.status='active'"
+				)
+				.all(source) as { id: string }[];
+			return [
+				`source:${source}`,
+				...[...ids, ...saved.map((row) => row.id)].map((id) => `video:${id}`)
+			];
+		}, options);
+	}
+
+	async acquirePublication(options: WaitOptions = {}): Promise<() => void> {
+		return this.claims.acquire(["publication"], options);
 	}
 
 	private requireRun(): void {
 		if (!this.runId) throw new Error("Select a run before storing progress");
 	}
 
+	hasPublicationPlans(): boolean {
+		this.requireRun();
+		return !!this.db
+			.query("SELECT key FROM checkpoints WHERE run_id=? AND key LIKE 'publication:%' LIMIT 1")
+			.get(this.runId);
+	}
+
 	beginRun(profile: unknown): { id: string; replaced: boolean } {
 		const encoded = canonical(profile);
-		const old = this.db
-			.query("SELECT id,profile FROM runs WHERE status='active' ORDER BY rowid DESC LIMIT 1")
-			.get() as { id: string; profile: string } | null;
-		if (old?.profile === encoded) {
-			this.runId = old.id;
-			return { id: old.id, replaced: false };
-		}
-		if (old) {
-			const before = JSON.parse(old.profile) as Record<string, unknown>;
-			const after = profile as Record<string, unknown>;
-			const requested = (s: Record<string, unknown>) => {
-				const p = (s.profile ?? s) as Record<string, unknown>;
-				return canonical([
-					s.source,
-					s.videoIds,
-					p.agent,
-					p.model,
-					p.effort,
-					p.contextTokens,
-					p.timeoutMs,
-					p.custom
-				]);
-			};
-			if (requested(before) === requested(after))
-				throw new Error(
-					"Agent routing changed since the paused run; restore the original route or explicitly select a replacement profile"
+		const selection = profile as { source?: unknown; videoIds?: unknown };
+		const source = typeof selection.source === "string" ? selection.source : "";
+		return this.db
+			.transaction(() => {
+				const old = this.db
+					.query(
+						"SELECT id,profile FROM runs WHERE status='active' AND source=? ORDER BY rowid DESC LIMIT 1"
+					)
+					.get(source) as { id: string; profile: string } | null;
+				const selectedProfile = (value: Record<string, unknown>) =>
+					value.profile ??
+					Object.fromEntries(
+						Object.entries(value).filter(([key]) => key !== "source" && key !== "videoIds")
+					);
+				if (
+					old &&
+					canonical(selectedProfile(JSON.parse(old.profile))) ===
+						canonical(selectedProfile(profile as Record<string, unknown>))
+				) {
+					this.runId = old.id;
+					// Finish this immutable source set before a follow-on run ingests newly listed videos.
+					// Saved plans recover every room even if another source completed the video.
+					if (!this.hasPublicationPlans())
+						this.db.run(
+							"UPDATE run_videos SET status='done',reason=NULL WHERE run_id=? AND id IN (SELECT id FROM videos WHERE status='done')",
+							[old.id]
+						);
+					return { id: old.id, replaced: false };
+				}
+				if (old) {
+					const requested = (s: Record<string, unknown>) => {
+						const p = (s.profile ?? s) as Record<string, unknown>;
+						return canonical([p.agent, p.model, p.effort, p.contextTokens, p.timeoutMs, p.custom]);
+					};
+					if (requested(JSON.parse(old.profile)) === requested(profile as Record<string, unknown>))
+						throw new Error(
+							"Agent routing changed since the paused run; restore the original route or explicitly select a replacement profile"
+						);
+				}
+				const id = randomUUID();
+				const ids = new Set(
+					Array.isArray(selection.videoIds) &&
+						selection.videoIds.every((id) => typeof id === "string")
+						? (selection.videoIds as string[])
+						: this.globalVideos().map((row) => row.id)
 				);
-		}
-		const id = randomUUID();
-		this.db.transaction(() => {
-			if (old) {
-				this.db.run("UPDATE runs SET status='superseded' WHERE id=?", [old.id]);
-				this.db.run("UPDATE videos SET status='fetched', reason=NULL WHERE status='distilled'");
-			}
-			this.db.run("INSERT INTO runs(id,profile,status) VALUES (?,?,'active')", [id, encoded]);
-		})();
-		this.runId = id;
-		return { id, replaced: !!old };
+				if (old) {
+					const saved = this.db
+						.query("SELECT id FROM run_videos WHERE run_id=? AND status!='done'")
+						.all(old.id) as { id: string }[];
+					for (const row of saved) ids.add(row.id);
+					this.db.run("UPDATE runs SET status='superseded' WHERE id=?", [old.id]);
+				}
+				this.db.run("INSERT INTO runs(id,profile,status,source) VALUES (?,?,'active',?)", [
+					id,
+					encoded,
+					source
+				]);
+				for (const videoId of ids) {
+					this.db.run("INSERT OR IGNORE INTO videos(id) VALUES (?)", [videoId]);
+					this.db.run(
+						"INSERT INTO run_videos(run_id,id,status,reason,title,channel,channelUrl) SELECT ?,id,status,reason,title,channel,channelUrl FROM videos WHERE id=?",
+						[id, videoId]
+					);
+				}
+				this.runId = id;
+				return { id, replaced: !!old };
+			})
+			.immediate();
 	}
 
 	addVideos(videos: { id: string; title: string; channel?: string; channelUrl?: string }[]): void {
@@ -168,33 +316,74 @@ export class Manifest {
 			`INSERT INTO videos (id,title,status,channel,channelUrl) VALUES (?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET title=COALESCE(NULLIF(excluded.title,''),videos.title), channel=COALESCE(NULLIF(excluded.channel,''),videos.channel), channelUrl=COALESCE(NULLIF(excluded.channelUrl,''),videos.channelUrl)`
 		);
 		this.db.transaction(() => {
-			for (const v of videos)
+			for (const v of videos) {
 				stmt.run(v.id, v.title || null, v.channel ?? null, v.channelUrl ?? null);
+				if (this.runId) {
+					this.db.run(
+						"INSERT OR IGNORE INTO run_videos(run_id,id,status,reason,title,channel,channelUrl) SELECT ?,id,status,reason,title,channel,channelUrl FROM videos WHERE id=?",
+						[this.runId, v.id]
+					);
+					this.db.run(
+						"UPDATE run_videos SET title=COALESCE(NULLIF(?,''),title),channel=COALESCE(NULLIF(?,''),channel),channelUrl=COALESCE(NULLIF(?,''),channelUrl) WHERE run_id=? AND id=?",
+						[v.title || null, v.channel ?? null, v.channelUrl ?? null, this.runId, v.id]
+					);
+				}
+			}
 		})();
 	}
 	setStatus(id: string, status: Status, reason: string | null = null): void {
-		this.db.run("UPDATE videos SET status=?, reason=? WHERE id=?", [status, reason, id]);
+		this.requireRun();
+		this.db
+			.transaction(() => {
+				const changed = this.db.run(
+					"UPDATE run_videos SET status=?,reason=? WHERE run_id=? AND id=?",
+					[status, reason, this.runId, id]
+				);
+				if (!changed.changes) throw new Error("Video is outside the selected run");
+				// Only completed publication is shared. Extraction remains private to its run.
+				const shared = status === "distilled" ? "fetched" : status;
+				this.db.run("UPDATE videos SET status=?,reason=? WHERE id=? AND status!='done'", [
+					shared,
+					reason,
+					id
+				]);
+			})
+			.immediate();
 	}
 	setTitle(id: string, title: string): void {
-		this.db.run("UPDATE videos SET title=? WHERE id=?", [title, id]);
+		this.requireRun();
+		this.db
+			.transaction(() => {
+				const changed = this.db.run("UPDATE run_videos SET title=? WHERE run_id=? AND id=?", [
+					title,
+					this.runId,
+					id
+				]);
+				if (!changed.changes) throw new Error("Video is outside the selected run");
+				this.db.run("UPDATE videos SET title=? WHERE id=?", [title, id]);
+			})
+			.immediate();
 	}
 	byStatus(...statuses: Status[]): VideoRow[] {
-		if (!statuses.length) return [];
-		return this.db
-			.query(
-				`SELECT * FROM videos WHERE status IN (${statuses.map(() => "?").join(",")}) ORDER BY rowid`
-			)
-			.all(...statuses) as VideoRow[];
+		return this.all().filter((row) => statuses.includes(row.status));
 	}
-	all(): VideoRow[] {
+	private globalVideos(): VideoRow[] {
 		return this.db.query("SELECT * FROM videos ORDER BY rowid").all() as VideoRow[];
 	}
-	counts(): Record<string, number> {
-		const rows = this.db
-			.query("SELECT status, COUNT(*) AS n FROM videos GROUP BY status")
-			.all() as { status: string; n: number }[];
-		return Object.fromEntries(rows.map((r) => [r.status, r.n]));
+	all(): VideoRow[] {
+		if (!this.runId) return this.globalVideos();
+		return this.db
+			.query(
+				"SELECT id,title,status,reason,channel,channelUrl FROM run_videos WHERE run_id=? ORDER BY rowid"
+			)
+			.all(this.runId) as VideoRow[];
 	}
+	counts(): Record<string, number> {
+		const counts: Record<string, number> = {};
+		for (const row of this.all()) counts[row.status] = (counts[row.status] ?? 0) + 1;
+		return counts;
+	}
+
 	getCheckpoint<T>(key: string): T | undefined {
 		this.requireRun();
 		const row = this.db
@@ -309,12 +498,28 @@ export class Manifest {
 			this.db.query("SELECT value FROM receipts ORDER BY rowid").all() as { value: string }[]
 		).map((r) => JSON.parse(r.value) as T);
 	}
-	completeRun(): void {
+	completeRun(nextProfile?: unknown): void {
 		this.requireRun();
-		this.db.transaction(() => {
-			this.db.run("UPDATE videos SET status='done', reason=NULL WHERE status='distilled'");
-			this.db.run("UPDATE runs SET status='complete' WHERE id=?", [this.runId]);
-		})();
+		const finishedRunId = this.runId;
+		try {
+			this.db
+				.transaction(() => {
+					this.db.run(
+						"UPDATE videos SET status='done',reason=NULL WHERE id IN (SELECT id FROM run_videos WHERE run_id=? AND status='distilled')",
+						[finishedRunId]
+					);
+					this.db.run(
+						"UPDATE run_videos SET status='done',reason=NULL WHERE run_id=? AND status='distilled'",
+						[finishedRunId]
+					);
+					this.db.run("UPDATE runs SET status='complete' WHERE id=?", [finishedRunId]);
+					if (nextProfile !== undefined) this.beginRun(nextProfile);
+				})
+				.immediate();
+		} catch (error) {
+			this.runId = finishedRunId;
+			throw error;
+		}
 	}
 
 	/** Import once without removing source files. Unknown old model work is archived, never mixed into the selected model. */
@@ -377,5 +582,6 @@ export class Manifest {
 	}
 	close(): void {
 		this.db.close();
+		this.claims.close();
 	}
 }

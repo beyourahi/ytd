@@ -22,8 +22,8 @@ test("SQLite resumes extraction and glean atomically and keeps model runs separa
 	try {
 		let manifest = new Manifest("library", f.dir);
 		manifest.addVideos([{ id: "video", title: "Title", channel: "Creator" }]);
-		manifest.setStatus("video", "fetched");
 		const first = manifest.beginRun({ profile, source: "url", videoIds: ["video"] });
+		manifest.setStatus("video", "fetched");
 		manifest.saveMap("extract", [candidate], []);
 		manifest.close();
 		manifest = new Manifest("library", f.dir);
@@ -273,6 +273,304 @@ test("source review evidence distinguishes empty, rejection-only and legacy comp
 		expect(m.byStatus("done")).toHaveLength(3);
 		m.close();
 	} finally {
+		f.cleanup();
+	}
+});
+
+test("disjoint sources keep progress, replacement and completion independent", () => {
+	const f = fixture();
+	const a = new Manifest("library", f.dir);
+	const b = new Manifest("library", f.dir);
+	try {
+		const first = a.beginRun({ profile, source: "a", videoIds: ["a"] });
+		a.setStatus("a", "fetched");
+		a.saveMap("map-complete:a", [{ ...candidate, sourceId: "a" }], ["a"], true, []);
+		const second = b.beginRun({ profile, source: "b", videoIds: ["b"] });
+		b.setStatus("b", "fetched");
+		b.saveMap("map-complete:b", [{ ...candidate, sourceId: "b" }], ["b"], true, []);
+		expect(a.all().map((row) => row.id)).toEqual(["a"]);
+		expect(b.all().map((row) => row.id)).toEqual(["b"]);
+		expect(() => a.setStatus("b", "done")).toThrow("outside the selected run");
+		a.completeRun();
+		expect(b.byStatus("distilled")).toHaveLength(1);
+		expect(b.beginRun({ profile, source: "b", videoIds: ["b"] }).id).toBe(second.id);
+		const replacement = b.beginRun({
+			profile: { ...profile, model: "new" },
+			source: "b",
+			videoIds: ["b"]
+		});
+		expect(replacement.replaced).toBe(true);
+		expect(a.byStatus("done")).toHaveLength(1);
+		const db = new Database(join(f.dir, "library.sqlite"));
+		expect(db.query("SELECT status FROM runs WHERE id=?").get(first.id)).toEqual({
+			status: "complete"
+		});
+		db.close();
+	} finally {
+		a.close();
+		b.close();
+		f.cleanup();
+	}
+});
+
+test("membership changes preserve a partial plan and keep vanished videos claimed", async () => {
+	const f = fixture();
+	const a = new Manifest("library", f.dir);
+	const b = new Manifest("library", f.dir);
+	try {
+		const run = a.beginRun({ profile, source: "a", videoIds: ["old"] });
+		expect(a.hasPublicationPlans()).toBe(false);
+		a.saveMap("complete", [], ["old"], true, []);
+		a.checkpoint("publication:creator", { complete: false, receipts: [{ room: "content" }] });
+		expect(a.hasPublicationPlans()).toBe(true);
+		b.beginRun({ profile, source: "b", videoIds: ["old"] });
+		b.saveMap("complete", [], ["old"], true, []);
+		b.completeRun();
+		expect(a.beginRun({ profile, source: "a", videoIds: ["new"] }).id).toBe(run.id);
+		expect(a.all().map((row) => [row.id, row.status])).toEqual([["old", "distilled"]]);
+		expect(a.getCheckpoint("publication:creator")).toEqual({
+			complete: false,
+			receipts: [{ room: "content" }]
+		});
+		const release = await a.acquireSource("a", ["new"]);
+		const cancellation = new AbortController();
+		let waited = false;
+		const blocked = b.acquireSource("third", ["old"], {
+			signal: cancellation.signal,
+			onWait: () => {
+				waited = true;
+				cancellation.abort(new Error("test cancelled"));
+			}
+		});
+		await expect(blocked).rejects.toThrow("test cancelled");
+		expect(waited).toBe(true);
+		release();
+		const releaseB = await b.acquireSource("third", ["old"]);
+		releaseB();
+		a.completeRun();
+		const next = a.beginRun({ profile, source: "a", videoIds: ["old", "new"] });
+		expect(next.id).not.toBe(run.id);
+		expect(a.hasPublicationPlans()).toBe(false);
+		expect(a.getCheckpoint("publication:creator")).toBeUndefined();
+		expect(a.all().map((row) => [row.id, row.status])).toEqual([
+			["old", "done"],
+			["new", "pending"]
+		]);
+		const db = new Database(join(f.dir, "library.sqlite"));
+		const saved = db.query("SELECT profile FROM runs WHERE id=?").get(run.id) as {
+			profile: string;
+		};
+		expect(JSON.parse(saved.profile).videoIds).toEqual(["old"]);
+		db.close();
+	} finally {
+		a.close();
+		b.close();
+		f.cleanup();
+	}
+});
+
+test("routing drift still stops when listing membership also changes", () => {
+	const f = fixture();
+	const m = new Manifest("library", f.dir);
+	try {
+		m.beginRun({ profile, source: "a", videoIds: ["old"] });
+		expect(() =>
+			m.beginRun({
+				profile: { ...profile, routing: { verified: true } },
+				source: "a",
+				videoIds: ["new"]
+			})
+		).toThrow("routing changed");
+	} finally {
+		m.close();
+		f.cleanup();
+	}
+});
+
+test("v1 migration backs up active state and preserves checkpoints, candidates and receipts", () => {
+	const f = fixture();
+	const path = join(f.dir, "library.sqlite");
+	const db = new Database(path);
+	db.run(
+		"CREATE TABLE videos(id TEXT PRIMARY KEY,title TEXT,status TEXT,reason TEXT,channel TEXT,channelUrl TEXT)"
+	);
+	db.run(
+		"INSERT INTO videos VALUES ('video','Title','distilled',NULL,'Original creator','https://youtube.com/@original')"
+	);
+	db.run("CREATE TABLE runs(id TEXT PRIMARY KEY,profile TEXT,status TEXT)");
+	db.run("INSERT INTO runs VALUES ('paused',?,'active')", [
+		JSON.stringify({ profile, source: "a", videoIds: ["video"] })
+	]);
+	db.run("CREATE TABLE checkpoints(run_id TEXT,key TEXT,value TEXT,PRIMARY KEY(run_id,key))");
+	db.run("INSERT INTO checkpoints VALUES ('paused','publication:creator','{\"complete\":false}')");
+	db.run(
+		"CREATE TABLE candidates(run_id TEXT,candidate_key TEXT,value TEXT,PRIMARY KEY(run_id,candidate_key))"
+	);
+	db.run("INSERT INTO candidates VALUES ('paused','candidate',?)", [JSON.stringify(candidate)]);
+	db.run("CREATE TABLE receipts(key TEXT PRIMARY KEY,run_id TEXT,value TEXT)");
+	db.run("INSERT INTO receipts VALUES ('receipt','paused','{\"verified\":true}')");
+	db.run("PRAGMA user_version=1");
+	db.close();
+	try {
+		const m = new Manifest("library", f.dir);
+		expect(m.beginRun({ profile, source: "a", videoIds: ["video"] }).id).toBe("paused");
+		expect(m.byStatus("distilled")).toHaveLength(1);
+		expect(m.all()[0]).toMatchObject({
+			title: "Title",
+			channel: "Original creator",
+			channelUrl: "https://youtube.com/@original"
+		});
+		expect(m.candidates()).toEqual([candidate]);
+		expect(m.receipts()).toEqual([{ verified: true }]);
+		expect(m.getCheckpoint("publication:creator")).toEqual({ complete: false });
+		m.close();
+		const migrated = new Database(path, { readonly: true });
+		expect(migrated.query("PRAGMA user_version").get()).toEqual({ user_version: 2 });
+		expect(migrated.query("SELECT status FROM videos").get()).toEqual({ status: "fetched" });
+		migrated.close();
+		const backup = new Database(`${path}.v1.bak`, { readonly: true });
+		expect(backup.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+		expect(backup.query("PRAGMA user_version").get()).toEqual({ user_version: 1 });
+		expect(backup.query("SELECT status FROM videos").get()).toEqual({ status: "distilled" });
+		backup.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("a resumed run without a publication plan adopts completed shared evidence", () => {
+	const f = fixture();
+	const a = new Manifest("library", f.dir);
+	const b = new Manifest("library", f.dir);
+	try {
+		const request = { profile, source: "a", videoIds: ["video"] };
+		const run = a.beginRun(request);
+		a.saveMap("map-complete:video", [candidate], ["video"], true, []);
+		b.beginRun({ profile, source: "b", videoIds: ["video"] });
+		b.saveMap("map-complete:video", [candidate], ["video"], true, []);
+		b.completeRun();
+		expect(a.beginRun(request).id).toBe(run.id);
+		expect(a.byStatus("distilled")).toEqual([]);
+		expect(a.byStatus("done")).toHaveLength(1);
+		expect(a.candidates()).toEqual([candidate]);
+	} finally {
+		a.close();
+		b.close();
+		f.cleanup();
+	}
+});
+
+test("run metadata snapshots survive foreign aliases and paused publication recovery", () => {
+	const f = fixture();
+	let original = new Manifest("library", f.dir);
+	const other = new Manifest("library", f.dir);
+	try {
+		const request = { profile, source: "handle", videoIds: ["video"] };
+		const run = original.beginRun(request);
+		const video = {
+			id: "video",
+			title: "Original title",
+			channel: "Original creator",
+			channelUrl: "https://youtube.com/@original"
+		};
+		original.addVideos([video]);
+		original.saveMap("complete", [], ["video"], true, []);
+		original.checkpoint("publication:original", { complete: false });
+		original.close();
+		other.beginRun({ profile, source: "video", videoIds: ["video"] });
+		other.addVideos([
+			{
+				...video,
+				title: "Other title",
+				channel: "Canonical creator",
+				channelUrl: "https://youtube.com/channel/canonical"
+			}
+		]);
+		other.setTitle("video", "Other revised title");
+		other.saveMap("complete", [], ["video"], true, []);
+		other.completeRun();
+		original = new Manifest("library", f.dir);
+		expect(original.beginRun(request).id).toBe(run.id);
+		expect(original.hasPublicationPlans()).toBe(true);
+		expect(original.all()).toEqual([{ ...video, status: "distilled", reason: null }]);
+		expect(other.all()[0]).toMatchObject({
+			title: "Other revised title",
+			channel: "Canonical creator",
+			channelUrl: "https://youtube.com/channel/canonical"
+		});
+		original.setTitle("video", "Original revised title");
+		expect(other.all()[0]?.title).toBe("Other revised title");
+		expect(original.all()[0]?.title).toBe("Original revised title");
+		expect(() => original.setTitle("foreign", "Wrong")).toThrow("outside the selected run");
+		const global = new Manifest("library", f.dir);
+		global.addVideos([{ id: "video", title: "Shared metadata changed again" }]);
+		global.close();
+		expect(original.all()[0]?.title).toBe("Original revised title");
+	} finally {
+		original.close();
+		other.close();
+		f.cleanup();
+	}
+});
+
+test("completion creates the follow-on run atomically with its pending membership", () => {
+	const f = fixture();
+	const m = new Manifest("library", f.dir);
+	try {
+		const request = { profile, source: "a", videoIds: ["old", "failed"] };
+		const first = m.beginRun(request);
+		m.saveMap("complete", [], ["old"], true, []);
+		m.setStatus("failed", "failed", "unavailable");
+		m.checkpoint("publication:creator", { complete: true });
+		const next = { profile, source: "a", videoIds: ["old", "failed", "new"] };
+		m.completeRun(next);
+		expect(m.runId).not.toBe(first.id);
+		const followOnId = m.runId;
+		expect(m.beginRun(next).id).toBe(followOnId);
+		expect(m.hasPublicationPlans()).toBe(false);
+		expect(m.all().map((row) => [row.id, row.status])).toEqual([
+			["old", "done"],
+			["failed", "failed"],
+			["new", "pending"]
+		]);
+		const db = new Database(join(f.dir, "library.sqlite"));
+		expect(db.query("SELECT id,status FROM runs ORDER BY rowid").all()).toEqual([
+			{ id: first.id, status: "complete" },
+			{ id: followOnId, status: "active" }
+		]);
+		db.close();
+	} finally {
+		m.close();
+		f.cleanup();
+	}
+});
+
+test("failed follow-on commit rolls back completion and restores the original run identity", () => {
+	const f = fixture();
+	const m = new Manifest("library", f.dir);
+	const db = new Database(join(f.dir, "library.sqlite"));
+	try {
+		const first = m.beginRun({ profile, source: "original", videoIds: ["video"] });
+		m.saveMap("complete", [], ["video"], true, []);
+		db.run("CREATE TABLE required_parent(id TEXT PRIMARY KEY)");
+		db.run(
+			"CREATE TABLE deferred_child(id TEXT REFERENCES required_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+		);
+		db.run(
+			"CREATE TRIGGER reject_next AFTER INSERT ON runs WHEN NEW.source='next' BEGIN INSERT INTO deferred_child VALUES ('missing'); END"
+		);
+		expect(() => m.completeRun({ profile, source: "next", videoIds: ["new"] })).toThrow();
+		expect(m.runId).toBe(first.id);
+		expect(m.byStatus("distilled")).toHaveLength(1);
+		expect(db.query("SELECT id,status FROM runs").all()).toEqual([
+			{ id: first.id, status: "active" }
+		]);
+		expect(db.query("SELECT id,status FROM videos").all()).toEqual([
+			{ id: "video", status: "fetched" }
+		]);
+	} finally {
+		m.close();
+		db.close();
 		f.cleanup();
 	}
 });

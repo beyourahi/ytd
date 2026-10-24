@@ -1,9 +1,8 @@
 import { test, expect, spyOn } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	acquireRunLock,
 	creatorGroups,
 	withoutPublishedBlocks,
 	preserveHalalNotes,
@@ -13,24 +12,6 @@ import {
 import type { PublicationReceipt } from "../src/palace.ts";
 import { Manifest } from "../src/manifest.ts";
 import { agentJson } from "../src/distill.ts";
-
-test("library lock excludes live concurrent writers, preserves ambiguous owners, and reclaims dead owners", () => {
-	const root = mkdtempSync(join(tmpdir(), "ytd-lock-"));
-	try {
-		const release = acquireRunLock(root);
-		const owner = join(root, "ingest.lock", "owner.json");
-		const original = readFileSync(owner, "utf8");
-		expect(() => acquireRunLock(root)).toThrow("Another ingestion");
-		expect(readFileSync(owner, "utf8")).toBe(original);
-		release();
-		mkdirSync(join(root, "ingest.lock"));
-		expect(() => acquireRunLock(root)).toThrow("ambiguous ownership");
-		writeFileSync(owner, JSON.stringify({ pid: 2147483647, token: "dead" }));
-		acquireRunLock(root)();
-	} finally {
-		rmSync(root, { recursive: true });
-	}
-});
 
 test("creator grouping preserves actual playlist creators and separates unknown attribution", () => {
 	const rows = [

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, DEFAULTS, type Room } from "./config.ts";
 import { Manifest, stableHash, type VideoRow } from "./manifest.ts";
@@ -16,40 +16,6 @@ import {
 } from "./palace.ts";
 import { preflight, type AgentProfile } from "./agents.ts";
 import { resolveCli } from "./settings.ts";
-
-/** One writer owns the shared library; stale locks are reclaimed only after PID absence. */
-export function acquireRunLock(root = DATA_DIR): () => void {
-	mkdirSync(root, { recursive: true });
-	const dir = join(root, "ingest.lock");
-	const owner = join(dir, "owner.json");
-	const token = crypto.randomUUID();
-	try {
-		mkdirSync(dir);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		let prior: { pid: number };
-		try {
-			prior = JSON.parse(readFileSync(owner, "utf8"));
-		} catch (cause) {
-			throw new Error("Ingestion lock has ambiguous ownership; preserved for recovery.", { cause });
-		}
-		if (!Number.isSafeInteger(prior.pid) || prior.pid <= 0)
-			throw new Error("Invalid ingestion lock preserved for recovery.", { cause: error });
-		try {
-			process.kill(prior.pid, 0);
-			throw new Error(`Another ingestion is active (PID ${prior.pid}).`, { cause: error });
-		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
-		}
-		rmSync(dir, { recursive: true });
-		mkdirSync(dir);
-	}
-	writeFileSync(owner, JSON.stringify({ pid: process.pid, token }), { mode: 0o600, flag: "wx" });
-	return () => {
-		if (existsSync(owner) && JSON.parse(readFileSync(owner, "utf8")).token === token)
-			rmSync(dir, { recursive: true });
-	};
-}
 
 interface PublicationPlan {
 	channel: string;
@@ -195,20 +161,28 @@ async function publishCreator(
 	source: string,
 	signal: AbortSignal
 ): Promise<PublicationReceipt[]> {
-	for (let attempt = 1; ; attempt++) {
-		signal.throwIfAborted();
-		try {
-			return await publishCreatorAttempt(manifest, profile, key, rows, source, signal);
-		} catch (error) {
+	const release = await manifest.acquirePublication({
+		signal,
+		onWait: () => console.log("Waiting for Palace synthesis and publication…")
+	});
+	try {
+		for (let attempt = 1; ; attempt++) {
 			signal.throwIfAborted();
-			if (!(error instanceof PalaceBaseChangedError)) throw error;
-			if (attempt >= 3)
-				throw new Error(
-					`Palace kept moving after ${attempt} publication attempts; progress preserved. Re-run the same command. ${error.message}`,
-					{ cause: error }
-				);
-			console.log("Palace changed; refreshing affected deduplication and retrying publication…");
+			try {
+				return await publishCreatorAttempt(manifest, profile, key, rows, source, signal);
+			} catch (error) {
+				signal.throwIfAborted();
+				if (!(error instanceof PalaceBaseChangedError)) throw error;
+				if (attempt >= 3)
+					throw new Error(
+						`Palace kept moving after ${attempt} publication attempts; progress preserved. Re-run the same command. ${error.message}`,
+						{ cause: error }
+					);
+				console.log("Palace changed; refreshing affected deduplication and retrying publication…");
+			}
 		}
+	} finally {
+		release();
 	}
 }
 
@@ -358,92 +332,128 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 				? "Listings failed; no videos were confirmed."
 				: "Listings succeeded but contain no videos."
 		);
-	const release = acquireRunLock();
+	let release: (() => void) | undefined;
 	let manifest: Manifest | undefined;
 	let ids = new Set<string>();
 	let completed = false;
 	try {
-		manifest = new Manifest("manifest", join(DATA_DIR, "library"));
-		manifest.importLegacy(listing.aliases, DATA_DIR);
-		manifest.addVideos(
-			listing.items.map((item: VideoItem) => ({
-				id: item.id,
-				title: item.title,
-				channel: item.creator !== "unknown" ? item.creator : undefined,
-				channelUrl: item.creatorUrl
-			}))
-		);
-		ids = new Set(listing.items.map((item) => item.id));
-		const run = manifest.beginRun({ profile: selected, source, videoIds: [...ids].sort() });
-		if (run.replaced)
-			console.log(
-				"Created a replacement run; prior checkpoints and verified receipts are preserved."
-			);
-		const scoped = () => scopeRows(manifest!, ids);
-		await fetchInto(
-			manifest,
-			listing.slug,
-			scoped().filter((row) => row.status === "pending"),
-			listing.aliases,
-			signal
-		);
-		for (let round = 1; round <= DEFAULTS.retryRounds; round++) {
-			const failed = scoped().filter((row) => row.status === "failed");
-			if (!failed.length) break;
-			signal.throwIfAborted();
-			console.log(`Retry ${round}/${DEFAULTS.retryRounds}: ${failed.length} videos…`);
-			await Bun.sleep(DEFAULTS.retryDelayMs);
-			signal.throwIfAborted();
-			await fetchInto(manifest, listing.slug, failed, listing.aliases, signal);
-		}
-		for (const row of scoped().filter((item) => item.status === "fetched")) {
-			signal.throwIfAborted();
-			const path = transcriptPath(row.id);
-			if (!existsSync(path)) {
-				// A legacy fetched row can reuse its preserved cache without a network request.
-				const result = await fetchTranscript(listing.slug, row.id, {
-					aliases: listing.aliases,
-					signal
-				});
-				if (!result.ok) {
-					manifest.setStatus(row.id, "failed", result.reason ?? "cache_missing");
-					continue;
-				}
-			}
-			console.log(`Extract and glean ${row.id}…`);
-			const result = await mapBatch(
-				[{ id: row.id, title: row.title || row.id, text: readFileSync(path, "utf8") }],
-				{ profile: selected, manifest, signal }
-			);
-			if (result.limited)
-				throw new Error(
-					"Agent usage limit reached; progress saved. Re-run later with the same selection."
-				);
-			if (result.error) throw new Error(result.error);
-		}
-		if (scoped().some((row) => row.status === "fetched"))
-			throw new Error("Extraction remains incomplete; progress preserved.");
+		manifest = await Manifest.open("manifest", join(DATA_DIR, "library"), {
+			signal,
+			legacyRoot: DATA_DIR,
+			aliases: listing.aliases,
+			sourceDir: DATA_DIR,
+			onWait: () => console.log("Waiting for library initialization or legacy ingestion…")
+		});
+		const listedIds = new Set(listing.items.map((item) => item.id));
+		release = await manifest.acquireSource(source, [...listedIds], {
+			signal,
+			onWait: () => console.log("Waiting for overlapping source or videos…")
+		});
+		let requestedIds = [...listedIds];
 		const receipts: PublicationReceipt[] = [];
-		for (const [key, rows] of creatorGroups(scoped().filter((row) => row.status === "distilled")))
-			receipts.push(...(await publishCreator(manifest, selected, key, rows, source, signal)));
-		signal.throwIfAborted();
-		manifest.completeRun();
-		completed = true;
-		const rows = scoped();
-		const failed = rows.filter((row) => row.status === "failed");
-		console.log(
-			`\nComplete: ${receipts.length} room/creator publications remotely verified; ${rows.filter((row) => row.status === "no_captions").length} videos without captions or description context; ${failed.length} fetch failures; ${listing.listingFailures.length} listing warnings.`
-		);
-		for (const row of failed) console.log(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
-		if (failed.length || listing.listingFailures.length) process.exitCode = 1;
+		for (;;) {
+			completed = false;
+			const run = manifest.beginRun({ profile: selected, source, videoIds: requestedIds.sort() });
+			ids = new Set(manifest.all().map((row) => row.id));
+			const publishing = manifest.hasPublicationPlans();
+			// A saved plan owns its original candidates, creator identity and room receipts.
+			// Recover that phase before changing metadata or extracting additional sources.
+			if (!publishing)
+				manifest.addVideos(
+					listing.items
+						.filter((item) => ids.has(item.id))
+						.map((item: VideoItem) => ({
+							id: item.id,
+							title: item.title,
+							channel: item.creator !== "unknown" ? item.creator : undefined,
+							channelUrl: item.creatorUrl
+						}))
+				);
+			if (run.replaced)
+				console.log(
+					"Created a replacement run; prior checkpoints and verified receipts are preserved."
+				);
+			const scoped = () => scopeRows(manifest!, ids);
+			if (!publishing) {
+				await fetchInto(
+					manifest,
+					listing.slug,
+					scoped().filter((row) => row.status === "pending"),
+					listing.aliases,
+					signal
+				);
+				for (let round = 1; round <= DEFAULTS.retryRounds; round++) {
+					const failed = scoped().filter((row) => row.status === "failed");
+					if (!failed.length) break;
+					signal.throwIfAborted();
+					console.log(`Retry ${round}/${DEFAULTS.retryRounds}: ${failed.length} videos…`);
+					await Bun.sleep(DEFAULTS.retryDelayMs);
+					signal.throwIfAborted();
+					await fetchInto(manifest, listing.slug, failed, listing.aliases, signal);
+				}
+				for (const row of scoped().filter((item) => item.status === "fetched")) {
+					signal.throwIfAborted();
+					const path = transcriptPath(row.id);
+					if (!existsSync(path)) {
+						// A legacy fetched row can reuse its preserved cache without a network request.
+						const result = await fetchTranscript(listing.slug, row.id, {
+							aliases: listing.aliases,
+							signal
+						});
+						if (!result.ok) {
+							manifest.setStatus(row.id, "failed", result.reason ?? "cache_missing");
+							continue;
+						}
+					}
+					console.log(`Extract and glean ${row.id}…`);
+					const result = await mapBatch(
+						[{ id: row.id, title: row.title || row.id, text: readFileSync(path, "utf8") }],
+						{ profile: selected, manifest, signal }
+					);
+					if (result.limited)
+						throw new Error(
+							"Agent usage limit reached; progress saved. Re-run later with the same selection."
+						);
+					if (result.error) throw new Error(result.error);
+				}
+				if (scoped().some((row) => row.status === "fetched"))
+					throw new Error("Extraction remains incomplete; progress preserved.");
+			}
+			for (const [key, rows] of creatorGroups(scoped().filter((row) => row.status === "distilled")))
+				receipts.push(...(await publishCreator(manifest, selected, key, rows, source, signal)));
+			signal.throwIfAborted();
+			const unfinished = scoped().filter((row) =>
+				["pending", "fetched", "failed"].includes(row.status)
+			);
+			if ([...listedIds].some((id) => !ids.has(id)) || (publishing && unfinished.length)) {
+				reportAuditEvidence(manifest, scoped(), true);
+				// Persist the next run before retiring saved membership, including vanished sources.
+				// The source/video claim already covers this union.
+				requestedIds = [...new Set([...listedIds, ...ids])];
+				manifest.completeRun({ profile: selected, source, videoIds: requestedIds.sort() });
+				ids = new Set(manifest.all().map((row) => row.id));
+				console.log("Saved run recovered; processing remaining videos…");
+				continue;
+			}
+			manifest.completeRun();
+			completed = true;
+			const rows = scoped();
+			const failed = rows.filter((row) => row.status === "failed");
+			console.log(
+				`\nComplete: ${receipts.length} room/creator publications remotely verified; ${rows.filter((row) => row.status === "no_captions").length} videos without captions or description context; ${failed.length} fetch failures; ${listing.listingFailures.length} listing warnings.`
+			);
+			for (const row of failed) console.log(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
+			if (failed.length || listing.listingFailures.length) process.exitCode = 1;
+			break;
+		}
 	} finally {
 		try {
 			if (manifest?.runId) reportAuditEvidence(manifest, scopeRows(manifest, ids), completed);
 		} finally {
 			try {
-				manifest?.close();
+				release?.();
 			} finally {
-				release();
+				manifest?.close();
 			}
 		}
 	}

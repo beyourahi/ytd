@@ -327,6 +327,7 @@ test("legacy completed sources keep their candidates without manufacturing sourc
 test("Unicode transcripts shard without loss and every assembled prompt stays bounded", async () => {
 	const f = fixture();
 	try {
+		f.manifest.addVideos([{ id: "video", title: "বাংলা🙂" }]);
 		const original = Array.from(
 			{ length: 1200 },
 			(_, i) => `বাংলা🙂 reproducible material ${i}\n`

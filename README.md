@@ -79,11 +79,30 @@ Rerun the same command to resume. An explicit selection change creates a replace
 unfinished work; fetched material and verified publication receipts survive. Earlier model
 checkpoints remain preserved. Legacy manifests and JSONL are backed up/imported idempotently;
 unknown historical completion is re-extracted and remotely deduplicated. Corrupt or ambiguous
-inputs stop migration with their originals preserved. One ingestion writer runs at a time.
+inputs stop migration with their originals preserved. Upgrades wait for any older ingestion to
+finish, then back up and migrate under serialized initialization. Older binaries refuse the upgraded
+database; keep the backup for recovery.
 Existing SQLite completed sources and verified publication receipts remain authoritative: missing
 source-review evidence is reported as unavailable, without rerunning completed sources or claiming
 a clean review. Reruns preserve recorded decisions through interruptions and partial publication;
 already published notes are never rewritten.
+
+Separate Mac terminal windows can run `ytd` concurrently. Disjoint sources/videos fetch and
+extract in parallel. Overlapping commands wait for the source and its complete video set, then
+reuse shared caches and completed-video evidence without repeating model calls. Progress,
+checkpoints, creator metadata, and profile replacement remain scoped to each source/run. Saved unfinished videos
+remain included even when a later listing changes. Aggregate service usage can increase across
+sessions; pacing remains enabled within each session.
+
+Palace synthesis and publication use a separate queue, covering recovery, canonical notes,
+deduplication, and every room transaction for a creator. Other sessions keep fetching/extracting
+while they wait. Ctrl-C cancels either wait and preserves checkpoints; rerun the same command to
+resume. Claims are reclaimed only after their owning PID is confirmed absent. Ambiguous ownership
+is preserved for recovery. An interrupted run reconciles its saved room publications even if another
+source has since completed a shared video. Saved publication work finishes before new extraction;
+newly listed or previously failed videos then use a fresh run so existing room receipts cannot hide
+their publications. The handoff saves the follow-on run atomically, preserving unfinished sources
+even if the process stops between runs.
 
 Playlists list themselves; channels enumerate videos and Shorts separately. Listing failures
 are reported separately from empty tabs. Fetches stay paced and retry failures. Description
