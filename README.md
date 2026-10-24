@@ -49,6 +49,11 @@ network-tool, integration, hook, and subagent surfaces; Pi disables tools and ex
 OpenCode denies tools and isolates plugins/MCP using its supported configuration.
 Unknown effective provider/model settings are recorded as unverified. A reported conflicting
 model identity fails the call. Routing changes pause a run rather than silently reroute it.
+Completion reports count saved successful calls for the current run, separating harness-reported
+model identities from unverified calls, including mixed results. Cached calls retain their saved
+identity evidence. A zero-call rerun does not verify historical model identity. Requested model,
+effort, and routing fingerprints describe configuration; remote publication verification is
+reported separately and does not prove model identity.
 
 Custom wrappers are trusted programs, responsible for their own isolation. They receive the
 prompt on stdin, return answer text on stdout, diagnostics on stderr, and must exit zero.
@@ -60,8 +65,14 @@ settings/arguments non-secret; retain credentials in the harness's existing secu
 
 State stays under `~/.ytd/`: versioned atomic `config.json`, per-video `cache/videos/`, a
 SQLite `data/library/manifest.sqlite` holding runs/candidates/checkpoints/receipts, and neutral `run/`.
-Extraction and glean are checkpointed separately; malformed responses retry three times.
-A valid empty extraction is successful. Quota failures preserve progress for a later rerun.
+Extraction and glean each return `{ candidates, halalNotes }` and are checkpointed separately;
+malformed responses retry three times. Source decisions record the exact video ID, destination
+room, concern/rejection/reframing reason, available supporting evidence, and uncertainty. Both
+arrays may be empty. Completed source reviews are retained even without candidates or concerns;
+rejection-only results are displayed locally without creating an empty Palace publication.
+Recorded decisions are merged into room halal notes after synthesis and deduplication, so those
+steps cannot discard them. Automated review can still miss concerns and is not certification.
+Quota failures preserve progress for a later rerun.
 Successful answer prose mentioning limits never becomes a quota error.
 
 Rerun the same command to resume. An explicit selection change creates a replacement run for
@@ -69,6 +80,10 @@ unfinished work; fetched material and verified publication receipts survive. Ear
 checkpoints remain preserved. Legacy manifests and JSONL are backed up/imported idempotently;
 unknown historical completion is re-extracted and remotely deduplicated. Corrupt or ambiguous
 inputs stop migration with their originals preserved. One ingestion writer runs at a time.
+Existing SQLite completed sources and verified publication receipts remain authoritative: missing
+source-review evidence is reported as unavailable, without rerunning completed sources or claiming
+a clean review. Reruns preserve recorded decisions through interruptions and partial publication;
+already published notes are never rewritten.
 
 Playlists list themselves; channels enumerate videos and Shorts separately. Listing failures
 are reported separately from empty tabs. Fetches stay paced and retry failures. Description

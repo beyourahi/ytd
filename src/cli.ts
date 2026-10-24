@@ -5,7 +5,7 @@ import { DATA_DIR, DEFAULTS, type Room } from "./config.ts";
 import { Manifest, stableHash, type VideoRow } from "./manifest.ts";
 import { canonicalSource, enumerate, type VideoItem } from "./enumerate.ts";
 import { fetchTranscript, transcriptPath } from "./fetch.ts";
-import { mapBatch, reduce, type ReduceOutput } from "./distill.ts";
+import { mapBatch, reduce, type ReduceOutput, type SourceHalalNote } from "./distill.ts";
 import {
 	loadPalaceSnapshot,
 	publishBatch,
@@ -134,6 +134,59 @@ export function preserveHalalNotes(out: ReduceOutput, publishedRooms: string[] =
 	};
 }
 
+export function mergeSourceReviews(
+	out: ReduceOutput,
+	review: { halalNotes: SourceHalalNote[]; unavailable: string[] }
+): ReduceOutput {
+	const rooms = out.rooms.map((room) => ({ ...room, halalNotes: [...room.halalNotes] }));
+	for (const note of review.halalNotes) {
+		let room = rooms.find((room) => room.room === note.room);
+		if (!room) {
+			room = { room: note.room, principles: [], halalNotes: [] };
+			rooms.push(room);
+		}
+		room.halalNotes.push(`YouTube ${note.sourceId}: ${note.note}`);
+	}
+	for (const room of rooms) {
+		if (room.principles.length && review.unavailable.length)
+			room.halalNotes.push(
+				`Source review evidence unavailable for: ${review.unavailable.join(", ")}.`
+			);
+		room.halalNotes = [...new Set(room.halalNotes)];
+	}
+	return { rooms };
+}
+
+export function reportAuditEvidence(
+	manifest: Manifest,
+	rows: VideoRow[],
+	runCompleted = false
+): void {
+	const summary = manifest.modelCallSummary();
+	if (!summary.total)
+		console.log(
+			runCompleted
+				? "Model identity: no model calls occurred for this run; historical identity is unverified."
+				: "Model identity: no saved successful model calls for this run; historical identity is unverified."
+		);
+	else {
+		console.log(
+			`Model identity (saved successful calls for this run): ${summary.total} total; ${summary.reported} harness-reported; ${summary.unverified} unverified.`
+		);
+		for (const { model, calls } of summary.models)
+			console.log(`Harness-reported model: ${model} (${calls} call${calls === 1 ? "" : "s"}).`);
+	}
+	const completed = rows.filter((row) => row.status === "distilled" || row.status === "done");
+	const review = manifest.sourceReviews(
+		completed.map((row) => row.id),
+		true
+	);
+	console.log(
+		`Source review evidence: ${completed.length - review.unavailable.length}/${completed.length} completed sources recorded; ${review.unavailable.length} unavailable. Automated review can miss concerns.`
+	);
+	for (const id of review.unavailable) console.log(`Source review evidence unavailable: ${id}.`);
+}
+
 async function publishCreator(
 	manifest: Manifest,
 	profile: AgentProfile,
@@ -194,7 +247,12 @@ async function publishCreatorAttempt(
 		if (plan.complete) return plan.receipts;
 	}
 	const candidates = manifest.candidates().filter((c) => rows.some((row) => row.id === c.sourceId));
-	if (!candidates.length) return [];
+	const sourceReview = manifest.sourceReviews(rows.map((row) => row.id));
+	if (!candidates.length) {
+		for (const note of sourceReview.halalNotes)
+			console.log(`Halal gate (${note.room}, YouTube ${note.sourceId}): ${note.note}`);
+		return [];
+	}
 	const snapshot = await loadPalaceSnapshot(undefined, signal);
 	const notes = snapshot.notes.map((note) => ({
 		...note,
@@ -228,15 +286,17 @@ async function publishCreatorAttempt(
 			dateStr: plan?.dateStr ?? new Date().toISOString().slice(0, 10),
 			base: snapshot.base,
 			notesHash,
-			out: preserveHalalNotes(
-				result.out,
-				plan?.receipts.map((receipt) => receipt.room)
-			),
+			out: result.out,
 			receipts: plan?.receipts ?? [],
 			complete: false
 		};
 		manifest.checkpoint(checkpointKey, plan);
 	}
+	plan.out = preserveHalalNotes(
+		mergeSourceReviews(plan.out, sourceReview),
+		plan.receipts.map((receipt) => receipt.room)
+	);
+	manifest.checkpoint(checkpointKey, plan);
 	if (!plan.out.rooms.some((room) => room.principles.length)) {
 		for (const room of plan.out.rooms)
 			for (const note of room.halalNotes) console.log(`Halal gate (${room.room}): ${note}`);
@@ -300,6 +360,8 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 		);
 	const release = acquireRunLock();
 	let manifest: Manifest | undefined;
+	let ids = new Set<string>();
+	let completed = false;
 	try {
 		manifest = new Manifest("manifest", join(DATA_DIR, "library"));
 		manifest.importLegacy(listing.aliases, DATA_DIR);
@@ -311,7 +373,7 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 				channelUrl: item.creatorUrl
 			}))
 		);
-		const ids = new Set(listing.items.map((item) => item.id));
+		ids = new Set(listing.items.map((item) => item.id));
 		const run = manifest.beginRun({ profile: selected, source, videoIds: [...ids].sort() });
 		if (run.replaced)
 			console.log(
@@ -366,6 +428,7 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 			receipts.push(...(await publishCreator(manifest, selected, key, rows, source, signal)));
 		signal.throwIfAborted();
 		manifest.completeRun();
+		completed = true;
 		const rows = scoped();
 		const failed = rows.filter((row) => row.status === "failed");
 		console.log(
@@ -374,8 +437,15 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 		for (const row of failed) console.log(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
 		if (failed.length || listing.listingFailures.length) process.exitCode = 1;
 	} finally {
-		manifest?.close();
-		release();
+		try {
+			if (manifest?.runId) reportAuditEvidence(manifest, scopeRows(manifest, ids), completed);
+		} finally {
+			try {
+				manifest?.close();
+			} finally {
+				release();
+			}
+		}
 	}
 }
 

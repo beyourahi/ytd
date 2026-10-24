@@ -37,10 +37,10 @@ if (process.argv[1].endsWith("yt-dlp")) {
  const candidates=prompt.startsWith("Merge") ? JSON.parse(prompt.split("CANDIDATES:\\n")[1]) : [];
  const sourceId=prompt.match(/videoId: ([A-Za-z0-9_-]{11})/)?.[1] || candidates[0]?.sourceId || "dQw4w9WgXcQ";
  const p={theme:"Reliable systems",principle:"Checkpoint completed work before advancing",ids:candidates.length ? [...new Set(candidates.map(c=>c.sourceId))] : [sourceId]};
- if(prompt.startsWith("Distill")) console.log(JSON.stringify([{principle:p.principle,detail:"Commit progress atomically so interruption does not lose work.",theme:p.theme,sourceId}]));
- else if(prompt.startsWith("Carefully")) console.log("[]");
+ if(prompt.startsWith("Distill")) console.log(JSON.stringify({candidates:process.env.YTD_FIXTURE_SOURCE_RESULT ? [] : [{principle:p.principle,detail:"Commit progress atomically so interruption does not lose work.",theme:p.theme,sourceId}],halalNotes:process.env.YTD_FIXTURE_SOURCE_RESULT === "empty" ? [] : [{sourceId,room:"business",note:"Rejected the source shortcut; supporting evidence is uncertain."}]}));
+ else if(prompt.startsWith("Carefully")) console.log(JSON.stringify({candidates:[],halalNotes:process.env.YTD_FIXTURE_SOURCE_RESULT ? [] : [{sourceId,room:"craft",note:"Reframed the source advice as transferable workflow guidance."}]}));
  else if(prompt.startsWith("Merge")) console.log(JSON.stringify({rooms:[{room:"content",principles:[p],halalNotes:[]},{room:"craft",principles:[p],halalNotes:[]},{room:"business",principles:[],halalNotes:["Reject the doubtful shortcut"]}]}));
- else if(prompt.startsWith("Is this")) console.log('{"duplicate":false}');
+ else if(prompt.startsWith("Is this")) console.log(JSON.stringify({duplicate:!!process.env.YTD_FIXTURE_DUPLICATE}));
  else if(prompt.startsWith("Does")) console.log('{"match":0}');
  else { console.error("unexpected prompt"); process.exit(1); }
 }
@@ -106,6 +106,8 @@ for (const url of ["https://youtube.com/@fixture", "https://youtube.com/playlist
 				expect(result.stderr).toBe("");
 				expect(result.code).toBe(0);
 				expect(result.stdout).toContain("4 room/creator publications remotely verified");
+				expect(result.stdout).toContain("0 harness-reported;");
+				expect(result.stdout).toContain("3/3 completed sources recorded; 0 unavailable");
 				for (const room of ["content", "craft"]) {
 					const text = fixtureGit(f.remote, "show", `main:${room}/field-notes.md`);
 					expect(text.match(/<!-- ytd:/g)).toHaveLength(2);
@@ -131,6 +133,9 @@ for (const url of ["https://youtube.com/@fixture", "https://youtube.com/playlist
 					});
 					expect(rerun.stderr).toBe("");
 					expect(rerun.code).toBe(0);
+					expect(rerun.stdout).toContain(
+						"no model calls occurred for this run; historical identity is unverified"
+					);
 					expect(readFileSync(f.calls, "utf8")).toBe(calls);
 					expect(fixtureGit(f.remote, "rev-parse", "main")).toBe(head);
 				}
@@ -190,6 +195,9 @@ test.skipIf(!hasPalacePrerequisite)(
 			const craft = fixtureGit(fixture.remote, "show", "main:craft/field-notes.md");
 			expect(content.match(/<!-- ytd:/g)?.length).toBe(1);
 			expect(content).toContain("business: Reject the doubtful shortcut");
+			expect(content).toContain("business: YouTube dQw4w9WgXcQ: Rejected the source shortcut");
+			expect(craft).toContain("YouTube dQw4w9WgXcQ: Reframed the source advice");
+			expect(second.stdout).toContain("1/1 completed sources recorded; 0 unavailable");
 			expect(craft).toContain("[M53]");
 			const head = fixtureGit(fixture.remote, "rev-parse", "main");
 			const third = await runCommand([process.execPath, cli, "https://youtube.com/@fixture"], {
@@ -202,6 +210,77 @@ test.skipIf(!hasPalacePrerequisite)(
 			expect(existsSync(join(configDir, "data", "ingest.lock"))).toBe(false);
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	},
+	180_000
+);
+
+for (const mode of ["empty", "rejected", "deduplicated"]) {
+	test.skipIf(!hasPalacePrerequisite)(
+		`whole CLI retains ${mode} source decisions without an empty publication`,
+		async () => {
+			const f = createCliFixture();
+			try {
+				const head = fixtureGit(f.remote, "rev-parse", "main");
+				const env =
+					mode === "deduplicated"
+						? { ...f.env, YTD_FIXTURE_DUPLICATE: "1" }
+						: { ...f.env, YTD_FIXTURE_SOURCE_RESULT: mode };
+				const result = await runCommand(f.command, { env, timeoutMs: 60_000 });
+				expect(result.stderr).toBe("");
+				expect(result.code).toBe(0);
+				expect(result.stdout).toContain("0 room/creator publications remotely verified");
+				expect(result.stdout).toContain("1/1 completed sources recorded; 0 unavailable");
+				if (mode !== "empty") expect(result.stdout).toContain("Rejected the source shortcut");
+				expect(fixtureGit(f.remote, "rev-parse", "main")).toBe(head);
+				const db = new Database(join(f.configDir, "data", "library", "manifest.sqlite"));
+				const row = db
+					.query("SELECT value FROM checkpoints WHERE key LIKE 'map-complete:%'")
+					.get() as { value: string };
+				expect(JSON.parse(row.value).halalNotes.length).toBe(
+					mode === "empty" ? 0 : mode === "deduplicated" ? 2 : 1
+				);
+				db.close();
+				const calls = readFileSync(f.calls, "utf8");
+				const rerun = await runCommand(f.command, { env, timeoutMs: 60_000 });
+				expect(rerun.code).toBe(0);
+				expect(rerun.stdout).toContain("no model calls occurred for this run");
+				expect(readFileSync(f.calls, "utf8")).toBe(calls);
+			} finally {
+				rmSync(f.root, { recursive: true, force: true });
+			}
+		},
+		180_000
+	);
+}
+
+test.skipIf(!hasPalacePrerequisite)(
+	"whole CLI discloses unavailable legacy review evidence without rerunning sources or rewriting receipts",
+	async () => {
+		const f = createCliFixture();
+		try {
+			const first = await runCommand(f.command, { env: f.env, timeoutMs: 60_000 });
+			expect(first.code).toBe(0);
+			const calls = readFileSync(f.calls, "utf8");
+			const head = fixtureGit(f.remote, "rev-parse", "main");
+			const db = new Database(join(f.configDir, "data", "library", "manifest.sqlite"));
+			const receipts = db.query("SELECT value FROM receipts ORDER BY key").all();
+			db.run("UPDATE checkpoints SET value='[]' WHERE key LIKE 'map-complete:%'");
+			db.close();
+			const rerun = await runCommand(f.command, { env: f.env, timeoutMs: 60_000 });
+			expect(rerun.code).toBe(0);
+			expect(rerun.stdout).toContain(
+				"no model calls occurred for this run; historical identity is unverified"
+			);
+			expect(rerun.stdout).toContain("0/1 completed sources recorded; 1 unavailable");
+			expect(rerun.stdout).toContain("Source review evidence unavailable: dQw4w9WgXcQ");
+			expect(readFileSync(f.calls, "utf8")).toBe(calls);
+			expect(fixtureGit(f.remote, "rev-parse", "main")).toBe(head);
+			const reopened = new Database(join(f.configDir, "data", "library", "manifest.sqlite"));
+			expect(reopened.query("SELECT value FROM receipts ORDER BY key").all()).toEqual(receipts);
+			reopened.close();
+		} finally {
+			rmSync(f.root, { recursive: true, force: true });
 		}
 	},
 	180_000

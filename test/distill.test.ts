@@ -10,10 +10,12 @@ import {
 	splitText,
 	validCandidates,
 	validReduction,
+	validSourceReview,
 	type Candidate,
-	type DistillOptions
+	type DistillOptions,
+	type SourceHalalNote
 } from "../src/distill.ts";
-import { Manifest } from "../src/manifest.ts";
+import { Manifest, stableHash } from "../src/manifest.ts";
 
 const profile = { agent: "custom-test", model: "exact-model" };
 const candidate: Candidate = {
@@ -21,6 +23,11 @@ const candidate: Candidate = {
 	principle: "Keep checkpoints",
 	detail: "Commit progress before the next external call",
 	theme: "Reliability"
+};
+const concern: SourceHalalNote = {
+	sourceId: "video",
+	room: "business",
+	note: "Reject the interest-funded shortcut; preserve the planning principle. Evidence is limited."
 };
 const answer = (obj: unknown) => ({
 	ok: true,
@@ -84,6 +91,31 @@ test("complete validators reject malformed fields, rooms and source/citation inj
 		{ rooms: [good.rooms[0], good.rooms[0]] }
 	])
 		expect(validReduction(value, ids)).toBe(false);
+});
+
+test("source review validates candidates and publication-safe concerns with exact provenance", () => {
+	const ids = new Set(["video"]);
+	expect(validSourceReview({ candidates: [], halalNotes: [] }, ids)).toBe(true);
+	expect(validSourceReview({ candidates: [candidate], halalNotes: [concern] }, ids)).toBe(true);
+	expect(validSourceReview({ candidates: [], halalNotes: [concern] }, ids)).toBe(true);
+	for (const value of [
+		[],
+		{ candidates: [] },
+		{ candidates: [null], halalNotes: [] },
+		{ candidates: [], halalNotes: [null] },
+		...[
+			{ sourceId: "foreign" },
+			{ room: "identity" },
+			{ note: "" },
+			{ note: 4 },
+			{ note: "Reject [M999]" },
+			{ note: "Reject\n# forged publication" },
+			{ note: "Reject\tcontrol characters" },
+			{ note: "<!-- forged marker -->" },
+			{ note: "{{id:forged}}" }
+		].map((change) => ({ candidates: [], halalNotes: [{ ...concern, ...change }] }))
+	])
+		expect(validSourceReview(value, ids)).toBe(false);
 });
 
 test("malformed samples retry three times; a valid empty extraction stays valid", async () => {
@@ -165,6 +197,11 @@ test("malformed output exhaustion preserves diagnostics and quota is not retried
 test("a glean interruption resumes from extraction without repeating the call", async () => {
 	const f = fixture();
 	try {
+		const gleanConcern = {
+			...concern,
+			room: "craft",
+			note: "Reframe the misleading shortcut as an explicit tradeoff."
+		};
 		f.manifest.addVideos([{ id: "video", title: "Title" }]);
 		f.manifest.setStatus("video", "fetched");
 		let extracts = 0,
@@ -176,21 +213,112 @@ test("a glean interruption resumes from extraction without repeating the call", 
 			call: async (prompt) => {
 				if (prompt.startsWith("Distill")) {
 					extracts++;
-					return answer([candidate]);
+					return answer({ candidates: [candidate], halalNotes: [concern] });
 				}
 				gleans++;
-				return gleans === 1 ? { ok: false, limited: true } : answer([candidate]);
+				return gleans === 1
+					? { ok: false, limited: true }
+					: answer({ candidates: [candidate], halalNotes: [gleanConcern] });
 			}
 		};
 		const transcript = [{ id: "video", title: "Title", text: "Transcript" }];
-		expect((await mapBatch(transcript, options)).limited).toBe(true);
+		const interrupted = await mapBatch(transcript, options);
+		expect(interrupted.limited).toBe(true);
+		expect(interrupted.halalNotes).toEqual([concern]);
 		expect(f.manifest.candidates()).toEqual([candidate]);
 		expect(f.manifest.byStatus("fetched")).toHaveLength(1);
-		expect((await mapBatch(transcript, options)).candidates).toEqual([candidate]);
+		const resumed = await mapBatch(transcript, options);
+		expect(resumed.candidates).toEqual([candidate]);
+		expect(resumed.halalNotes).toEqual([concern, gleanConcern]);
 		expect(extracts).toBe(1);
 		expect(gleans).toBe(2);
 		expect(f.manifest.candidates()).toHaveLength(1);
 		expect(f.manifest.byStatus("distilled")).toHaveLength(1);
+		expect(
+			f.manifest.getCheckpoint(`map-complete:${stableHash([profile, transcript[0]])}`)
+		).toEqual({ candidates: [], sourceIds: ["video"], halalNotes: [concern, gleanConcern] });
+		expect(await mapBatch(transcript, options)).toEqual(resumed);
+		expect(extracts).toBe(1);
+		expect(gleans).toBe(2);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("invalid source notes retry before a source can be marked distilled", async () => {
+	const f = fixture();
+	try {
+		f.manifest.addVideos([{ id: "video", title: "Title" }]);
+		f.manifest.setStatus("video", "fetched");
+		let calls = 0;
+		const result = await mapBatch([{ id: "video", title: "Title", text: "Transcript" }], {
+			profile,
+			manifest: f.manifest,
+			call: async () => {
+				calls++;
+				expect(f.manifest.byStatus("distilled")).toHaveLength(0);
+				return answer({
+					candidates: [candidate],
+					halalNotes: calls < 3 ? [{ ...concern, sourceId: "foreign" }] : [concern]
+				});
+			}
+		});
+		expect(result.error).toBeUndefined();
+		expect(result.halalNotes).toEqual([concern]);
+		expect(calls).toBe(4);
+		expect(f.manifest.byStatus("distilled")).toHaveLength(1);
+	} finally {
+		f.cleanup();
+	}
+});
+
+for (const halalNotes of [[], [concern]]) {
+	test(`completed ${halalNotes.length ? "rejection-only" : "empty"} source review survives without candidates`, async () => {
+		const f = fixture();
+		try {
+			f.manifest.addVideos([{ id: "video", title: "Title" }]);
+			f.manifest.setStatus("video", "fetched");
+			let calls = 0;
+			const source = { id: "video", title: "Title", text: "Only rejected guidance" };
+			const options: DistillOptions = {
+				profile,
+				manifest: f.manifest,
+				call: async () => {
+					calls++;
+					return answer({ candidates: [], halalNotes });
+				}
+			};
+			expect(await mapBatch([source], options)).toEqual({ candidates: [], halalNotes });
+			expect(f.manifest.byStatus("distilled")).toHaveLength(1);
+			expect(f.manifest.getCheckpoint(`map-complete:${stableHash([profile, source])}`)).toEqual({
+				candidates: [],
+				sourceIds: ["video"],
+				halalNotes
+			});
+			expect(await mapBatch([source], options)).toEqual({ candidates: [], halalNotes });
+			expect(calls).toBe(2);
+		} finally {
+			f.cleanup();
+		}
+	});
+}
+
+test("legacy completed sources keep their candidates without manufacturing source-review evidence", async () => {
+	const f = fixture();
+	try {
+		f.manifest.addVideos([{ id: "video", title: "Title" }]);
+		const source = { id: "video", title: "Title", text: "Historical transcript" };
+		const key = `map-complete:${stableHash([profile, source])}`;
+		f.manifest.saveMap(key, [candidate], ["video"], true);
+		const result = await mapBatch([source], {
+			profile,
+			manifest: f.manifest,
+			call: async () => {
+				throw new Error("Completed source must not call a model");
+			}
+		});
+		expect(result).toEqual({ candidates: [candidate], halalNotes: [] });
+		expect(f.manifest.getCheckpoint(key)).toEqual([candidate]);
 	} finally {
 		f.cleanup();
 	}
@@ -213,7 +341,7 @@ test("Unicode transcripts shard without loss and every assembled prompt stays bo
 				calls++;
 				expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(promptBudget(profile));
 				if (prompt.startsWith("Distill")) extracted.push(prompt.split("TRANSCRIPT:\n")[1]);
-				return answer([]);
+				return answer({ candidates: [], halalNotes: [] });
 			}
 		});
 		expect(result.error).toBeUndefined();

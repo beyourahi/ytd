@@ -189,3 +189,90 @@ test("reserved library names cannot collide with legacy channel manifests", () =
 		f.cleanup();
 	}
 });
+
+test("model identity summaries count saved reported, missing and mixed calls per run", () => {
+	const f = fixture();
+	try {
+		let m = new Manifest("library", f.dir);
+		const run = m.beginRun(profile);
+		expect(m.modelCallSummary()).toEqual({ total: 0, reported: 0, unverified: 0, models: [] });
+		m.checkpoint("resolved-model", { reportedModel: "configured-only" });
+		m.checkpoint("call:reported", {
+			obj: [],
+			reportedModel: "exact-model",
+			identityVerified: true
+		});
+		expect(m.modelCallSummary()).toEqual({
+			total: 1,
+			reported: 1,
+			unverified: 0,
+			models: [{ model: "exact-model", calls: 1 }]
+		});
+		m.checkpoint("call:missing", { obj: [], reportedModel: null, identityVerified: false });
+		m.checkpoint("call:legacy", { obj: [] });
+		m.close();
+		m = new Manifest("library", f.dir);
+		expect(m.beginRun(profile).id).toBe(run.id);
+		expect(m.modelCallSummary()).toEqual({
+			total: 3,
+			reported: 1,
+			unverified: 2,
+			models: [{ model: "exact-model", calls: 1 }]
+		});
+		m.checkpoint("call:reported", {
+			obj: [],
+			reportedModel: "exact-model",
+			identityVerified: true
+		});
+		expect(m.modelCallSummary().total).toBe(3);
+		m.completeRun();
+		m.beginRun(profile);
+		expect(m.modelCallSummary().total).toBe(0);
+		m.checkpoint("call:unknown", { obj: [], reportedModel: "" });
+		expect(m.modelCallSummary()).toEqual({ total: 1, reported: 0, unverified: 1, models: [] });
+		m.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("source review evidence distinguishes empty, rejection-only and legacy completion across resume", () => {
+	const f = fixture();
+	const note = {
+		sourceId: "video",
+		room: "business",
+		note: "Reject the doubtful shortcut; evidence uncertain."
+	};
+	try {
+		let m = new Manifest("library", f.dir);
+		m.beginRun(profile);
+		m.addVideos(["video", "empty", "legacy"].map((id) => ({ id, title: id })));
+		m.saveMap("map-complete:video", [], ["video"], true, [note]);
+		m.saveMap("map-complete:empty", [], ["empty"], true, []);
+		m.saveMap("map-complete:legacy", [], ["legacy"], true);
+		m.recordReceipt("old", { verified: true });
+		m.close();
+		m = new Manifest("library", f.dir);
+		m.beginRun(profile);
+		expect(m.sourceReviews(["video", "empty", "legacy"])).toEqual({
+			halalNotes: [note],
+			unavailable: ["legacy"]
+		});
+		m.completeRun();
+		m.beginRun(profile);
+		expect(m.sourceReviews(["video", "empty", "legacy"]).unavailable).toEqual([
+			"video",
+			"empty",
+			"legacy"
+		]);
+		expect(m.sourceReviews(["video", "empty", "legacy"], true)).toEqual({
+			halalNotes: [note],
+			unavailable: ["legacy"]
+		});
+		expect(m.receipts()).toEqual([{ verified: true }]);
+		expect(m.byStatus("done")).toHaveLength(3);
+		m.close();
+	} finally {
+		f.cleanup();
+	}
+});

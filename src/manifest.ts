@@ -3,7 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, constants } from "no
 import { join, resolve } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { DATA_DIR } from "./config.ts";
-import type { Candidate } from "./distill.ts";
+import { validSourceReview, type Candidate, type SourceHalalNote } from "./distill.ts";
 
 export type Status = "pending" | "fetched" | "distilled" | "done" | "failed" | "no_captions";
 export interface VideoRow {
@@ -210,10 +210,19 @@ export class Manifest {
 			JSON.stringify(value)
 		]);
 	}
-	saveMap(key: string, candidates: Candidate[], videoIds: string[], complete = false): void {
+	saveMap(
+		key: string,
+		candidates: Candidate[],
+		videoIds: string[],
+		complete = false,
+		halalNotes?: SourceHalalNote[]
+	): void {
 		this.requireRun();
 		this.db.transaction(() => {
-			this.checkpoint(key, candidates);
+			this.checkpoint(
+				key,
+				halalNotes === undefined ? candidates : { candidates, sourceIds: videoIds, halalNotes }
+			);
 			const insert = this.db.prepare(
 				"INSERT OR IGNORE INTO candidates(run_id,candidate_key,value) VALUES (?,?,?)"
 			);
@@ -225,6 +234,59 @@ export class Manifest {
 				);
 			if (complete) for (const id of videoIds) this.setStatus(id, "distilled");
 		})();
+	}
+	modelCallSummary(): {
+		total: number;
+		reported: number;
+		unverified: number;
+		models: { model: string; calls: number }[];
+	} {
+		this.requireRun();
+		const rows = this.db
+			.query("SELECT value FROM checkpoints WHERE run_id=? AND key LIKE 'call:%' ORDER BY key")
+			.all(this.runId) as { value: string }[];
+		const models = new Map<string, number>();
+		for (const row of rows) {
+			const call = JSON.parse(row.value) as { reportedModel?: unknown };
+			if (typeof call.reportedModel === "string" && call.reportedModel.trim())
+				models.set(call.reportedModel, (models.get(call.reportedModel) ?? 0) + 1);
+		}
+		const reported = [...models.values()].reduce((sum, n) => sum + n, 0);
+		return {
+			total: rows.length,
+			reported,
+			unverified: rows.length - reported,
+			models: [...models]
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([model, calls]) => ({ model, calls }))
+		};
+	}
+	sourceReviews(
+		ids: string[],
+		historical = false
+	): { halalNotes: SourceHalalNote[]; unavailable: string[] } {
+		this.requireRun();
+		const rows = this.db
+			.query(
+				`SELECT value FROM checkpoints WHERE key LIKE 'map-complete:%'${historical ? "" : " AND run_id=?"} ORDER BY rowid DESC`
+			)
+			.all(...(historical ? [] : [this.runId])) as { value: string }[];
+		const remaining = new Set(ids);
+		const halalNotes: SourceHalalNote[] = [];
+		for (const row of rows) {
+			const review = JSON.parse(row.value) as { sourceIds?: unknown };
+			if (
+				!Array.isArray(review.sourceIds) ||
+				!review.sourceIds.every((id) => typeof id === "string")
+			)
+				continue;
+			if (!validSourceReview(review, new Set(review.sourceIds))) continue;
+			for (const id of review.sourceIds) {
+				if (!remaining.delete(id)) continue;
+				halalNotes.push(...review.halalNotes.filter((note) => note.sourceId === id));
+			}
+		}
+		return { halalNotes, unavailable: [...remaining] };
 	}
 	candidates(): Candidate[] {
 		this.requireRun();

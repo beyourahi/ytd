@@ -72,6 +72,10 @@ test("renderBatch groups by theme, cites global [Mn] sorted, lists only cited so
 	expect(out).toContain("- one [M51]");
 	expect(out).toContain("- two [M51] [M52]"); // ids sorted by [Mn]
 	expect(out).toContain("## ⚠️ Halal gate"); // present even when halalNotes is empty
+	expect(out).toContain("No halal concerns were recorded.");
+	expect(out).toContain("Automated halal review can miss concerns");
+	expect(out).not.toContain("Nothing borderline");
+	expect(out).not.toContain("Passed through the halal gate");
 	expect(out).not.toContain("{{id:");
 	expect(out).not.toContain("M53"); // CCC is not cited here → not in this room's sources
 });

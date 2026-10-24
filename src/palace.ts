@@ -109,7 +109,7 @@ export function renderBatch(o: RenderInput): string {
 
 	const halal = o.halalNotes.length
 		? o.halalNotes.map((n) => `- ${n.trim()}`).join("\n")
-		: "- Nothing borderline; all kept principles are general halal wisdom (ḥikmah).";
+		: "- No halal concerns were recorded.";
 	const body = `${sections}\n\n## ⚠️ Halal gate\n${halal}`;
 
 	// videos cited in this room, de-duped, in [Mn] order
@@ -131,7 +131,7 @@ export function renderBatch(o: RenderInput): string {
 
 	return (
 		`\n\n# ═══ ${inlineMetadata(o.channel)} → ${o.room} — YouTube ingest${tag} ═══\n` +
-		`*Ingested ${o.dateStr} via ytd from ${inlineMetadata(o.channelUrl)}. Deduped across the channel and against existing field-notes; only net-new wisdom logged. Passed through the halal gate.*\n\n` +
+		`*Ingested ${o.dateStr} via ytd from ${inlineMetadata(o.channelUrl)}. Deduped across the channel and against existing field-notes; only net-new wisdom logged. Automated halal review can miss concerns; recorded decisions follow.*\n\n` +
 		`## Sources logged (this block)\n${sources}\n\n${body.trim()}\n`
 	);
 }
