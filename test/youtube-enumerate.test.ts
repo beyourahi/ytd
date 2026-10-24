@@ -49,12 +49,15 @@ process.exit(response.code ?? 0);
 			[
 				process.execPath,
 				"-e",
-				`import {enumerate} from ${JSON.stringify(source)};
+				`import {existsSync,statSync} from "node:fs";
+import {enumerate} from ${JSON.stringify(source)};
 const controller=new AbortController();
-const timer=process.env.YTD_LISTING_CANCEL ? setTimeout(()=>controller.abort(),150) : undefined;
+const timer=process.env.YTD_LISTING_CANCEL ? setInterval(()=>{
+ if(existsSync(process.env.YTD_LISTING_CALLS) && statSync(process.env.YTD_LISTING_CALLS).size > 0) controller.abort();
+},10) : undefined;
 try { console.log(JSON.stringify(await enumerate(process.argv[1],controller.signal))); }
 catch(error) { console.error(error.message); process.exitCode=1; }
-finally {clearTimeout(timer);}`,
+finally {clearInterval(timer);}`,
 				url
 			],
 			{
