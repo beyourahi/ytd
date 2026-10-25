@@ -457,7 +457,15 @@ export async function reduce(
 		const ids = new Set(groups[i].map((c) => c.sourceId));
 		const synthesis = await agentJson(
 			synthesisPrompt(channel, groups[i]),
-			(v): v is ReduceOutput => validReduction(v, ids),
+			(v): v is ReduceOutput => {
+				if (object(v) && Array.isArray(v.rooms))
+					for (const room of v.rooms)
+						if (object(room) && Array.isArray(room.principles))
+							for (const principle of room.principles)
+								if (object(principle) && Array.isArray(principle.ids))
+									principle.ids = [...new Set(principle.ids)];
+				return validReduction(v, ids);
+			},
 			"synthesis",
 			options
 		);

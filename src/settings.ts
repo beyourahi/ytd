@@ -246,13 +246,19 @@ async function chooseProfile(
 			: effortChoice === "__default__"
 				? undefined
 				: effortChoice;
-	const contextTokens = unique.get(model)?.contextTokens;
+	const previous =
+		config.selected?.agent === agent && config.selected.model === model
+			? config.selected
+			: undefined;
+	const contextTokens = previous ? previous.contextTokens : unique.get(model)?.contextTokens;
+	const timeoutMs = previous?.timeoutMs;
 	const custom = config.adapters[agent];
 	return {
 		agent,
 		model,
 		...(effort ? { effort } : {}),
 		...(contextTokens ? { contextTokens } : {}),
+		...(timeoutMs ? { timeoutMs } : {}),
 		...(custom ? { custom } : {})
 	};
 }
@@ -269,7 +275,7 @@ export async function resolveCli(
 		models?: typeof discoverModels;
 		installed?: (name: string) => boolean;
 	} = {}
-): Promise<{ url: string; profile: AgentProfile } | null> {
+): Promise<{ url: string; profile: AgentProfile; replaceRouting: boolean } | null> {
 	const args = parseArgs(argv);
 	if (args.command === "help") {
 		console.log(USAGE);
@@ -316,6 +322,8 @@ export async function resolveCli(
 		return null;
 	}
 	let profile: AgentProfile | undefined;
+	let replaceRouting =
+		args.agent !== undefined || args.model !== undefined || args.effort !== undefined;
 	const explicit =
 		args.agent !== undefined ||
 		args.model !== undefined ||
@@ -344,7 +352,10 @@ export async function resolveCli(
 			);
 			if (action === "change") profile = undefined;
 		}
-		if (!profile) profile = await chooseProfile(config, ui, models, installed);
+		if (!profile) {
+			profile = await chooseProfile(config, ui, models, installed);
+			replaceRouting = true;
+		}
 	}
 	if (!validateProfile(profile)) throw new Error("Invalid agent/model selection");
 	const url =
@@ -366,5 +377,5 @@ export async function resolveCli(
 		console.log(`Saved ${profile.agent} / ${profile.model}`);
 		return null;
 	}
-	return { url: url!.trim(), profile };
+	return { url: url!.trim(), profile, replaceRouting };
 }

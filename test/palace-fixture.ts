@@ -8,7 +8,7 @@ import {
 	writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PALACE_DIR } from "../src/config.ts";
 
 const syncScript =
@@ -41,6 +41,9 @@ export function createPalaceFixture(options: { root?: string; source?: string } 
 	mkdirSync(join(source, "scripts"));
 	copyFileSync(syncScript, join(source, "scripts", "mind-palace-sync"));
 	chmodSync(join(source, "scripts", "mind-palace-sync"), 0o755);
+	const integrityScript = join(dirname(syncScript), "validate-mind-palace");
+	if (existsSync(integrityScript))
+		copyFileSync(integrityScript, join(source, "scripts", "validate-mind-palace"));
 	mkdirSync(join(source, ".githooks"));
 	for (const hook of ["pre-commit", "pre-push", "post-commit"]) {
 		const original = join(PALACE_DIR, ".githooks", hook);

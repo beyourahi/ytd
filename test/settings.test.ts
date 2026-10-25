@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { Manifest } from "../src/manifest.ts";
 import {
 	Cancelled,
 	loadSettings,
@@ -124,6 +125,127 @@ test("remembered selection preselects Run and bare ytd asks for URL", async () =
 		effort: undefined
 	});
 	expect(loadSettings(path).recent).toHaveLength(1);
+});
+
+test("route replacement authorization belongs only to the current explicit selection", async () => {
+	const path = configPath();
+	const selected = { agent: "codex", model: "same-model", effort: "high", contextTokens: 12000 };
+	saveSettings({ version: 1, selected, recent: [selected], adapters: {} }, path);
+	const answers = ["change", "codex", "same-model", "high"];
+	const result = await resolveCli(["https://youtu.be/abcdefghijk"], {
+		path,
+		interactive: true,
+		installed: (name) => name === "codex",
+		models: async () => [{ id: "same-model", contextTokens: 12000 }],
+		ui: {
+			select: async () => answers.shift()!,
+			text: async () => {
+				throw new Error("Unexpected text prompt");
+			}
+		}
+	});
+	expect(result?.profile).toEqual(selected);
+	expect(result?.replaceRouting).toBe(true);
+	expect(readFileSync(path, "utf8")).not.toContain("replaceRouting");
+	const saved = await resolveCli(["https://youtu.be/abcdefghijk"], { path, interactive: false });
+	expect(saved?.replaceRouting).toBe(false);
+	for (const args of [
+		["--model", "same-model"],
+		["--agent", "codex"],
+		["--effort", "high"]
+	]) {
+		const explicit = await resolveCli(["https://youtu.be/abcdefghijk", ...args], {
+			path,
+			interactive: false
+		});
+		expect(explicit?.replaceRouting).toBe(true);
+	}
+	for (const args of [
+		["--context-tokens", "12000"],
+		["--timeout-ms", "1000"]
+	]) {
+		const configured = await resolveCli(["https://youtu.be/abcdefghijk", ...args], {
+			path,
+			interactive: false
+		});
+		expect(configured?.replaceRouting).toBe(false);
+	}
+});
+
+test("same-model picker reselection preserves saved limits and resumes its source work", async () => {
+	for (const [savedContext, discoveredContext] of [
+		[12000, 272000],
+		[12000, undefined],
+		[undefined, 272000],
+		[undefined, undefined]
+	]) {
+		const path = configPath();
+		const selected = {
+			agent: "codex",
+			model: "same-model",
+			effort: "high",
+			...(savedContext ? { contextTokens: savedContext } : {}),
+			timeoutMs: 123456
+		};
+		saveSettings({ version: 1, selected, recent: [selected], adapters: {} }, path);
+		const manifest = new Manifest("limits", dirname(path));
+		const source = "https://youtu.be/abcdefghijk";
+		const first = manifest.beginRun({
+			profile: { ...selected, routing: { fingerprint: "old" } },
+			source,
+			videoIds: ["video"]
+		});
+		const candidate = {
+			sourceId: "video",
+			principle: "Preserve completed work",
+			detail: "Retain saved evidence",
+			theme: "Recovery"
+		};
+		manifest.saveMap("map-complete:video", [candidate], ["video"], true, []);
+		const choose = async (model: string) => {
+			const answers = ["change", "codex", model, "high"];
+			return resolveCli([source], {
+				path,
+				interactive: true,
+				installed: (name) => name === "codex",
+				models: async () => [
+					{ id: "same-model", contextTokens: discoveredContext },
+					{ id: "different-model", contextTokens: 32000 }
+				],
+				ui: {
+					select: async () => answers.shift()!,
+					text: async () => {
+						throw new Error("Unexpected text prompt");
+					}
+				}
+			});
+		};
+		try {
+			const result = await choose("same-model");
+			expect(result?.profile).toEqual(selected);
+			expect(
+				manifest.beginRun(
+					{
+						profile: { ...result!.profile, routing: { fingerprint: "new" } },
+						source,
+						videoIds: ["video"]
+					},
+					{ replaceRouting: result!.replaceRouting }
+				)
+			).toEqual({ id: first.id, replaced: false, routingChanged: true });
+			expect(manifest.candidates()).toEqual([candidate]);
+			expect(manifest.byStatus("distilled")).toHaveLength(1);
+			const changed = await choose("different-model");
+			expect(changed?.profile).toEqual({
+				agent: "codex",
+				model: "different-model",
+				effort: "high",
+				contextTokens: 32000
+			});
+		} finally {
+			manifest.close();
+		}
+	}
 });
 
 test("searchable installed-agent/model picker offers exact entry and persists effort", async () => {

@@ -238,7 +238,10 @@ export class Manifest {
 			.get(this.runId);
 	}
 
-	beginRun(profile: unknown): { id: string; replaced: boolean } {
+	beginRun(
+		profile: unknown,
+		options: { replaceRouting?: boolean } = {}
+	): { id: string; replaced: boolean; routingChanged?: boolean } {
 		const encoded = canonical(profile);
 		const selection = profile as { source?: unknown; videoIds?: unknown };
 		const source = typeof selection.source === "string" ? selection.source : "";
@@ -254,11 +257,46 @@ export class Manifest {
 					Object.fromEntries(
 						Object.entries(value).filter(([key]) => key !== "source" && key !== "videoIds")
 					);
-				if (
+				const requested = (s: Record<string, unknown>, limits = true) => {
+					const p = selectedProfile(s) as Record<string, unknown>;
+					return canonical([
+						p.agent,
+						p.model,
+						p.effort,
+						p.custom,
+						...(limits ? [p.contextTokens, p.timeoutMs] : [])
+					]);
+				};
+				const previous = old ? JSON.parse(old.profile) : undefined;
+				const sameSelection =
+					old && requested(previous) === requested(profile as Record<string, unknown>);
+				const sameRouteSelection =
 					old &&
-					canonical(selectedProfile(JSON.parse(old.profile))) ===
-						canonical(selectedProfile(profile as Record<string, unknown>))
-				) {
+					requested(previous, false) === requested(profile as Record<string, unknown>, false);
+				const route = (value: Record<string, unknown>) =>
+					canonical((selectedProfile(value) as Record<string, unknown>).routing);
+				const sameProfile =
+					old &&
+					canonical(selectedProfile(previous)) ===
+						canonical(selectedProfile(profile as Record<string, unknown>));
+				if (old && (sameProfile || (sameSelection && options.replaceRouting))) {
+					if (!sameProfile) {
+						const selected = selectedProfile(profile as Record<string, unknown>);
+						// Keep prior call keys/evidence and publication identities on their original run.
+						this.db.run("INSERT INTO checkpoints(run_id,key,value) VALUES (?,?,?)", [
+							old.id,
+							`routing-transition:${randomUUID()}`,
+							JSON.stringify({
+								at: new Date().toISOString(),
+								from: selectedProfile(previous),
+								to: selected
+							})
+						]);
+						this.db.run("UPDATE runs SET profile=? WHERE id=?", [
+							canonical({ ...previous, profile: selected }),
+							old.id
+						]);
+					}
 					this.runId = old.id;
 					// Finish this immutable source set before a follow-on run ingests newly listed videos.
 					// Saved plans recover every room even if another source completed the video.
@@ -267,18 +305,17 @@ export class Manifest {
 							"UPDATE run_videos SET status='done',reason=NULL WHERE run_id=? AND id IN (SELECT id FROM videos WHERE status='done')",
 							[old.id]
 						);
-					return { id: old.id, replaced: false };
+					return { id: old.id, replaced: false, ...(!sameProfile ? { routingChanged: true } : {}) };
 				}
-				if (old) {
-					const requested = (s: Record<string, unknown>) => {
-						const p = (s.profile ?? s) as Record<string, unknown>;
-						return canonical([p.agent, p.model, p.effort, p.contextTokens, p.timeoutMs, p.custom]);
-					};
-					if (requested(JSON.parse(old.profile)) === requested(profile as Record<string, unknown>))
-						throw new Error(
-							"Agent routing changed since the paused run; restore the original route or explicitly select a replacement profile"
-						);
-				}
+				if (
+					sameSelection ||
+					(sameRouteSelection &&
+						route(previous) !== route(profile as Record<string, unknown>) &&
+						!options.replaceRouting)
+				)
+					throw new Error(
+						"Agent routing changed since the paused run; restore the original route or explicitly select a replacement profile"
+					);
 				const id = randomUUID();
 				const ids = new Set(
 					Array.isArray(selection.videoIds) &&

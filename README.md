@@ -75,9 +75,15 @@ steps cannot discard them. Automated review can still miss concerns and is not c
 Quota failures preserve progress for a later rerun.
 Successful answer prose mentioning limits never becomes a quota error.
 
-Rerun the same command to resume. An explicit selection change creates a replacement run for
-unfinished work; fetched material and verified publication receipts survive. Earlier model
-checkpoints remain preserved. Legacy manifests and JSONL are backed up/imported idempotently;
+Rerun the same command to resume. If routing changed, choose **Change agent/model** and select
+the same agent/model/effort again, or pass an explicit `--agent`, `--model`, or `--effort` argument.
+This authorizes the current routing for that invocation and resumes the saved run, retaining
+completed extraction, source reviews, candidates and publication recovery. Routing transitions
+are recorded separately; earlier successful calls keep their original identity evidence and
+are not reclassified as verified by the new route. Merely choosing **Run** with a remembered
+selection does not authorize routing drift. Changing the requested selection creates a separate
+replacement run for unfinished work; fetched material, verified publication receipts and earlier
+model checkpoints remain preserved. Legacy manifests and JSONL are backed up/imported idempotently;
 unknown historical completion is re-extracted and remotely deduplicated. Corrupt or ambiguous
 inputs stop migration with their originals preserved. Upgrades wait for any older ingestion to
 finish, then back up and migrate under serialized initialization. Older binaries refuse the upgraded

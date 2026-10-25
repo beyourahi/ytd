@@ -181,6 +181,64 @@ function publicationReceipts(f: CliFixture): { commit: string; path: string; mar
 }
 
 test.skipIf(!hasPalacePrerequisite)(
+	"explicit same-model routing selection resumes saved extraction without repeating model calls",
+	async () => {
+		const f = createCliFixture();
+		const barrier = join(f.root, "route-barrier");
+		mkdirSync(barrier);
+		const first = startCli(f, undefined, {
+			YTD_FIXTURE_BARRIER: barrier,
+			YTD_FIXTURE_BARRIER_STAGE: "synthesize"
+		});
+		try {
+			await waitFor(
+				() => existsSync(join(barrier, "synthesize-dQw4w9WgXcQ.entered")),
+				() => first.stdout + first.stderr
+			);
+			await first.stop();
+			const callsBefore = fixtureCalls(f).filter(
+				(call) => call.startsWith("Distill") || call.startsWith("Carefully")
+			);
+			expect(callsBefore).toHaveLength(2);
+			const executable = join(f.root, "bin", "fixture-agent");
+			writeFileSync(executable, readFileSync(executable, "utf8") + "\n");
+			const blocked = await runCommand(f.command, { env: f.env, timeoutMs: 60_000 });
+			expect(blocked.code).toBe(1);
+			expect(blocked.stderr).toContain("Agent routing changed since the paused run");
+			const resumed = await runCommand([...f.command, "--model", "fixture-model"], {
+				env: f.env,
+				timeoutMs: 60_000
+			});
+			expect(resumed.stderr).toBe("");
+			expect(resumed.code).toBe(0);
+			expect(resumed.stdout).toContain("Resumed with explicitly selected routing");
+			expect(
+				fixtureCalls(f).filter((call) => call.startsWith("Distill") || call.startsWith("Carefully"))
+			).toEqual(callsBefore);
+			const db = new Database(join(f.configDir, "data", "library", "manifest.sqlite"), {
+				readonly: true
+			});
+			try {
+				expect(db.query("SELECT count(*) AS n FROM runs").get()).toEqual({ n: 1 });
+				expect(db.query("SELECT status FROM runs").get()).toEqual({ status: "complete" });
+				expect(
+					db
+						.query("SELECT count(*) AS n FROM checkpoints WHERE key LIKE 'routing-transition:%'")
+						.get()
+				).toEqual({ n: 1 });
+			} finally {
+				db.close();
+			}
+			expect(publicationReceipts(f)).toHaveLength(2);
+		} finally {
+			await first.stop();
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	180_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
 	"concurrent disjoint CLI runs extract together and queue synthesis with verified unique IDs",
 	async () => {
 		const f = createCliFixture();

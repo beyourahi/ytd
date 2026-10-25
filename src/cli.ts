@@ -315,7 +315,12 @@ async function publishCreatorAttempt(
 	return plan.receipts;
 }
 
-async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): Promise<void> {
+async function ingest(
+	url: string,
+	profile: AgentProfile,
+	signal: AbortSignal,
+	replaceRouting = false
+): Promise<void> {
 	const source = canonicalSource(url);
 	if (!Bun.which("yt-dlp", { PATH: process.env.PATH }))
 		throw new Error("yt-dlp not found. Install separately with: uv tool install yt-dlp");
@@ -353,7 +358,11 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 		const receipts: PublicationReceipt[] = [];
 		for (;;) {
 			completed = false;
-			const run = manifest.beginRun({ profile: selected, source, videoIds: requestedIds.sort() });
+			const run = manifest.beginRun(
+				{ profile: selected, source, videoIds: requestedIds.sort() },
+				{ replaceRouting }
+			);
+			replaceRouting = false;
 			ids = new Set(manifest.all().map((row) => row.id));
 			const publishing = manifest.hasPublicationPlans();
 			// A saved plan owns its original candidates, creator identity and room receipts.
@@ -372,6 +381,10 @@ async function ingest(url: string, profile: AgentProfile, signal: AbortSignal): 
 			if (run.replaced)
 				console.log(
 					"Created a replacement run; prior checkpoints and verified receipts are preserved."
+				);
+			if (run.routingChanged)
+				console.log(
+					"Resumed with explicitly selected routing; saved work and prior model identity evidence are preserved."
 				);
 			const scoped = () => scopeRows(manifest!, ids);
 			if (!publishing) {
@@ -467,7 +480,7 @@ export async function main(): Promise<void> {
 	process.on("SIGINT", cancel);
 	process.on("SIGTERM", cancel);
 	try {
-		await ingest(selection.url, selection.profile, controller.signal);
+		await ingest(selection.url, selection.profile, controller.signal, selection.replaceRouting);
 	} finally {
 		process.off("SIGINT", cancel);
 		process.off("SIGTERM", cancel);

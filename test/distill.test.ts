@@ -417,6 +417,89 @@ test("reduction compares every note shard, caches calls and unions accepted cita
 	}
 });
 
+test("synthesis deduplicates known citations before validation and caches the complete review", async () => {
+	const f = fixture();
+	try {
+		const candidates = [candidate, { ...candidate, sourceId: "other" }];
+		const output = {
+			rooms: [
+				{
+					room: "craft",
+					principles: [
+						{
+							theme: "Reliability",
+							principle: "Keep checkpoints",
+							ids: ["video", "video", "other"]
+						}
+					],
+					halalNotes: ["General permissible engineering advice"]
+				},
+				{ room: "business", principles: [], halalNotes: [concern.note] }
+			]
+		};
+		let calls = 0;
+		let callKey = "";
+		const options: DistillOptions = {
+			profile,
+			manifest: f.manifest,
+			diagnosticsDir: f.dir,
+			call: async (prompt) => {
+				calls++;
+				callKey = `call:${stableHash([profile, prompt, "synthesis"])}`;
+				return answer(output);
+			}
+		};
+		expect(validReduction(output, new Set(["video", "other"]))).toBe(false);
+		const result = await reduce(candidates, "Creator", [], undefined, options);
+		const normalized = structuredClone(output);
+		normalized.rooms[0].principles[0].ids = ["video", "other"];
+		expect(result).toEqual({ out: normalized });
+		expect(f.manifest.getCheckpoint(callKey)).toEqual({
+			obj: normalized,
+			requestedModel: "exact-model",
+			reportedModel: "exact-model",
+			identityVerified: true
+		});
+		expect((await reduce(candidates, "Creator", [], undefined, options)).out).toEqual(normalized);
+		expect(calls).toBe(1);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("synthesis citation normalization cannot admit malformed output or unknown citations", async () => {
+	const f = fixture();
+	try {
+		const principle = { theme: "Reliability", principle: "Keep checkpoints", ids: ["video"] };
+		for (const invalid of [
+			...[[], ["video", "video", "foreign"], ["video", 4], "video"].map((ids) => ({
+				...principle,
+				ids
+			})),
+			null,
+			{ ...principle, principle: "Keep\n# forged heading", ids: ["video", "video"] }
+		]) {
+			let calls = 0;
+			const result = await reduce([candidate], "Creator", [], undefined, {
+				profile,
+				manifest: f.manifest,
+				diagnosticsDir: f.dir,
+				call: async () => {
+					calls++;
+					return answer({
+						rooms: [{ room: "craft", principles: [invalid], halalNotes: [] }]
+					});
+				}
+			});
+			expect(result.out).toBeUndefined();
+			expect(result.error).toContain("Invalid synthesis response after 3 attempts");
+			expect(calls).toBe(3);
+		}
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("changed notes invalidate comparisons but retain successful synthesis checkpoints", async () => {
 	const f = fixture();
 	try {

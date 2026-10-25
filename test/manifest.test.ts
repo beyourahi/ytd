@@ -68,6 +68,104 @@ test("routing-only changes stop paused runs; explicit source/model changes creat
 	}
 });
 
+test("explicit route reselection preserves source work, publication recovery and original call evidence", () => {
+	const f = fixture();
+	try {
+		const m = new Manifest("library", f.dir);
+		const request = { profile, source: "one", videoIds: ["video"] };
+		const old = m.beginRun(request);
+		m.addVideos([{ id: "video", title: "Original title", channel: "Creator" }]);
+		const halalNotes = [
+			{ sourceId: "video", room: "craft" as const, note: "Preserve review evidence" }
+		];
+		m.saveMap("map-complete:video", [candidate], ["video"], true, halalNotes);
+		const call = {
+			obj: { candidates: [candidate], halalNotes },
+			reportedModel: "original-model",
+			identityVerified: true
+		};
+		m.checkpoint("call:original-route", call);
+		m.checkpoint("resolved-model", { reportedModel: "original-model" });
+		const plan = { complete: false, receipts: [{ verified: true, commit: "abc" }] };
+		m.checkpoint("publication:creator", plan);
+		m.recordReceipt("room", plan.receipts[0]);
+		const selected = { ...profile, routing: { verified: false, fingerprint: "new-route" } };
+		expect(() => m.beginRun({ profile: selected, source: "one", videoIds: ["new"] })).toThrow(
+			"routing changed"
+		);
+		expect(
+			m.beginRun({ profile: selected, source: "one", videoIds: ["new"] }, { replaceRouting: true })
+		).toEqual({ id: old.id, replaced: false, routingChanged: true });
+		expect(m.candidates()).toEqual([candidate]);
+		expect(m.byStatus("distilled").map((row) => row.id)).toEqual(["video"]);
+		expect(m.sourceReviews(["video"])).toEqual({ halalNotes, unavailable: [] });
+		expect(m.getCheckpoint("call:original-route")).toEqual(call);
+		expect(m.getCheckpoint("resolved-model")).toEqual({ reportedModel: "original-model" });
+		expect(m.modelCallSummary()).toEqual({
+			total: 1,
+			reported: 1,
+			unverified: 0,
+			models: [{ model: "original-model", calls: 1 }]
+		});
+		expect(m.getCheckpoint("publication:creator")).toEqual(plan);
+		expect(m.receipts()).toEqual(plan.receipts);
+		m.close();
+		const db = new Database(join(f.dir, "library.sqlite"), { readonly: true });
+		const saved = db.query("SELECT profile FROM runs WHERE id=?").get(old.id) as {
+			profile: string;
+		};
+		expect(JSON.parse(saved.profile)).toEqual({ ...request, profile: selected });
+		const transition = db
+			.query("SELECT value FROM checkpoints WHERE run_id=? AND key LIKE 'routing-transition:%'")
+			.get(old.id) as { value: string };
+		expect(JSON.parse(transition.value)).toMatchObject({ from: profile, to: selected });
+		db.close();
+		const resumed = new Manifest("library", f.dir);
+		expect(resumed.beginRun({ profile: selected, source: "one", videoIds: ["new"] }).id).toBe(
+			old.id
+		);
+		expect(() => resumed.beginRun(request)).toThrow("routing changed");
+		resumed.beginRun(request, { replaceRouting: true });
+		resumed.beginRun({ ...request, profile: selected }, { replaceRouting: true });
+		resumed.close();
+		const audit = new Database(join(f.dir, "library.sqlite"), { readonly: true });
+		expect(
+			audit
+				.query(
+					"SELECT count(*) AS n FROM checkpoints WHERE run_id=? AND key LIKE 'routing-transition:%'"
+				)
+				.get(old.id)
+		).toEqual({ n: 3 });
+		audit.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("timeout and context overrides cannot authorize routing changes", () => {
+	const f = fixture();
+	try {
+		const m = new Manifest("library", f.dir);
+		m.beginRun({ profile, source: "one", videoIds: ["video"] });
+		for (const limits of [{ timeoutMs: 1000 }, { contextTokens: 12000 }]) {
+			expect(() =>
+				m.beginRun({
+					profile: { ...profile, ...limits, routing: { verified: false, fingerprint: "changed" } },
+					source: "one",
+					videoIds: ["video"]
+				})
+			).toThrow("routing changed");
+		}
+		expect(
+			m.beginRun({ profile: { ...profile, timeoutMs: 1000 }, source: "one", videoIds: ["video"] })
+				.replaced
+		).toBe(true);
+		m.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("candidate/checkpoint errors roll back the whole transaction", () => {
 	const f = fixture();
 	try {
