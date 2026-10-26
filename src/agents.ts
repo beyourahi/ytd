@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { OPENCODE_CONFIG_HOME, RUN_DIR } from "./config.ts";
 import { runCommand, type CommandResult } from "./process.ts";
-import { FREEBUFF_CATALOG, handoff, prepareWorkspace, workspaceFor } from "./freebuff.ts";
+import { FREEBUFF_CATALOG, handoff, isWorkspaceFor, prepareWorkspace } from "./freebuff.ts";
 
 export const BUILT_INS = ["claude", "codex", "pi", "opencode", "freebuff"] as const;
 export interface CustomAdapter {
@@ -553,7 +553,8 @@ async function verifyOpencodeV2(
 	}
 }
 
-export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
+/** `source` gives Freebuff a job folder of its own for that URL. */
+export async function preflight(profile: AgentProfile, source?: string): Promise<AgentProfile> {
 	if (!validateProfile(profile)) throw new Error("Invalid agent/model settings");
 	if (
 		profile.custom &&
@@ -581,7 +582,7 @@ export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 			routing: {
 				...routing,
 				protocol: "freebuff-handoff",
-				workspace: prepareWorkspace(profile.model, profile.effort)
+				workspace: prepareWorkspace(profile.model, profile.effort, source)
 			}
 		};
 	if (!profile.custom) {
@@ -922,7 +923,8 @@ export async function agentPrompt(
 			const workspace = profile.routing.workspace;
 			if (
 				profile.routing.protocol !== "freebuff-handoff" ||
-				workspace !== workspaceFor(profile.model, profile.effort)
+				!workspace ||
+				!isWorkspaceFor(workspace, profile.model)
 			)
 				return failure(
 					profile,

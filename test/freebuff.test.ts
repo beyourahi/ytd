@@ -142,6 +142,25 @@ test("preflight prepares a private job folder without running Freebuff", async (
 	expect((await preflight({ ...deepseek, effort: "max" })).routing!.workspace).not.toBe(dir);
 });
 
+test("each source gets its own stable folder, so concurrent terminals never share jobs", async () => {
+	const channel = "https://www.youtube.com/@some-creator";
+	const one = (await preflight(deepseek, channel)).routing!.workspace!;
+	const video = (await preflight(deepseek, "https://www.youtube.com/watch?v=abc_DEF-123")).routing!
+		.workspace!;
+	expect(one).not.toBe(video);
+	expect(one).not.toBe((await preflight(deepseek)).routing!.workspace);
+	expect(one).toMatch(/\/deepseek-v4\.1-flash-10-17-@some-creator-[0-9a-f]{8}$/);
+	expect(video).toMatch(/-abc_DEF-123-[0-9a-f]{8}$/);
+	// A rerun of the same source resumes in the same folder.
+	expect((await preflight(deepseek, channel)).routing!.workspace).toBe(one);
+	// Only a folder preflight could have made is used.
+	const elsewhere = await preflight(deepseek, channel);
+	for (const workspace of [join(root, "elsewhere"), join(FREEBUFF.dir, "other-model-1234abcd")])
+		expect(
+			await agentPrompt("x", { ...elsewhere, routing: { ...elsewhere.routing!, workspace } })
+		).toMatchObject({ ok: false, kind: "restriction" });
+});
+
 test("answers are imported once settled, unverified, and the job is retired", async () => {
 	const selected = await preflight(deepseek);
 	const dir = selected.routing!.workspace!;

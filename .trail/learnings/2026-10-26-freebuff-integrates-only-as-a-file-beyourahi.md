@@ -19,7 +19,7 @@ touches:
 
 ## Decided
 
-Freebuff 0.2.34 has no headless mode, prompt argument, model flag, model listing or structured output (CodebuffAI/freebuff#947). src/freebuff.ts therefore never runs, scripts or reads Freebuff's UI, login or ~/.config/manicode settings. agentPrompt writes each exact prompt to ~/.ytd/freebuff/<model-effort>/jobs/<id>.prompt.txt and imports responses/<id>.txt, so every existing validator, checkpoint, dedup and halal step is reused unchanged. Identity is always unverified. The catalog is a versioned copy of the README picker plus installed-binary efforts and fallbacks; it is advertised data, never account confirmation.
+Freebuff 0.2.34 has no headless mode, prompt argument, model flag, model listing or structured output (CodebuffAI/freebuff#947). src/freebuff.ts therefore never runs, scripts or reads Freebuff's UI, login or ~/.config/manicode settings. agentPrompt writes each exact prompt to ~/.ytd/freebuff/<model>-<source label>-<hash of model, effort, source>/jobs/<id>.prompt.txt (one folder per source URL, so concurrent terminals with the same model and effort never share jobs; Manifest.beginRun ignores routing.workspace so runs paused under the earlier shared folder still resume) and imports responses/<id>.txt, so every existing validator, checkpoint, dedup and halal step is reused unchanged. Identity is always unverified. The catalog is a versioned copy of the README picker plus installed-binary efforts and fallbacks; it is advertised data, never account confirmation.
 
 ## Tried and ruled out
 

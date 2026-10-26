@@ -68,6 +68,22 @@ test("routing-only changes stop paused runs; explicit source/model changes creat
 	}
 });
 
+test("a moved Freebuff exchange folder alone resumes the paused run", () => {
+	const f = fixture();
+	try {
+		const m = new Manifest("library", f.dir);
+		const at = (workspace: string) => ({
+			profile: { ...profile, routing: { verified: false, workspace } },
+			source: "one"
+		});
+		const old = m.beginRun(at("/x/model-shared"));
+		expect(m.beginRun(at("/x/model-one-1234abcd"))).toEqual({ id: old.id, replaced: false });
+		m.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("explicit route reselection preserves source work, publication recovery and original call evidence", () => {
 	const f = fixture();
 	try {

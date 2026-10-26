@@ -83,9 +83,14 @@ job file that your own Freebuff session answers:
 ```sh
 ytd 'https://youtu.be/VIDEO_ID' --agent freebuff --model deepseek-v4.1-flash-10-17 --effort high
 # in a second terminal, the folder ytd prints:
-freebuff --cwd ~/.ytd/freebuff/deepseek-v4.1-flash-10-17-<hash>
+freebuff --cwd ~/.ytd/freebuff/deepseek-v4.1-flash-10-17-VIDEO_ID-<hash>
 # in Freebuff: select DeepSeek V4.1 Flash 10/17 (effort high), then send: Follow INSTRUCTIONS.md
 ```
+
+Each source URL gets its own folder (model, source label, hash of model, effort and URL), so
+ytd runs in several terminals with the same model and effort each need their own Freebuff
+session and never share jobs. Rerunning the same URL reuses its folder, so a paused run resumes
+there.
 
 What is automated: ytd writes each exact prompt to `jobs/<id>.prompt.txt`, with a
 `[[ytd-check <code>]]` line after about every 24 KB and at the end. Freebuff runs `sh next.sh`,

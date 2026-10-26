@@ -179,12 +179,27 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const tilde = (path: string) =>
 	path.startsWith(homedir() + "/") ? `~${path.slice(homedir().length)}` : path;
 
-export function workspaceFor(model: string, effort?: string): string {
-	const readable = model.replace(/[^\w.-]+/g, "_").slice(0, 48);
-	return join(
-		FREEBUFF.dir,
-		`${readable}-${hash(JSON.stringify([model, effort ?? null])).slice(0, 8)}`
+const readable = (model: string) => model.replace(/[^\w.-]+/g, "_").slice(0, 48);
+
+/** One folder per source, so concurrent terminals never share jobs and a rerun resumes its own. */
+export function workspaceFor(model: string, effort?: string, source?: string): string {
+	const id = hash(
+		JSON.stringify(source ? [model, effort ?? null, source] : [model, effort ?? null])
 	);
+	// e.g. "@handle", a video id or a playlist id from the canonical source URL
+	const label = source
+		? `${source
+				.split(/[/=]/)
+				.pop()!
+				.replace(/[^\w.@-]+/g, "_")
+				.slice(0, 32)}-`
+		: "";
+	return join(FREEBUFF.dir, `${readable(model)}-${label}${id.slice(0, 8)}`);
+}
+
+/** True for a folder workspaceFor could have made for this model. */
+export function isWorkspaceFor(dir: string, model: string): boolean {
+	return dirname(dir) === FREEBUFF.dir && basename(dir).startsWith(`${readable(model)}-`);
 }
 
 function writeAtomic(path: string, text: string): void {
@@ -285,8 +300,8 @@ export function provenAnswer(text: string, codes: string[]): string | undefined 
 }
 
 /** Creates the job workspace; it holds only job prompts and answers, never credentials. */
-export function prepareWorkspace(model: string, effort?: string): string {
-	const dir = workspaceFor(model, effort);
+export function prepareWorkspace(model: string, effort?: string, source?: string): string {
+	const dir = workspaceFor(model, effort, source);
 	for (const sub of ["jobs", "responses", "rejected"])
 		mkdirSync(join(dir, sub), { recursive: true, mode: 0o700 });
 	writeAtomic(join(dir, "INSTRUCTIONS.md"), instructions(model, effort));

@@ -325,7 +325,7 @@ async function ingest(
 	const source = canonicalSource(url);
 	if (!Bun.which("yt-dlp", { PATH: process.env.PATH }))
 		throw new Error("yt-dlp not found. Install separately with: uv tool install yt-dlp");
-	const selected = await preflight(profile);
+	const selected = await preflight(profile, source);
 	console.log(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
 	);
