@@ -19,6 +19,7 @@ import {
 	type CustomAdapter,
 	type ModelSuggestion
 } from "./agents.ts";
+import { catalogNote, freebuffModel } from "./freebuff.ts";
 
 export const SETTINGS_PATH = join(homedir(), ".ytd/config.json");
 export interface Settings {
@@ -41,7 +42,11 @@ export function loadSettings(path = SETTINGS_PATH): Settings {
 	)
 		throw new Error(`Invalid or unsupported settings in ${path}; original file preserved`);
 	for (const [agent, custom] of Object.entries(config.adapters))
-		if (!validateProfile({ agent, model: "validation", custom }))
+		if (BUILT_INS.includes(agent as (typeof BUILT_INS)[number]))
+			throw new Error(
+				`Custom adapter ${agent} conflicts with the built-in ${agent} agent; rename it in ${path}`
+			);
+		else if (!validateProfile({ agent, model: "validation", custom }))
 			throw new Error(`Invalid custom adapter ${agent}; settings preserved`);
 	return config;
 }
@@ -119,12 +124,19 @@ export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile
 	const model = args.model ?? (!changed ? previous?.model : undefined);
 	if (!model) throw new Error("Select a model with --model or ytd settings");
 	const custom = settings.adapters[agent];
+	const listed = agent === "freebuff" ? freebuffModel(model) : undefined;
+	// Freebuff cannot be told an effort, so a choice its picker lacks would mislead the user.
+	if (listed && args.effort && !listed.efforts?.includes(args.effort))
+		throw new Error(
+			`${listed.name} ${listed.efforts?.length ? `offers effort ${listed.efforts.join(", ")}` : "has no effort setting"} in Freebuff`
+		);
 	const profile: AgentProfile = {
 		agent,
 		model,
+		...(listed?.contextTokens ? { contextTokens: listed.contextTokens } : {}),
 		...(!changed && previous?.model === model
 			? {
-					contextTokens: previous.contextTokens,
+					...(previous.contextTokens ? { contextTokens: previous.contextTokens } : {}),
 					timeoutMs: previous.timeoutMs,
 					effort: previous.effort
 				}
@@ -138,7 +150,7 @@ export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile
 	return profile;
 }
 
-type Choice = { value: string; label: string; hint?: string };
+type Choice = { value: string; label: string; hint?: string; disabled?: boolean };
 export interface Picker {
 	text(message: string, initial?: string): Promise<string>;
 	select(
@@ -182,6 +194,9 @@ export const EFFORTS: Record<string, string[]> = {
 	pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
 	opencode: ["minimal", "low", "medium", "high", "max"]
 };
+const AGENT_HINTS: Record<string, string> = {
+	freebuff: "interactive handoff; no headless mode; login not checked"
+};
 
 async function chooseProfile(
 	config: Settings,
@@ -189,19 +204,31 @@ async function chooseProfile(
 	models: typeof discoverModels,
 	installed: (name: string) => boolean
 ): Promise<AgentProfile> {
-	const names = [...BUILT_INS, ...Object.keys(config.adapters)].filter((name) =>
-		installed(config.adapters[name]?.executable ?? name)
-	);
-	if (!names.length)
+	// Clack draws no hint for disabled rows and may start on one, so name the state in the label
+	// and start on an installed agent.
+	const agents = [...BUILT_INS, ...Object.keys(config.adapters)]
+		.map((value) => {
+			const ready = installed(config.adapters[value]?.executable ?? value);
+			return ready
+				? {
+						value,
+						label: value,
+						hint: AGENT_HINTS[value] ?? (config.adapters[value] ? "trusted wrapper" : "headless")
+					}
+				: { value, label: `${value} (not installed)`, disabled: true };
+		})
+		.sort((a, b) => Number(Boolean(a.disabled)) - Number(Boolean(b.disabled)));
+	const ready = agents.filter((choice) => !choice.disabled);
+	if (!ready.length)
 		throw new Error(
 			"No installed agents found. Configure one separately or add a trusted wrapper with ytd agents add."
 		);
-	const agent = await ui.select(
-		"Agent",
-		names.map((value) => ({ value, label: value })),
-		config.selected?.agent,
-		true
-	);
+	const saved = ready.find((choice) => choice.value === config.selected?.agent);
+	const agent = await ui.select("Agent", agents, (saved ?? ready[0]).value, true);
+	if (!ready.some((choice) => choice.value === agent))
+		throw new Error(
+			agent ? `${agent} is not installed; no agent was selected` : "No installed agent was selected"
+		);
 	const suggestions = await models(agent);
 	const recent = config.recent.filter((p) => p.agent === agent);
 	const unique = new Map<string, ModelSuggestion>(
@@ -210,13 +237,13 @@ async function chooseProfile(
 		)
 	);
 	const modelChoice = await ui.select(
-		"Model",
+		agent === "freebuff" ? `Model · ${catalogNote()}` : "Model",
 		[...unique.values()]
 			.map((m) => ({
 				value: m.id,
-				label: m.id,
+				label: m.label ?? suggestions.find((s) => s.id === m.id)?.label ?? m.id,
 				hint: recent.some((p) => p.model === m.id)
-					? "recent"
+					? ["recent", suggestions.find((s) => s.id === m.id)?.hint].filter(Boolean).join("; ")
 					: (m.hint ?? "suggestion; availability depends on your account")
 			}))
 			.concat([
@@ -231,18 +258,21 @@ async function chooseProfile(
 	);
 	const model =
 		modelChoice === "__exact__" ? (await ui.text("Exact model ID")).trim() : modelChoice;
-	// An OpenCode model ID ending in #variant already selects its variant.
+	const variants = suggestions.find((m) => m.id === model)?.variants;
+	// An OpenCode model ID ending in #variant already selects its variant; Freebuff offers
+	// effort only for catalog models that list efforts.
 	const effortChoice =
-		agent === "opencode" && model.includes("#")
+		(agent === "opencode" && model.includes("#")) || (agent === "freebuff" && !variants?.length)
 			? "__default__"
 			: await ui.select(
 					"Effort",
 					[
 						{ value: "__default__", label: "Use configured agent default" },
-						...(suggestions.find((m) => m.id === model)?.variants ?? EFFORTS[agent] ?? []).map(
-							(value) => ({ value, label: value })
-						),
-						{ value: "__exact__", label: "Enter exact effort/variant" }
+						...(variants ?? EFFORTS[agent] ?? []).map((value) => ({ value, label: value })),
+						// Freebuff catalog efforts are exact; ytd cannot pass Freebuff anything else.
+						...(agent === "freebuff" && variants?.length
+							? []
+							: [{ value: "__exact__", label: "Enter exact effort/variant" }])
 					],
 					"__default__"
 				);

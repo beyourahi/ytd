@@ -1,7 +1,15 @@
 import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync
+} from "node:fs";
 import { join } from "node:path";
 import { createPalaceFixture, fixtureGit, hasPalacePrerequisite } from "./palace-fixture.ts";
 import { runCommand } from "../src/process.ts";
@@ -1222,3 +1230,105 @@ process.exit(code);
 		180_000
 	);
 }
+
+test.skipIf(!hasPalacePrerequisite)(
+	"Freebuff handoff completes the pipeline from answer files, rejects invalid answers and resumes",
+	async () => {
+		const f = createCliFixture();
+		const marker = join(f.root, "freebuff-executed");
+		const bin = join(f.root, "bin");
+		writeFileSync(join(bin, "freebuff"), `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\n`);
+		chmodSync(join(bin, "freebuff"), 0o755);
+		writeFileSync(
+			join(f.configDir, "config.json"),
+			JSON.stringify({
+				version: 1,
+				selected: { agent: "freebuff", model: "deepseek-v4.1-flash-10-17", effort: "high" },
+				recent: [],
+				adapters: {}
+			})
+		);
+		const exchange = join(f.configDir, "freebuff");
+		const pending = () =>
+			(existsSync(exchange) ? readdirSync(exchange) : []).flatMap((folder) =>
+				(existsSync(join(exchange, folder, "jobs"))
+					? readdirSync(join(exchange, folder, "jobs"))
+					: []
+				)
+					.filter((name) => name.endsWith(".prompt.txt"))
+					.map((name) => ({
+						job: join(exchange, folder, "jobs", name),
+						note: join(exchange, folder, "jobs", name.replace(".prompt.txt", ".note.txt")),
+						response: join(exchange, folder, "responses", name.replace(".prompt.txt", ".txt"))
+					}))
+			);
+		// Mock Freebuff session: answers jobs with the fixture model, never via ytd's process.
+		const answer = async (only?: string, invalidFirst = false) => {
+			for (const job of pending()) {
+				if (existsSync(job.response)) continue;
+				let prompt: string;
+				try {
+					prompt = readFileSync(job.job, "utf8");
+				} catch {
+					continue;
+				}
+				if (only && !prompt.startsWith(only)) continue;
+				if (invalidFirst && !existsSync(job.note)) {
+					writeFileSync(job.response, '{"candidates":');
+					continue;
+				}
+				const result = await runCommand([join(bin, "fixture-agent"), "freebuff"], {
+					input: prompt,
+					env: f.env,
+					timeoutMs: 30_000
+				});
+				writeFileSync(job.response, result.stdout);
+			}
+		};
+		let first: ReturnType<typeof startCli> | undefined;
+		try {
+			first = startCli(f);
+			const deadline = Date.now() + 60_000;
+			const gleanPending = () =>
+				pending().some((job) => {
+					try {
+						return readFileSync(job.job, "utf8").startsWith("Carefully");
+					} catch {
+						return false; // ytd retired the job while it was listed
+					}
+				});
+			while (!gleanPending()) {
+				if (Date.now() > deadline) throw new Error(`No glean job: ${first.stdout}${first.stderr}`);
+				await answer("Distill", true);
+				await Bun.sleep(50);
+			}
+			await first.stop();
+			expect(first.stdout).toContain("Send: Follow INSTRUCTIONS.md");
+			expect(first.stdout).toContain("asked again");
+			// Answered while ytd was stopped: the resumed run imports it instead of asking again.
+			await answer("Carefully");
+			const resumed = startCli(f);
+			const done = Date.now() + 120_000;
+			while (resumed.child.exitCode === null && Date.now() < done) {
+				await answer();
+				await Bun.sleep(50);
+			}
+			const result = await resumed.result;
+			expect(result.stderr).toBe("");
+			expect(result.code).toBe(0);
+			expect(result.stdout).toContain("2 room/creator publications remotely verified");
+			expect(result.stdout).toContain("Freebuff: job");
+			expect(result.stdout).toContain("unverified");
+			const calls = fixtureCalls(f);
+			expect(calls.filter((c) => c.startsWith("Distill"))).toHaveLength(1);
+			expect(calls.filter((c) => c.startsWith("Carefully"))).toHaveLength(1);
+			expect(publicationReceipts(f)).toHaveLength(2);
+			expect(pending()).toEqual([]);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			await first?.stop();
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	240_000
+);

@@ -28,6 +28,7 @@ Automation skips the picker:
 ytd 'https://youtu.be/VIDEO_ID' --agent claude --model opus --effort high
 ytd 'https://youtu.be/VIDEO_ID' --agent codex --model YOUR_MODEL_ID
 ytd 'https://youtu.be/VIDEO_ID' --agent opencode --model opencode/MODEL_ID --effort VARIANT
+ytd 'https://youtu.be/VIDEO_ID' --agent freebuff --model deepseek-v4.1-flash-10-17 --effort high
 ```
 
 Explicit arguments override remembered settings for that invocation. Changing agent requires
@@ -43,8 +44,10 @@ assembled prompt is budgeted; transcripts and notes are sharded without truncati
 
 Install/configure `yt-dlp`, Bun, a JavaScript runtime for YouTube (Node is auto-detected),
 and the desired coding-agent CLI separately. Existing harness provider/auth/account settings
-remain in effect. ytd invokes installed headless protocols for Claude, Codex, Pi, and OpenCode.
-Each built-in checks restriction support before ingestion and refuses unsupported versions.
+remain in effect. ytd invokes installed headless protocols for Claude, Codex, Pi, and OpenCode,
+and an interactive file handoff for Freebuff (below).
+Each headless built-in checks restriction support before ingestion and refuses unsupported
+versions. Freebuff is the exception: ytd cannot restrict its tools (see below).
 Claude explicitly disables tools/MCP; Codex uses read-only execution and disables command,
 network-tool, integration, hook, and subagent surfaces; Pi disables tools and external context;
 OpenCode denies tools and isolates plugins/MCP using its supported configuration.
@@ -69,11 +72,55 @@ come from OpenCode's model metadata, including context windows, variants, and wh
 cost is zero. A listed model, even a zero-cost one, is not proof that your account can use it;
 OpenCode's free tier has quotas, and an exhausted quota pauses the run like any other quota.
 
-Freebuff is not a built-in agent. As of Freebuff 0.2.34, it is an interactive terminal app only,
-with no prompt argument, model flag, or machine-readable output
-([CodebuffAI/freebuff#947](https://github.com/CodebuffAI/freebuff/issues/947)). ytd does not
-script its UI or reuse its login. It can be added once Freebuff ships a supported headless mode
-with explicit model selection, structured output, and tool isolation.
+### Freebuff (interactive handoff)
+
+Freebuff 0.2.34 is an interactive terminal app only: no prompt argument, model flag, model
+listing, or machine-readable output
+([CodebuffAI/freebuff#947](https://github.com/CodebuffAI/freebuff/issues/947)). ytd never runs,
+scripts, or steers it, and never reads its login or settings. Instead, each AI call becomes a
+job file that your own Freebuff session answers:
+
+```sh
+ytd 'https://youtu.be/VIDEO_ID' --agent freebuff --model deepseek-v4.1-flash-10-17 --effort high
+# in a second terminal, the folder ytd prints:
+freebuff --cwd ~/.ytd/freebuff/deepseek-v4.1-flash-10-17-<hash>
+# in Freebuff: select DeepSeek V4.1 Flash 10/17 (effort high), then send: Follow INSTRUCTIONS.md
+```
+
+What is automated: ytd writes each exact prompt to `jobs/<id>.prompt.txt`, waits, imports
+`responses/<id>.txt` once it is a private regular file that has stopped changing, and runs the
+same validation, checkpoints, deduplication, halal gate, and publication as every other agent.
+Answers that fail validation get `jobs/<id>.note.txt` and are asked again (three attempts);
+empty, oversized, linked or special files are moved unread to `rejected/` and asked again. An
+agent that cannot answer writes `responses/<id>.error.txt`; usage-limit reasons pause the run
+like any quota, but a settled answer wins over an error. Ctrl-C leaves the pending job in place,
+and an answer written while ytd is stopped is imported if ytd is rerun within a day. Jobs whose ytd process
+has exited are retired at the next start so Freebuff does not spend quota on them; answers and
+rejected files older than a day are removed. Answers are untrusted text and never execute anything.
+
+What stays interactive: opening Freebuff, choosing its model and effort, sending the single
+instruction, and nudging Freebuff if it stops (ytd reminds you every 10 minutes). Whether
+Freebuff keeps looping without supervision is not verified; its own agent needs to wait and
+look for new jobs, and may ask you to approve the `sleep` command it is allowed to use. A
+sudden kill between importing an answer and saving its checkpoint loses that one answer, which is
+then asked again.
+
+The model picker shows a versioned catalog from the Freebuff 0.2.34 README (picker models) and
+its installed catalog (efforts, fallbacks), with each model's mode/plan eligibility and data-use
+notes. It flags itself as possibly outdated when another or an unknown Freebuff version is installed. A listed
+model is advertised, not confirmed for your account, region, or plan; only Freebuff's own picker
+confirms access. ytd cannot change or detect Freebuff's active model, so every Freebuff call is
+recorded as unverified, and some models may answer on a fallback model (noted in the picker).
+Effort choices appear only for models that list efforts, and `--effort` must be one of them. Models with a large catalog context use
+a conservative 32k-token handoff budget to keep job files readable; `--context-tokens` overrides.
+
+Each model/effort pair has its own folder holding only `INSTRUCTIONS.md`, job prompts, answers
+and rejected files (mode 0700). Prompts include transcripts and the Mind Palace field notes used for deduplication.
+Freebuff's tools, network access, and data use are governed by Freebuff, not ytd; a working
+directory is not isolation. Unlike the headless agents, Freebuff fails open: it keeps its full
+toolset while reading untrusted transcripts, so approve only the `sleep` command in its prompts. While Freebuff synthesizes, ytd keeps its local publication claim, so
+a concurrent ytd run waits before publishing; no Palace transaction lock is held while waiting.
+
 Unknown effective provider/model settings are recorded as unverified. A reported conflicting
 model identity fails the call. Routing changes pause a run rather than silently reroute it.
 Completion reports count saved successful calls for the current run, separating harness-reported

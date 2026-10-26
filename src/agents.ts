@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { OPENCODE_CONFIG_HOME, RUN_DIR } from "./config.ts";
 import { runCommand, type CommandResult } from "./process.ts";
+import { FREEBUFF_CATALOG, handoff, prepareWorkspace, workspaceFor } from "./freebuff.ts";
 
-export const BUILT_INS = ["claude", "codex", "pi", "opencode"] as const;
+export const BUILT_INS = ["claude", "codex", "pi", "opencode", "freebuff"] as const;
 export interface CustomAdapter {
 	executable: string;
 	args: string[];
@@ -19,7 +20,9 @@ export interface RoutingSnapshot {
 	verified: false;
 	mcpServers?: string[];
 	/** OpenCode 2 runs a private --standalone server and takes variants as model#variant. */
-	protocol?: "opencode-v2";
+	protocol?: "opencode-v2" | "freebuff-handoff";
+	/** Freebuff job exchange folder; the user's interactive Freebuff session answers there. */
+	workspace?: string;
 }
 export interface AgentProfile {
 	agent: string;
@@ -571,6 +574,16 @@ export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 			"Agent routing configuration changed. Select the profile again to create a replacement run."
 		);
 	mkdirSync(RUN_DIR, { recursive: true });
+	// Freebuff is never executed by ytd: it has no headless mode or model selection to verify.
+	if (profile.agent === "freebuff")
+		return {
+			...profile,
+			routing: {
+				...routing,
+				protocol: "freebuff-handoff",
+				workspace: prepareWorkspace(profile.model, profile.effort)
+			}
+		};
 	if (!profile.custom) {
 		const help = await runCommand(
 			[
@@ -905,6 +918,27 @@ export async function agentPrompt(
 				"Agent routing configuration changed; select it again to create a replacement run",
 				"routing"
 			);
+		if (profile.agent === "freebuff") {
+			const workspace = profile.routing.workspace;
+			if (
+				profile.routing.protocol !== "freebuff-handoff" ||
+				workspace !== workspaceFor(profile.model, profile.effort)
+			)
+				return failure(
+					profile,
+					"Freebuff profile must pass preflight before execution",
+					"restriction"
+				);
+			const answer = await handoff(prompt, profile.model, profile.effort, workspace, {
+				signal,
+				timeoutMs: profile.timeoutMs
+			});
+			if (answer.text === undefined)
+				return failure(profile, answer.error!, answer.kind ?? "process");
+			// No reported identity: the model chosen inside Freebuff stays unverified. Blank or
+			// malformed answers fail validation, so ytd asks for that job again.
+			return { ok: true, text: answer.text, requestedModel: profile.model };
+		}
 		const command = commandFor(profile);
 		command.argv[0] = profile.routing.executable;
 		return parseAgentOutput(
@@ -924,6 +958,7 @@ export async function agentPrompt(
 
 export interface ModelSuggestion {
 	id: string;
+	label?: string;
 	contextTokens?: number;
 	/** Model-specific reasoning variants, when the harness lists them. */
 	variants?: string[];
@@ -969,6 +1004,15 @@ export function parseOpencodeModels(stdout: string): ModelSuggestion[] {
 export async function discoverModels(agent: string): Promise<ModelSuggestion[]> {
 	try {
 		if (agent === "claude") return ["opus", "sonnet", "haiku"].map((id) => ({ id }));
+		// Freebuff has no model listing; offer its versioned picker catalog as advertised models.
+		if (agent === "freebuff")
+			return FREEBUFF_CATALOG.models.map((m) => ({
+				id: m.id,
+				label: m.name,
+				...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
+				variants: m.efforts ?? [],
+				hint: [m.access, m.notes].filter(Boolean).join("; ")
+			}));
 		if (agent === "codex") {
 			const r = await runCommand(["codex", "debug", "models", "--bundled"], { timeoutMs: 15000 });
 			if (r.code !== 0) return [];

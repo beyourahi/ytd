@@ -16,6 +16,7 @@ import {
 } from "./palace.ts";
 import { preflight, type AgentProfile } from "./agents.ts";
 import { resolveCli } from "./settings.ts";
+import { launchGuide } from "./freebuff.ts";
 
 interface PublicationPlan {
 	channel: string;
@@ -328,6 +329,10 @@ async function ingest(
 	console.log(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
 	);
+	// Shown before enumeration so Freebuff can be opened while transcripts download.
+	if (selected.routing?.workspace)
+		for (const line of launchGuide(selected.model, selected.effort, selected.routing.workspace))
+			console.log(line);
 	console.log("Enumerating…");
 	const listing = await enumerate(source, signal);
 	for (const failure of listing.listingFailures) console.warn(`Listing warning: ${failure}`);

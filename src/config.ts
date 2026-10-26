@@ -12,6 +12,8 @@ export const DATA_DIR = join(APP_DIR, "data"); // transactional SQLite runs/chec
 export const RUN_DIR = join(APP_DIR, "run"); // neutral cwd for headless agent calls
 // OpenCode 2 cannot skip global plugins per run; give it an empty config home (auth stays in its data dir).
 export const OPENCODE_CONFIG_HOME = join(APP_DIR, "opencode-config");
+// Freebuff job exchange: one folder of job prompts and answers per selected model/effort.
+export const FREEBUFF_DIR = join(APP_DIR, "freebuff");
 
 /** Rooms in the palace that keep a field-notes.md. Default ingest target is `content`. */
 /** The reduce step auto-routes each batch to one of these by the video's context. */

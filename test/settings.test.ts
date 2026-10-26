@@ -256,7 +256,13 @@ test("searchable installed-agent/model picker offers exact entry and persists ef
 			calls.push(message);
 			if (message === "Agent") {
 				expect(searchable).toBe(true);
-				expect(choices.map((o) => o.value)).toEqual(["pi"]);
+				expect(choices.filter((o) => !o.disabled).map((o) => o.value)).toEqual(["pi"]);
+				expect(choices.find((o) => o.value === "claude")).toMatchObject({
+					label: "claude (not installed)",
+					disabled: true
+				});
+				// Clack may start on the initial option, so it must be installed.
+				expect(_initial).toBe("pi");
 				return "pi";
 			}
 			if (message === "Model") {
