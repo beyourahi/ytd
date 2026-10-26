@@ -160,6 +160,10 @@ steps cannot discard them. Automated review can still miss concerns and is not c
 Quota failures preserve progress for a later rerun.
 Successful answer prose mentioning limits never becomes a quota error.
 
+The Codex fingerprint hashes `config.toml` without the tables Codex rewrites for its own state
+(`projects`, `tui`, `desktop`, `notice`, `marketplaces`, `tool_suggest`, `hooks.state`), so trusting a folder or
+an auto-update mid-run does not pause the run; any other key, including MCP servers, still does.
+
 Rerun the same command to resume. If routing changed, choose **Change agent/model** and select
 the same agent/model/effort again, or pass an explicit `--agent`, `--model`, or `--effort` argument.
 This authorizes the current routing for that invocation and resumes the saved run, retaining

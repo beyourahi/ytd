@@ -126,6 +126,53 @@ function configPaths(agent: string): string[] {
 	}
 }
 
+// Tables Codex itself rewrites for state that cannot change routing (trust prompts, UI nags,
+// desktop-app preferences, marketplace refresh stamps, hook trust hashes). Everything else, including unknown keys, stays pinned.
+const CODEX_STATE_TABLES = [
+	["projects"],
+	["tui"],
+	["desktop"],
+	["notice"],
+	["marketplaces"],
+	["tool_suggest"],
+	["hooks", "state"]
+];
+
+const canonical = (value: unknown): unknown =>
+	Array.isArray(value)
+		? value.map(canonical)
+		: value && typeof value === "object"
+			? Object.fromEntries(
+					Object.entries(value)
+						.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+						.map(([key, child]) => [key, canonical(child)])
+				)
+			: value;
+
+function configDigest(agent: string, path: string): string {
+	if (!existsSync(path)) return "missing";
+	const raw = readFileSync(path);
+	if (agent !== "codex") return hash(raw);
+	try {
+		const config = Bun.TOML.parse(raw.toString("utf8")) as Record<string, any>;
+		for (const keys of CODEX_STATE_TABLES) {
+			const parents = [config];
+			for (const key of keys.slice(0, -1)) parents.push(parents[parents.length - 1]?.[key]);
+			// Delete the table, then any parent it leaves empty, so "absent" and "empty" hash alike.
+			for (let i = keys.length - 1; i >= 0; i--) {
+				const parent = parents[i];
+				if (!parent || typeof parent !== "object") break;
+				delete parent[keys[i]];
+				if (Object.keys(parent).length > 0) break;
+			}
+		}
+		return hash(JSON.stringify(canonical(config)));
+	} catch {
+		// shortcut: an unparsable file is hashed raw (fail closed); it only matters if Codex writes one.
+		return hash(raw);
+	}
+}
+
 export function routingSnapshot(profile: AgentProfile): RoutingSnapshot {
 	const executable = Bun.which(profile.custom?.executable ?? profile.agent, {
 		PATH: process.env.PATH
@@ -135,10 +182,7 @@ export function routingSnapshot(profile: AgentProfile): RoutingSnapshot {
 			`${profile.agent} executable is unavailable; install/configure it separately. No fallback was selected.`
 		);
 	const actual = realpathSync(executable);
-	const files = configPaths(profile.agent).map((path) => [
-		path,
-		existsSync(path) ? hash(readFileSync(path)) : "missing"
-	]);
+	const files = configPaths(profile.agent).map((path) => [path, configDigest(profile.agent, path)]);
 	const routingEnv = Object.entries(process.env)
 		.filter(([key]) =>
 			/^(ANTHROPIC_|CLAUDE_|CODEX_|OPENAI_|PI_|OPENCODE_|AWS_|AZURE_|GOOGLE_|VERTEX_|XDG_CONFIG_HOME$)/.test(

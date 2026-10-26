@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	realpathSync,
@@ -560,4 +561,52 @@ else{let input="";process.stdin.on("data",d=>input+=d);process.stdin.on("end",()
 			expect(existsSync(`${record}.shared-models`)).toBe(false);
 		});
 	});
+});
+
+test("codex routing fingerprint ignores Codex-written state tables but pins routing config", () => {
+	const dir = mkdtempSync(join(tmpdir(), "ytd-codex-home-"));
+	dirs.push(dir);
+	const bin = join(dir, "bin");
+	const home = join(dir, "home");
+	mkdirSync(bin);
+	mkdirSync(home);
+	const script = join(bin, "codex");
+	writeFileSync(script, `#!${process.execPath}\n`);
+	chmodSync(script, 0o700);
+	const config = join(home, "config.toml");
+	const oldPath = process.env.PATH;
+	const oldHome = process.env.CODEX_HOME;
+	const fingerprint = (toml: string) => {
+		writeFileSync(config, toml);
+		return routingSnapshot(profile("codex")).fingerprint;
+	};
+	try {
+		process.env.PATH = `${bin}:${oldPath}`;
+		process.env.CODEX_HOME = home;
+		const base = 'model = "m"\napproval_policy = "never"\n[mcp_servers.a]\ncommand = "x"\n';
+		const pinned = fingerprint(base);
+		expect(fingerprint(base)).toBe(pinned);
+		const churn =
+			'[projects."/a"]\ntrust_level = "trusted"\n[tui]\nstatus_line = true\n[desktop]\nappearanceTheme = "dark"\n[notice]\nhide = true\n' +
+			'[marketplaces.m]\nlast_updated = "1"\n[tool_suggest]\nx = 1\n' +
+			'[hooks.state."h"]\ntrusted_hash = "1"\n';
+		expect(fingerprint(base + churn)).toBe(pinned);
+		expect(fingerprint(base + churn.replaceAll('"1"', '"2"').replace("true", "false"))).toBe(
+			pinned
+		);
+		// Key order is irrelevant; values are not.
+		expect(
+			fingerprint('approval_policy = "never"\nmodel = "m"\n[mcp_servers.a]\ncommand = "x"\n')
+		).toBe(pinned);
+		expect(fingerprint(base.replace('"m"', '"other"'))).not.toBe(pinned);
+		expect(fingerprint(base.replace('"never"', '"on-request"'))).not.toBe(pinned);
+		expect(fingerprint(base + '[mcp_servers.b]\ncommand = "y"\n')).not.toBe(pinned);
+		expect(fingerprint(base + "[hooks]\nenabled = true\n")).not.toBe(pinned);
+		expect(fingerprint("= not toml")).not.toBe(pinned);
+		expect(fingerprint("= not toml ")).not.toBe(fingerprint("= not toml"));
+	} finally {
+		process.env.PATH = oldPath;
+		if (oldHome === undefined) delete process.env.CODEX_HOME;
+		else process.env.CODEX_HOME = oldHome;
+	}
 });
