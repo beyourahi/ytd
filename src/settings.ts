@@ -217,7 +217,7 @@ async function chooseProfile(
 				label: m.id,
 				hint: recent.some((p) => p.model === m.id)
 					? "recent"
-					: "suggestion; availability depends on your account"
+					: (m.hint ?? "suggestion; availability depends on your account")
 			}))
 			.concat([
 				{
@@ -231,15 +231,21 @@ async function chooseProfile(
 	);
 	const model =
 		modelChoice === "__exact__" ? (await ui.text("Exact model ID")).trim() : modelChoice;
-	const effortChoice = await ui.select(
-		"Effort",
-		[
-			{ value: "__default__", label: "Use configured agent default" },
-			...(EFFORTS[agent] ?? []).map((value) => ({ value, label: value })),
-			{ value: "__exact__", label: "Enter exact effort/variant" }
-		],
-		"__default__"
-	);
+	// An OpenCode model ID ending in #variant already selects its variant.
+	const effortChoice =
+		agent === "opencode" && model.includes("#")
+			? "__default__"
+			: await ui.select(
+					"Effort",
+					[
+						{ value: "__default__", label: "Use configured agent default" },
+						...(suggestions.find((m) => m.id === model)?.variants ?? EFFORTS[agent] ?? []).map(
+							(value) => ({ value, label: value })
+						),
+						{ value: "__exact__", label: "Enter exact effort/variant" }
+					],
+					"__default__"
+				);
 	const effort =
 		effortChoice === "__exact__"
 			? (await ui.text("Exact effort/variant")).trim()

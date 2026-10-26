@@ -303,3 +303,66 @@ test("cancellation preserves remembered configuration", async () => {
 	await expect(resolveCli([], { path, interactive: true, ui })).rejects.toThrow("Cancelled");
 	expect(readFileSync(path, "utf8")).toBe(before);
 });
+
+test("picker offers model-specific variants and discovery hints", async () => {
+	const path = configPath();
+	const ui: Picker = {
+		async select(message, choices) {
+			if (message === "Agent") return "opencode";
+			if (message === "Model") {
+				expect(choices.find((o) => o.value === "opencode/free")?.hint).toBe(
+					"listed at no cost; free-tier quotas apply"
+				);
+				return "opencode/free";
+			}
+			expect(choices.map((o) => o.value)).toEqual(["__default__", "low", "max", "__exact__"]);
+			return "max";
+		},
+		async text() {
+			throw new Error("unused");
+		}
+	};
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		ui,
+		installed: (name) => name === "opencode",
+		models: async () => [
+			{
+				id: "opencode/free",
+				contextTokens: 200000,
+				variants: ["low", "max"],
+				hint: "listed at no cost; free-tier quotas apply"
+			}
+		]
+	});
+	expect(loadSettings(path).selected).toEqual({
+		agent: "opencode",
+		model: "opencode/free",
+		effort: "max",
+		contextTokens: 200000
+	});
+});
+
+test("an OpenCode model ID with #variant skips the effort step", async () => {
+	const path = configPath();
+	const calls: string[] = [];
+	const ui: Picker = {
+		async select(message) {
+			calls.push(message);
+			return message === "Agent" ? "opencode" : "__exact__";
+		},
+		async text() {
+			return "opencode/free#max";
+		}
+	};
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		ui,
+		installed: (name) => name === "opencode",
+		models: async () => [{ id: "opencode/free", variants: ["low", "max"] }]
+	});
+	expect(calls).toEqual(["Agent", "Model"]);
+	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode/free#max" });
+});

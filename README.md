@@ -27,6 +27,7 @@ Automation skips the picker:
 ```sh
 ytd 'https://youtu.be/VIDEO_ID' --agent claude --model opus --effort high
 ytd 'https://youtu.be/VIDEO_ID' --agent codex --model YOUR_MODEL_ID
+ytd 'https://youtu.be/VIDEO_ID' --agent opencode --model opencode/MODEL_ID --effort VARIANT
 ```
 
 Explicit arguments override remembered settings for that invocation. Changing agent requires
@@ -47,6 +48,32 @@ Each built-in checks restriction support before ingestion and refuses unsupporte
 Claude explicitly disables tools/MCP; Codex uses read-only execution and disables command,
 network-tool, integration, hook, and subagent surfaces; Pi disables tools and external context;
 OpenCode denies tools and isolates plugins/MCP using its supported configuration.
+
+OpenCode 2 is detected from `opencode run --help` (`--standalone`); OpenCode 1 keeps its `--pure`
+adapter. With OpenCode 2, every call starts a private `--standalone` server, never the shared
+background service. It runs from `~/.ytd/run` with an empty ytd-owned config home
+(`~/.ytd/opencode-config`), so your global OpenCode plugins, MCP servers, skills, instructions,
+and custom provider definitions are not loaded. Your OpenCode settings are not changed, and
+accounts connected with `opencode auth login` still apply. An inline config denies every action
+for a dedicated `ytd` agent, disables web search, and replaces any remaining configured MCP server
+with a disabled inert entry. Before ingestion a private server is started with that exact config,
+without a model request, and must prove that the `ytd` agent's final rules deny everything, that
+every MCP server is `disabled`, and that only built-in plugins load. OpenCode 2 cannot disable
+external plugins per run, so plugins from other sources (`OPENCODE_CONFIG_DIR`, system or
+managed config) stop ytd. Plugins declared in those config sources are refused before any server
+starts. Model discovery lists models through the same isolated private server and never falls back
+to the shared service. The selected model must be listed, and the effort must be one of its variants;
+it is passed as `provider/model#variant` (or put the variant in the model ID instead). OpenCode 2
+does not report the answering model, so its calls are recorded as unverified. Model suggestions
+come from OpenCode's model metadata, including context windows, variants, and whether the listed
+cost is zero. A listed model, even a zero-cost one, is not proof that your account can use it;
+OpenCode's free tier has quotas, and an exhausted quota pauses the run like any other quota.
+
+Freebuff is not a built-in agent. As of Freebuff 0.2.34, it is an interactive terminal app only,
+with no prompt argument, model flag, or machine-readable output
+([CodebuffAI/freebuff#947](https://github.com/CodebuffAI/freebuff/issues/947)). ytd does not
+script its UI or reuse its login. It can be added once Freebuff ships a supported headless mode
+with explicit model selection, structured output, and tool isolation.
 Unknown effective provider/model settings are recorded as unverified. A reported conflicting
 model identity fails the call. Routing changes pause a run rather than silently reroute it.
 Completion reports count saved successful calls for the current run, separating harness-reported

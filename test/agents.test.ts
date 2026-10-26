@@ -1,16 +1,28 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	agentPrompt,
 	CODEX_DISABLED_FEATURES,
 	commandFor,
+	discoverModels,
+	OPENCODE_V2,
+	parseOpencodeModels,
 	parseAgentOutput,
 	preflight,
 	routingSnapshot,
 	type AgentProfile
 } from "../src/agents.ts";
+import { OPENCODE_CONFIG_HOME, RUN_DIR } from "../src/config.ts";
 import { runCommand, type CommandResult } from "../src/process.ts";
 
 const dirs: string[] = [];
@@ -295,4 +307,257 @@ test("custom executable/argv never becomes a shell command and passes model/effo
 	expect(codex).toContain("mcp_servers={}");
 	expect(codex).toContain('web_search="disabled"');
 	expect(codex).toContain("features.shell_tool=false");
+});
+
+describe("OpenCode 2", () => {
+	const model = "opencode/deepseek-v4.1-flash-free";
+	const models = [
+		{
+			id: "deepseek-v4.1-flash-free",
+			providerID: "opencode",
+			enabled: true,
+			status: "active",
+			capabilities: { input: ["text", "image"], output: ["text"] },
+			variants: [{ id: "low" }, { id: "high" }, { id: "max" }],
+			cost: [{ input: 0, output: 0 }],
+			limit: { context: 200000, output: 32000 }
+		},
+		{
+			id: "paid-plain",
+			providerID: "opencode",
+			enabled: true,
+			status: "beta",
+			capabilities: { input: ["text"], output: ["text"] },
+			variants: [],
+			cost: [{ input: 1, output: 2 }],
+			limit: { context: 1000, output: 1 }
+		},
+		{
+			id: "image-only",
+			providerID: "opencode",
+			enabled: true,
+			capabilities: { input: ["text"], output: ["image"] },
+			variants: [],
+			cost: [],
+			limit: { context: 1000, output: 1 }
+		}
+	];
+	const events = [
+		{ type: "step_start", timestamp: 1, sessionID: "s", part: { type: "step-start" } },
+		{ type: "text", timestamp: 2, sessionID: "s", part: { type: "text", text: "v2 answer" } },
+		{ type: "step_finish", timestamp: 3, sessionID: "s", part: { reason: "stop" } }
+	];
+	// Mirrors OpenCode 2.1.4: config sources, a private authenticated server and run JSON events.
+	const fake = (record: string) => `#!${process.execPath}
+const args=process.argv.slice(2), env=process.env;
+const config=JSON.parse(env.OPENCODE_CONFIG_CONTENT||"{}"), inline=env.YTD_TEST_IGNORE_INLINE?{}:config;
+const models=${JSON.stringify(models)};
+if(args[0]==="run"&&args.includes("--help")) console.log("--standalone --session --model --agent --format --auto");
+else if(args[0]==="models") require("fs").writeFileSync(${JSON.stringify(record)}+".shared-models","used");
+else if(args[0]==="api"&&env.YTD_TEST_API_FAIL) process.exit(2);
+else if(args[0]==="api"&&args.at(-1)==="/api/config") console.log(JSON.stringify([{type:"document",path:"/cfg/opencode.json",info:{mcp:{servers:{plain:{type:"local",command:["x"]}}},...(env.YTD_TEST_DECLARED_PLUGIN?{plugins:["pkg"]}:{})}},...(env.YTD_TEST_IGNORE_INLINE?[]:[{type:"document",info:config}])]));
+else if(args[0]==="api"&&args.at(-1)==="/api/model") console.log(JSON.stringify({location:{},data:models}));
+else if(args[0]==="serve"){
+ require("fs").writeFileSync(${JSON.stringify(record)}+".serve-pid",String(process.pid));
+ if(env.YTD_TEST_SERVE_EXIT) process.exit(3);
+ let pluginReads=0;
+ Bun.serve({port:Number(args[args.indexOf("--port")+1]),hostname:"127.0.0.1",fetch(req){
+  if(req.headers.get("authorization")!=="Basic "+btoa("opencode:"+env.OPENCODE_SERVER_PASSWORD)) return Response.json({},{status:401});
+  const agents=[{id:"build",permissions:[{action:"*",resource:"*",effect:"allow"}]}];
+  if(inline.agents?.ytd&&!env.YTD_TEST_NO_AGENT) agents.push({id:"ytd",permissions:[{action:"*",resource:"*",effect:"allow"},...(inline.permissions??[]),...inline.agents.ytd.permissions,...(env.YTD_TEST_ALLOW_AFTER?[{action:"shell",resource:"*",effect:"allow"}]:[])]});
+  const data={"/api/agent":agents,
+   "/api/mcp":["plain"].map(name=>({name,status:{status:inline.mcp?.servers?.[name]?.disabled&&!env.YTD_TEST_MCP_IGNORES?"disabled":"connected"}})),
+   // Locations load asynchronously: late plugins arrive after the agent list is ready.
+   "/api/plugin":env.YTD_TEST_PLUGIN_LATE&&new URL(req.url).pathname==="/api/plugin"&&++pluginReads<3?[]:[{id:"builtin",source:{type:"builtin"}},...(env.YTD_TEST_PLUGIN||env.YTD_TEST_PLUGIN_LATE?[{source:{type:"local",path:"/p.ts"}}]:[])],
+   "/api/model":models}[new URL(req.url).pathname];
+  return Response.json({location:{},data});
+ }});
+}
+else{let input="";process.stdin.on("data",d=>input+=d);process.stdin.on("end",()=>{require("fs").writeFileSync(${JSON.stringify(record)},JSON.stringify({args,pwd:env.PWD,xdg:env.XDG_CONFIG_HOME,config,input}));if(env.YTD_TEST_STDERR)console.error(env.YTD_TEST_STDERR);console.log(env.YTD_TEST_OUTPUT)})}
+`;
+	const withFake = async (run: (record: string) => Promise<void>) => {
+		const dir = mkdtempSync(join(tmpdir(), "ytd-opencode2-"));
+		dirs.push(dir);
+		const record = join(dir, "record.json");
+		writeFileSync(join(dir, "opencode"), fake(record));
+		chmodSync(join(dir, "opencode"), 0o700);
+		const saved = { ...process.env };
+		const verifyMs = OPENCODE_V2.verifyMs;
+		process.env.PATH = `${dir}:${saved.PATH}`;
+		process.env.YTD_TEST_OUTPUT = events.map((e) => JSON.stringify(e)).join("\n");
+		OPENCODE_V2.verifyMs = 4000;
+		try {
+			await run(record);
+		} finally {
+			OPENCODE_V2.verifyMs = verifyMs;
+			for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+			Object.assign(process.env, saved);
+		}
+	};
+
+	// The private verification server never outlives preflight, whether it passed or failed.
+	const expectServerStopped = (record: string) => {
+		const pidFile = `${record}.serve-pid`;
+		if (!existsSync(pidFile)) return;
+		const pid = Number(readFileSync(pidFile, "utf8"));
+		rmSync(pidFile);
+		expect(() => process.kill(pid, 0)).toThrow();
+	};
+
+	test("runs a standalone, verified, deny-all agent with model#variant", async () => {
+		await withFake(async (record) => {
+			const selected = await preflight({ agent: "opencode", model, effort: "high" });
+			expect(selected.routing).toMatchObject({ protocol: "opencode-v2", mcpServers: ["plain"] });
+			expect(existsSync(`${record}.serve-pid`)).toBe(true);
+			expectServerStopped(record);
+			const command = commandFor(selected);
+			expect(command.argv).toEqual([
+				"opencode",
+				"run",
+				"--standalone",
+				"--format",
+				"json",
+				"--agent",
+				"ytd",
+				"--model",
+				`${model}#high`
+			]);
+			expect(command.argv).not.toContain("--auto");
+			const result = await agentPrompt("source text", selected);
+			expect(result).toMatchObject({ ok: true, text: "v2 answer", requestedModel: model });
+			expect(result.reportedModel).toBeUndefined();
+			const seen = JSON.parse(readFileSync(record, "utf8"));
+			expect(seen.input).toBe("source text");
+			expect(seen.pwd).toBe(RUN_DIR);
+			expect(seen.xdg).toBe(OPENCODE_CONFIG_HOME);
+			expect(seen.config.mcp.servers.plain).toEqual({
+				type: "local",
+				command: ["false"],
+				disabled: true
+			});
+			expect(seen.config.agents.ytd.permissions).toEqual([
+				{ action: "*", resource: "*", effect: "deny" }
+			]);
+			const variantInModel = await preflight({ agent: "opencode", model: `${model}#max` });
+			expect(commandFor(variantInModel).argv.at(-1)).toBe(`${model}#max`);
+		});
+	});
+
+	test("fails closed when isolation, model or variant cannot be proven", async () => {
+		await withFake(async (record) => {
+			const cases: [Record<string, string>, Partial<AgentProfile>, string][] = [
+				[{ YTD_TEST_IGNORE_INLINE: "1" }, {}, "did not load the restricted inline configuration"],
+				[{ YTD_TEST_NO_AGENT: "1" }, {}, "could not prove the restricted ytd agent"],
+				[{ YTD_TEST_ALLOW_AFTER: "1" }, {}, "denies every tool"],
+				[{ YTD_TEST_MCP_IGNORES: "1" }, {}, "MCP server is disabled"],
+				[{ YTD_TEST_PLUGIN: "1" }, {}, "external plugin"],
+				[{ YTD_TEST_PLUGIN_LATE: "1" }, {}, "external plugin"],
+				[{ YTD_TEST_DECLARED_PLUGIN: "1" }, {}, "declares external plugins"],
+				[{ YTD_TEST_SERVE_EXIT: "1" }, {}, "exited before proving isolation"],
+				[{}, { effort: "xhigh" }, "has no variant xhigh; choose low, high, max"],
+				[{}, { model: "opencode/unlisted" }, "does not offer opencode/unlisted"],
+				[{}, { model: `${model}#low`, effort: "high" }, "variant once"],
+				[{}, { model: "no-provider" }, "provider/model"]
+			];
+			for (const [env, overrides, message] of cases) {
+				Object.assign(process.env, env);
+				try {
+					await expect(preflight({ agent: "opencode", model, ...overrides })).rejects.toThrow(
+						message
+					);
+				} finally {
+					for (const key of Object.keys(env)) delete process.env[key];
+				}
+				expectServerStopped(record);
+			}
+			const selected = await preflight({ agent: "opencode", model });
+			await expect(
+				preflight({ ...selected, routing: { ...selected.routing!, mcpServers: [] } })
+			).rejects.toThrow("MCP configuration changed");
+			expect(
+				(
+					await agentPrompt("x", {
+						...selected,
+						routing: { ...selected.routing!, mcpServers: undefined }
+					})
+				).kind
+			).toBe("restriction");
+		});
+	}, 30000);
+
+	test("free-limit errors, rejected permissions and tool events are classified", () => {
+		const p = { agent: "opencode", model };
+		const limit = parseAgentOutput(
+			p,
+			commandResult(
+				JSON.stringify({
+					type: "error",
+					timestamp: 1,
+					sessionID: "s",
+					error: { type: "provider.free-limit", message: "Free usage limit reached.", status: 429 }
+				}),
+				1
+			)
+		);
+		expect(limit).toMatchObject({ ok: false, kind: "quota", limited: true });
+		expect(
+			parseAgentOutput(
+				p,
+				commandResult(
+					JSON.stringify({ type: "error", error: { type: "provider.quota", status: 402 } }),
+					1
+				)
+			).kind
+		).toBe("quota");
+		const encodedEvents = events.map((e) => JSON.stringify(e)).join("\n");
+		expect(
+			parseAgentOutput(
+				p,
+				commandResult(encodedEvents, 0, "! permission requested: shell (ls); auto-rejecting")
+			).kind
+		).toBe("restriction");
+		expect(
+			parseAgentOutput(
+				p,
+				commandResult(
+					`${encodedEvents}\n${JSON.stringify({ type: "tool_use", part: { tool: "read" } })}`
+				)
+			).kind
+		).toBe("restriction");
+		expect(
+			parseAgentOutput(
+				p,
+				commandResult(
+					events
+						.slice(0, 2)
+						.map((e) => JSON.stringify(e))
+						.join("\n")
+				)
+			).ok
+		).toBe(false);
+	});
+
+	test("discovery reads text models, context windows, variants and cost hints", async () => {
+		const parsed = parseOpencodeModels(JSON.stringify({ data: models }));
+		expect(parsed).toEqual([
+			{
+				id: model,
+				contextTokens: 200000,
+				variants: ["low", "high", "max"],
+				hint: "listed at no cost; free-tier quotas apply"
+			},
+			{
+				id: "opencode/paid-plain",
+				variants: [],
+				hint: "listed; access depends on your account · beta"
+			}
+		]);
+		await withFake(async (record) => {
+			expect(await discoverModels("opencode")).toEqual(parsed);
+			process.env.YTD_TEST_API_FAIL = "1";
+			// A failed private listing never falls back to the shared background service.
+			expect(await discoverModels("opencode")).toEqual([]);
+			expect(existsSync(`${record}.shared-models`)).toBe(false);
+		});
+	});
 });

@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { RUN_DIR } from "./config.ts";
+import { spawn } from "node:child_process";
+import { OPENCODE_CONFIG_HOME, RUN_DIR } from "./config.ts";
 import { runCommand, type CommandResult } from "./process.ts";
 
 export const BUILT_INS = ["claude", "codex", "pi", "opencode"] as const;
@@ -17,6 +18,8 @@ export interface RoutingSnapshot {
 	executable: string;
 	verified: false;
 	mcpServers?: string[];
+	/** OpenCode 2 runs a private --standalone server and takes variants as model#variant. */
+	protocol?: "opencode-v2";
 }
 export interface AgentProfile {
 	agent: string;
@@ -107,7 +110,13 @@ function configPaths(agent: string): string[] {
 			return [
 				join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "opencode/opencode.json"),
 				join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "opencode/opencode.jsonc"),
-				...(process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [])
+				...(process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : []),
+				// OpenCode 2 runs load the ytd-owned config home and OPENCODE_CONFIG_DIR instead; only
+				// existing files count, so saved fingerprints without them stay valid.
+				...[join(OPENCODE_CONFIG_HOME, "opencode"), process.env.OPENCODE_CONFIG_DIR]
+					.filter((dir): dir is string => Boolean(dir))
+					.flatMap((dir) => [join(dir, "opencode.json"), join(dir, "opencode.jsonc")])
+					.filter((path) => existsSync(path))
 			];
 		default:
 			return [];
@@ -298,6 +307,21 @@ export function commandFor(profile: AgentProfile): { argv: string[]; env?: NodeJ
 				]
 			};
 		case "opencode":
+			if (profile.routing?.protocol === "opencode-v2")
+				return {
+					argv: [
+						"opencode",
+						"run",
+						"--standalone",
+						"--format",
+						"json",
+						"--agent",
+						"ytd",
+						"--model",
+						effort ? `${model}#${effort}` : model
+					],
+					env: opencodeV2Env(profile.routing.mcpServers)
+				};
 			return {
 				argv: [
 					"opencode",
@@ -338,6 +362,194 @@ function parseInlineConfig(): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
+const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" }];
+/** v2 resolves its location from PWD, so pin it to the neutral run directory. */
+function opencodeV2Env(mcpServers: string[] = []): NodeJS.ProcessEnv {
+	mkdirSync(OPENCODE_CONFIG_HOME, { recursive: true });
+	return {
+		...process.env,
+		PWD: RUN_DIR,
+		XDG_CONFIG_HOME: OPENCODE_CONFIG_HOME,
+		OPENCODE_CONFIG_CONTENT: JSON.stringify({
+			...parseInlineConfig(),
+			permissions: DENY_ALL,
+			websearch: false,
+			// A complete inert entry: partial server entries make OpenCode drop the whole inline config.
+			mcp: {
+				servers: Object.fromEntries(
+					mcpServers.map((name) => [name, { type: "local", command: ["false"], disabled: true }])
+				)
+			},
+			agents: {
+				ytd: { mode: "primary", description: "ytd text completion", permissions: DENY_ALL }
+			},
+			default_agent: "ytd"
+		})
+	};
+}
+
+export const OPENCODE_V2 = { verifyMs: 30_000 };
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Configured MCP names from every config source. Listing sources starts no MCP server or
+ * plugin, so declared plugins are refused here, before any OpenCode server would load them.
+ */
+async function opencodeV2McpNames(executable: string): Promise<string[]> {
+	const result = await runCommand([executable, "api", "--standalone", "GET", "/api/config"], {
+		cwd: RUN_DIR,
+		env: opencodeV2Env(),
+		timeoutMs: 30000
+	});
+	let sources: unknown;
+	try {
+		sources = JSON.parse(result.stdout);
+	} catch {
+		sources = undefined;
+	}
+	if (result.code !== 0 || !Array.isArray(sources))
+		throw new Error("OpenCode configuration sources are unavailable; cannot restrict MCP");
+	if (!sources.some((source) => source?.info?.agents?.ytd))
+		throw new Error("OpenCode did not load the restricted inline configuration");
+	const declared = sources.filter(
+		(source) =>
+			[source?.info?.plugins, source?.info?.plugin].some(
+				(list) => Array.isArray(list) && list.length
+			) ||
+			(source?.type === "directory" &&
+				typeof source.path === "string" &&
+				["plugins", "plugin"].some((sub) => {
+					try {
+						return readdirSync(join(source.path, sub)).length > 0;
+					} catch {
+						return false;
+					}
+				}))
+	);
+	if (declared.length)
+		throw new Error(
+			`OpenCode configuration declares external plugins (${declared.map((s) => s.path ?? "inline").join(", ")}), which OpenCode 2 cannot disable per run`
+		);
+	const names = sources.flatMap((source) => Object.keys(source?.info?.mcp?.servers ?? {}));
+	return [...new Set(names)].sort();
+}
+
+/**
+ * Proves isolation on a private server with the exact run configuration, without a model
+ * request: the ytd agent denies every action, every MCP server is disabled, and only built-in
+ * plugins load (v2 has no switch that disables external plugins).
+ */
+async function verifyOpencodeV2(
+	executable: string,
+	mcpServers: string[],
+	model: string,
+	effort?: string
+): Promise<void> {
+	const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+	const port = probe.port;
+	probe.stop(true);
+	const password = crypto.randomUUID();
+	const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+		cwd: RUN_DIR,
+		env: { ...opencodeV2Env(mcpServers), OPENCODE_SERVER_PASSWORD: password },
+		stdio: "ignore",
+		detached: process.platform !== "win32"
+	});
+	let exited = false;
+	const exit = new Promise<void>((resolve) =>
+		child.once("exit", () => {
+			exited = true;
+			resolve();
+		})
+	);
+	child.on("error", () => {});
+	const get = async (path: string): Promise<any[]> => {
+		const response = await fetch(
+			`http://127.0.0.1:${port}${path}?location%5Bdirectory%5D=${encodeURIComponent(RUN_DIR)}`,
+			{
+				headers: { authorization: `Basic ${btoa(`opencode:${password}`)}` },
+				signal: AbortSignal.timeout(5000)
+			}
+		);
+		const body: any = await response.json();
+		if (!response.ok || !Array.isArray(body?.data)) throw new Error(`OpenCode ${path} failed`);
+		return body.data;
+	};
+	const deadline = Date.now() + OPENCODE_V2.verifyMs;
+	try {
+		let agent: any;
+		let state = "";
+		let snapshot: { mcp: any[]; plugins: any[]; models: any[] } | undefined;
+		// Locations load asynchronously: wait for the ytd agent, then for a stable MCP/plugin view.
+		while (Date.now() < deadline) {
+			if (exited) throw new Error("OpenCode verification server exited before proving isolation");
+			try {
+				agent ??= (await get("/api/agent")).find((a) => a?.id === "ytd");
+				if (agent) {
+					const next = {
+						mcp: await get("/api/mcp"),
+						plugins: await get("/api/plugin"),
+						models: await get("/api/model")
+					};
+					const serialized = JSON.stringify([next.mcp, next.plugins]);
+					// Built-in plugins always load, so an empty list means plugins are still loading.
+					if (
+						serialized === state &&
+						next.plugins.length > 0 &&
+						next.mcp.length >= mcpServers.length
+					) {
+						snapshot = next;
+						break;
+					}
+					state = serialized;
+				}
+			} catch {
+				/* server still starting */
+			}
+			await sleep(400);
+		}
+		if (!agent || !snapshot)
+			throw new Error("OpenCode could not prove the restricted ytd agent and MCP state in time");
+		const rules: unknown = agent.permissions;
+		const last = Array.isArray(rules)
+			? rules.findLastIndex(
+					(r: any) => r?.action === "*" && r?.resource === "*" && r?.effect === "deny"
+				)
+			: -1;
+		// Rules are last-match-wins; a final deny-all with only denials after it denies everything.
+		if (last < 0 || (rules as any[]).slice(last).some((r: any) => r?.effect !== "deny"))
+			throw new Error("OpenCode could not verify that the ytd agent denies every tool");
+		if (snapshot.mcp.some((server) => server?.status?.status !== "disabled"))
+			throw new Error("OpenCode could not verify every configured MCP server is disabled");
+		const external = snapshot.plugins.filter((plugin) => plugin?.source?.type !== "builtin");
+		if (external.length)
+			throw new Error(
+				`OpenCode loads ${external.length} external plugin(s), which OpenCode 2 cannot disable per run; remove them from its configuration to use it with ytd`
+			);
+		const listed = snapshot.models.find((m) => `${m?.providerID}/${m?.id}` === model);
+		if (!listed) throw new Error(`OpenCode does not offer ${model} in its resolved configuration`);
+		const variants = Array.isArray(listed.variants) ? listed.variants.map((v: any) => v?.id) : [];
+		if (effort && !variants.includes(effort))
+			throw new Error(
+				`OpenCode model ${model} has no variant ${effort}${variants.length ? `; choose ${variants.join(", ")}` : ""}`
+			);
+	} finally {
+		const kill = (signal: NodeJS.Signals) => {
+			try {
+				if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+				else child.kill(signal);
+			} catch {
+				/* already exited */
+			}
+		};
+		if (!exited) {
+			kill("SIGTERM");
+			await Promise.race([exit, sleep(2000)]);
+			if (!exited) kill("SIGKILL");
+		}
+	}
+}
+
 export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 	if (!validateProfile(profile)) throw new Error("Invalid agent/model settings");
 	if (
@@ -369,6 +581,7 @@ export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 			{ cwd: RUN_DIR, timeoutMs: 15000 }
 		);
 		if (help.code !== 0) throw new Error(`${profile.agent} capability check failed`);
+		const opencodeV2 = profile.agent === "opencode" && /--standalone\b/.test(help.stdout);
 		const required: Record<string, string[]> = {
 			claude: [
 				"--tools",
@@ -379,7 +592,9 @@ export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 			],
 			codex: ["--sandbox", "--json", "--ephemeral", "--config"],
 			pi: ["--no-tools", "--no-extensions", "--no-mcp", "--no-context-files"],
-			opencode: ["--format", "--model", "--pure", "--agent"]
+			opencode: opencodeV2
+				? ["--standalone", "--format", "--model", "--agent"]
+				: ["--format", "--model", "--pure", "--agent"]
 		};
 		for (const flag of required[profile.agent])
 			if (!(help.stdout + help.stderr).includes(flag))
@@ -418,7 +633,28 @@ export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 					"Codex could not verify disabled command, network, integration, hook and subagent surfaces"
 				);
 		}
-		if (profile.agent === "opencode") {
+		if (opencodeV2) {
+			if (!/^[^/#]+\/[^#]+(?:#[^#]+)?$/.test(profile.model))
+				throw new Error("OpenCode models use provider/model, optionally provider/model#variant");
+			if (profile.effort && profile.model.includes("#"))
+				throw new Error("Choose the OpenCode variant once: in the model ID or as effort");
+			const [model, variant] = profile.model.split("#");
+			routing.protocol = "opencode-v2";
+			routing.mcpServers = await opencodeV2McpNames(routing.executable);
+			if (
+				profile.routing?.mcpServers &&
+				JSON.stringify(profile.routing.mcpServers) !== JSON.stringify(routing.mcpServers)
+			)
+				throw new Error(
+					"OpenCode MCP configuration changed; select the profile again before continuing"
+				);
+			await verifyOpencodeV2(
+				routing.executable,
+				routing.mcpServers,
+				model,
+				profile.effort ?? variant
+			);
+		} else if (profile.agent === "opencode") {
 			// Config inspection performs no model request; never log the resolved config.
 			const config = await runCommand([routing.executable, "--pure", "debug", "config"], {
 				cwd: RUN_DIR,
@@ -542,6 +778,8 @@ export function parseAgentOutput(profile: AgentProfile, result: CommandResult): 
 									Number.isInteger(e.error?.data?.statusCode)
 										? String(e.error.data.statusCode)
 										: undefined,
+									e.error?.type,
+									Number.isInteger(e.error?.status) ? String(e.error.status) : undefined,
 									e.message?.errorMessage,
 									e.result,
 									e.error?.code,
@@ -565,7 +803,9 @@ export function parseAgentOutput(profile: AgentProfile, result: CommandResult): 
 						e.item.type
 					)) ||
 				e?.permission_denials?.length
-		)
+		) ||
+		// OpenCode 2 auto-rejects permission requests in run mode and reports them on stderr.
+		(profile.agent === "opencode" && /permission requested:/.test(result.stderr))
 	)
 		return failure(
 			profile,
@@ -650,10 +890,13 @@ export async function agentPrompt(
 	try {
 		if (!profile.routing)
 			return failure(profile, "Agent profile must pass preflight before execution", "restriction");
-		if (profile.agent === "codex" && !Array.isArray(profile.routing.mcpServers))
+		if (
+			(profile.agent === "codex" || profile.routing.protocol === "opencode-v2") &&
+			!Array.isArray(profile.routing.mcpServers)
+		)
 			return failure(
 				profile,
-				"Codex profile must verify disabled MCP servers before execution",
+				`${profile.agent} profile must verify disabled MCP servers before execution`,
 				"restriction"
 			);
 		if (routingSnapshot(profile).fingerprint !== profile.routing.fingerprint)
@@ -682,6 +925,46 @@ export async function agentPrompt(
 export interface ModelSuggestion {
 	id: string;
 	contextTokens?: number;
+	/** Model-specific reasoning variants, when the harness lists them. */
+	variants?: string[];
+	hint?: string;
+}
+
+/** OpenCode 2 model metadata; a listed model is not proof that this account can use it. */
+export function parseOpencodeModels(stdout: string): ModelSuggestion[] {
+	const parsed: any = JSON.parse(stdout);
+	if (!Array.isArray(parsed?.data)) return [];
+	return parsed.data
+		.filter(
+			(m: any) =>
+				typeof m?.providerID === "string" &&
+				typeof m.id === "string" &&
+				m.enabled !== false &&
+				m.capabilities?.input?.includes("text") !== false &&
+				m.capabilities?.output?.includes("text") !== false
+		)
+		.map((m: any) => {
+			const variants = Array.isArray(m.variants)
+				? m.variants.map((v: any) => v?.id).filter((id: unknown) => typeof id === "string")
+				: [];
+			const free =
+				Array.isArray(m.cost) &&
+				m.cost.length > 0 &&
+				m.cost.every((c: any) => c?.input === 0 && c?.output === 0);
+			return {
+				id: `${m.providerID}/${m.id}`,
+				...(Number.isSafeInteger(m.limit?.context) && m.limit.context >= 4096
+					? { contextTokens: m.limit.context }
+					: {}),
+				variants,
+				hint: [
+					free
+						? "listed at no cost; free-tier quotas apply"
+						: "listed; access depends on your account",
+					...(m.status && m.status !== "active" ? [m.status] : [])
+				].join(" · ")
+			};
+		});
 }
 export async function discoverModels(agent: string): Promise<ModelSuggestion[]> {
 	try {
@@ -713,6 +996,20 @@ export async function discoverModels(agent: string): Promise<ModelSuggestion[]> 
 				: [];
 		}
 		if (agent === "opencode") {
+			mkdirSync(RUN_DIR, { recursive: true });
+			const help = await runCommand(["opencode", "run", "--help"], {
+				cwd: RUN_DIR,
+				timeoutMs: 15000
+			});
+			// OpenCode 2: metadata from a private server, never the shared service or a model request.
+			if (/--standalone\b/.test(help.stdout)) {
+				const v2 = await runCommand(["opencode", "api", "--standalone", "GET", "/api/model"], {
+					cwd: RUN_DIR,
+					env: opencodeV2Env(),
+					timeoutMs: 30000
+				});
+				return v2.code === 0 ? parseOpencodeModels(v2.stdout) : [];
+			}
 			const r = await runCommand(["opencode", "models"], { timeoutMs: 15000 });
 			return r.code === 0
 				? r.stdout
