@@ -1263,9 +1263,13 @@ test.skipIf(!hasPalacePrerequisite)(
 					}))
 			);
 		// Mock Freebuff session: answers jobs with the fixture model, never via ytd's process.
+		// ytd claims an answer a moment before retiring its job; answer each job state once.
+		const handled = new Set<string>();
 		const answer = async (only?: string, invalidFirst = false) => {
 			for (const job of pending()) {
 				if (existsSync(job.response)) continue;
+				const state = `${job.job}:${existsSync(job.note)}`;
+				if (handled.has(state)) continue;
 				let prompt: string;
 				try {
 					prompt = readFileSync(job.job, "utf8");
@@ -1273,16 +1277,19 @@ test.skipIf(!hasPalacePrerequisite)(
 					continue;
 				}
 				if (only && !prompt.startsWith(only)) continue;
+				handled.add(state);
 				if (invalidFirst && !existsSync(job.note)) {
 					writeFileSync(job.response, '{"candidates":');
 					continue;
 				}
+				// Like a session that read every part: strip check lines, prove them, answer.
+				const codes = [...prompt.matchAll(/^\[\[ytd-check (\w+)\]\]$/gm)].map((m) => m[1]);
 				const result = await runCommand([join(bin, "fixture-agent"), "freebuff"], {
-					input: prompt,
+					input: prompt.replace(/^\[\[ytd-check \w+\]\]\n/gm, "").replace(/\n$/, ""),
 					env: f.env,
 					timeoutMs: 30_000
 				});
-				writeFileSync(job.response, result.stdout);
+				writeFileSync(job.response, `ytd-proof: ${codes.join(" ")}\n${result.stdout}`);
 			}
 		};
 		let first: ReturnType<typeof startCli> | undefined;

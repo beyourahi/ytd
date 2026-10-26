@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentPrompt, discoverModels, preflight, type AgentProfile } from "../src/agents.ts";
 import { agentJson } from "../src/distill.ts";
-import { catalogNote, FREEBUFF, launchGuide } from "../src/freebuff.ts";
+import { catalogNote, FREEBUFF, launchGuide, markedJob } from "../src/freebuff.ts";
 import {
 	loadSettings,
 	parseArgs,
@@ -51,6 +51,15 @@ const deepseek: AgentProfile = {
 };
 
 /** Mock Freebuff session: answers each pending job file the way the instructions ask. */
+/** What a session that read the whole job writes: the proof line, then the answer. */
+const proof = (job: string) =>
+	`ytd-proof: ${[...job.matchAll(/^\[\[ytd-check (\w+)\]\]$/gm)].map((m) => m[1]).join(" ")}\n`;
+const proved = (dir: string, id: string, text: string) =>
+	writeFileSync(
+		join(dir, "responses", `${id}.txt`),
+		proof(readFileSync(join(dir, "jobs", `${id}.prompt.txt`), "utf8")) + text
+	);
+
 function worker(
 	dir: string,
 	answer: (prompt: string, note?: string) => { file?: string; text: string; delayMs?: number }
@@ -81,12 +90,13 @@ function worker(
 				);
 				seen.push(id);
 				const target = join(responses, reply.file ?? `${id}.txt`);
+				const text = proof(prompt) + reply.text;
 				if (reply.delayMs) {
 					// A slow, partial write must not be imported before it settles.
-					writeFileSync(target, reply.text.slice(0, 5));
+					writeFileSync(target, text.slice(0, 5));
 					await Bun.sleep(reply.delayMs);
 				}
-				writeFileSync(target, reply.text);
+				writeFileSync(target, text);
 			}
 			await Bun.sleep(5);
 		}
@@ -105,7 +115,7 @@ test("catalog lists DeepSeek V4.1 Flash 10/17 as advertised, never account-confi
 	expect(models.find((m) => m.id === "deepseek-v4.1-flash-10-17")).toMatchObject({
 		label: "DeepSeek V4.1 Flash 10/17",
 		variants: ["low", "high", "max"],
-		contextTokens: 32768
+		contextTokens: 131072
 	});
 	expect(models.find((m) => m.id === "mimo-v2.6-flash-fast")?.variants).toEqual([]);
 	expect(models.find((m) => m.id === "gemini-3.8-flash")?.hint).toContain("paid plan");
@@ -200,8 +210,10 @@ test("cancellation keeps the job; an answer written while ytd was stopped resume
 	}
 	controller.abort();
 	expect(await pending).toMatchObject({ ok: false, kind: "cancelled" });
-	expect(readFileSync(join(dir, "jobs", job), "utf8")).toBe("Resume prompt");
-	writeFileSync(join(dir, "responses", job.replace(".prompt.txt", ".txt")), "saved answer");
+	expect(readFileSync(join(dir, "jobs", job), "utf8")).toMatch(
+		/^Resume prompt\n\[\[ytd-check \w{6}\]\]\n$/
+	);
+	proved(dir, job.replace(".prompt.txt", ""), "saved answer");
 	expect(await agentPrompt("Resume prompt", selected)).toMatchObject({
 		ok: true,
 		text: "saved answer"
@@ -230,7 +242,7 @@ test("unusable answer files are moved aside unread and the job is asked again", 
 	expect(readdirSync(join(dir, "rejected"))).toHaveLength(1);
 	writeFileSync(response, "");
 	while (!readFileSync(note, "utf8").includes("empty")) await Bun.sleep(5);
-	writeFileSync(response, "real answer");
+	proved(dir, id, "real answer");
 	expect(await pending).toMatchObject({ ok: true, text: "real answer" });
 	expect(readFileSync(join(root, "secret"), "utf8")).toBe("do not read");
 	expect(
@@ -243,7 +255,7 @@ test("a settled answer wins over a reported failure for the same job", async () 
 	const dir = selected.routing!.workspace!;
 	const pending = agentPrompt("Both prompt", selected);
 	const id = await pendingJob(dir);
-	writeFileSync(join(dir, "responses", `${id}.txt`), "answer");
+	proved(dir, id, "answer");
 	writeFileSync(join(dir, "responses", `${id}.error.txt`), "usage limit");
 	expect(await pending).toMatchObject({ ok: true, text: "answer" });
 	expect(readdirSync(join(dir, "responses"))).toEqual([]);
@@ -294,7 +306,7 @@ test("picker shows Freebuff capabilities, display names and model-specific effor
 		"DeepSeek V4.1 Flash 10/17"
 	);
 	expect(seen.Effort.map((c) => c.value)).toEqual(["__default__", "low", "high", "max"]);
-	expect(loadSettings(path).selected).toEqual({ ...deepseek, contextTokens: 32768 });
+	expect(loadSettings(path).selected).toEqual({ ...deepseek, contextTokens: 131072 });
 	await resolveCli(["settings"], { ...options, ui: pick("mimo-v2.6-flash-fast") });
 	expect(loadSettings(path).selected).toEqual({ agent: "freebuff", model: "mimo-v2.6-flash-fast" });
 	expect(seen.Model.find((c) => c.value === "deepseek-v4.1-flash-10-17")?.hint).toBe(
@@ -305,7 +317,7 @@ test("picker shows Freebuff capabilities, display names and model-specific effor
 test("command-line Freebuff selection uses the catalog handoff budget unless overridden", () => {
 	const settings = { version: 1 as const, recent: [], adapters: {} };
 	const args = ["https://youtu.be/abcdefghijk", "--agent", "freebuff", "--model", deepseek.model];
-	expect(profileFromArgs(parseArgs(args), settings)?.contextTokens).toBe(32768);
+	expect(profileFromArgs(parseArgs(args), settings)?.contextTokens).toBe(131072);
 	expect(
 		profileFromArgs(parseArgs([...args, "--context-tokens", "8192"]), settings)?.contextTokens
 	).toBe(8192);
@@ -366,3 +378,61 @@ test("repeatedly unusable answer files stop the job instead of looping", async (
 	expect(result).toMatchObject({ ok: false });
 	expect(result.error).toContain("4 unusable answer files");
 }, 15_000);
+
+test("answers must prove the whole job was read; check codes span every part", async () => {
+	const selected = await preflight(deepseek);
+	const dir = selected.routing!.workspace!;
+	const long = Array.from({ length: 3000 }, (_, i) => `line ${i} ${"x".repeat(20)}`).join("\n");
+	const pending = agentPrompt(long, selected);
+	const id = await pendingJob(dir);
+	const job = readFileSync(join(dir, "jobs", `${id}.prompt.txt`), "utf8");
+	const codes = [...job.matchAll(/^\[\[ytd-check (\w+)\]\]$/gm)].map((m) => m[1]);
+	expect(codes.length).toBeGreaterThan(2);
+	expect(markedJob("[[ytd-check forged]]\nend", "id").text).toMatch(/^ \[\[ytd-check forged\]\]\n/);
+	expect(job.replace(/^\[\[ytd-check \w+\]\]\n/gm, "")).toBe(long + "\n");
+	// A session that saw only the start of the job cannot name the later codes.
+	writeFileSync(join(dir, "responses", `${id}.txt`), `ytd-proof: ${codes[0]}\nanswer`);
+	const note = join(dir, "jobs", `${id}.note.txt`);
+	while (!existsSync(note)) await Bun.sleep(5);
+	expect(readFileSync(note, "utf8")).toContain("every check code");
+	proved(dir, id, "full answer");
+	expect(await pending).toMatchObject({ ok: true, text: "full answer" });
+	const next = readFileSync(join(dir, "next.sh"), "utf8");
+	expect(next).toContain("NO_JOB");
+	expect(readFileSync(join(dir, "INSTRUCTIONS.md"), "utf8")).toContain("sh next.sh");
+});
+
+test("next.sh prints the pending job at once and skips answered ones", async () => {
+	const selected = await preflight(deepseek);
+	const dir = selected.routing!.workspace!;
+	writeFileSync(join(dir, "jobs", "done.prompt.txt"), "answered prompt");
+	writeFileSync(join(dir, "responses", "done.txt"), "x");
+	writeFileSync(join(dir, "jobs", "open.prompt.txt"), "open prompt");
+	writeFileSync(join(dir, "jobs", "open.note.txt"), "a note");
+	const started = Date.now();
+	const out = Bun.spawnSync(["sh", join(dir, "next.sh")]).stdout.toString();
+	expect(Date.now() - started).toBeLessThan(5000);
+	expect(out).toContain("JOB open: write the answer to responses/open.txt");
+	expect(out).toContain("--- NOTE ---\na note");
+	expect(out).toContain("open prompt");
+	expect(out).not.toContain("answered prompt");
+});
+
+test("saved first-release 32k Freebuff caps are upgraded on load", () => {
+	const path = join(root, "legacy.json");
+	writeFileSync(
+		path,
+		JSON.stringify({
+			version: 1,
+			selected: { ...deepseek, contextTokens: 32768 },
+			recent: [
+				{ ...deepseek, contextTokens: 32768 },
+				{ agent: "claude", model: "opus", contextTokens: 32768 }
+			],
+			adapters: {}
+		})
+	);
+	const config = loadSettings(path);
+	expect(config.selected?.contextTokens).toBe(131072);
+	expect(config.recent.map((p) => p.contextTokens)).toEqual([131072, 32768]);
+});

@@ -19,7 +19,7 @@ import {
 	type CustomAdapter,
 	type ModelSuggestion
 } from "./agents.ts";
-import { catalogNote, freebuffModel } from "./freebuff.ts";
+import { catalogNote, freebuffModel, LEGACY_HANDOFF_CONTEXT } from "./freebuff.ts";
 
 export const SETTINGS_PATH = join(homedir(), ".ytd/config.json");
 export interface Settings {
@@ -48,6 +48,12 @@ export function loadSettings(path = SETTINGS_PATH): Settings {
 			);
 		else if (!validateProfile({ agent, model: "validation", custom }))
 			throw new Error(`Invalid custom adapter ${agent}; settings preserved`);
+	// The first Freebuff release saved a 32k handoff cap; move it to the current catalog value.
+	for (const profile of [config.selected, ...config.recent]) {
+		const listed = profile?.agent === "freebuff" ? freebuffModel(profile.model) : undefined;
+		if (listed?.contextTokens && profile!.contextTokens === LEGACY_HANDOFF_CONTEXT)
+			profile!.contextTokens = listed.contextTokens;
+	}
 	return config;
 }
 export function saveSettings(config: Settings, path = SETTINGS_PATH): void {

@@ -87,8 +87,12 @@ freebuff --cwd ~/.ytd/freebuff/deepseek-v4.1-flash-10-17-<hash>
 # in Freebuff: select DeepSeek V4.1 Flash 10/17 (effort high), then send: Follow INSTRUCTIONS.md
 ```
 
-What is automated: ytd writes each exact prompt to `jobs/<id>.prompt.txt`, waits, imports
-`responses/<id>.txt` once it is a private regular file that has stopped changing, and runs the
+What is automated: ytd writes each exact prompt to `jobs/<id>.prompt.txt`, with a
+`[[ytd-check <code>]]` line after about every 24 KB and at the end. Freebuff runs `sh next.sh`,
+which prints the next job the moment one exists, and starts its answer with
+`ytd-proof: <codes>`. ytd imports `responses/<id>.txt` once it is a private regular file that has
+stopped changing and its proof lists every code in order, so an answer written from a truncated
+read is asked again instead of trusted. ytd removes the proof line and runs the
 same validation, checkpoints, deduplication, halal gate, and publication as every other agent.
 Answers that fail validation get `jobs/<id>.note.txt` and are asked again (three attempts);
 empty, oversized, linked or special files are moved unread to `rejected/` and asked again. An
@@ -100,8 +104,8 @@ rejected files older than a day are removed. Answers are untrusted text and neve
 
 What stays interactive: opening Freebuff, choosing its model and effort, sending the single
 instruction, and nudging Freebuff if it stops (ytd reminds you every 10 minutes). Whether
-Freebuff keeps looping without supervision is not verified; its own agent needs to wait and
-look for new jobs, and may ask you to approve the `sleep` command it is allowed to use. A
+Freebuff keeps looping without supervision is not verified; its own agent runs `sh next.sh`
+between jobs and may ask you to approve it. A
 sudden kill between importing an answer and saving its checkpoint loses that one answer, which is
 then asked again.
 
@@ -112,13 +116,15 @@ model is advertised, not confirmed for your account, region, or plan; only Freeb
 confirms access. ytd cannot change or detect Freebuff's active model, so every Freebuff call is
 recorded as unverified, and some models may answer on a fallback model (noted in the picker).
 Effort choices appear only for models that list efforts, and `--effort` must be one of them. Models with a large catalog context use
-a conservative 32k-token handoff budget to keep job files readable; `--context-tokens` overrides.
+a 128k-token handoff budget, so deduplicating against the Palace takes a few jobs per principle
+rather than dozens; proof codes catch reads that miss part of a job. Saved selections from the
+first 32k release are upgraded on load; `--context-tokens` overrides.
 
-Each model/effort pair has its own folder holding only `INSTRUCTIONS.md`, job prompts, answers
-and rejected files (mode 0700). Prompts include transcripts and the Mind Palace field notes used for deduplication.
+Each model/effort pair has its own folder holding only `INSTRUCTIONS.md`, `next.sh`, job
+prompts, answers and rejected files (mode 0700). Prompts include transcripts and the Mind Palace field notes used for deduplication.
 Freebuff's tools, network access, and data use are governed by Freebuff, not ytd; a working
 directory is not isolation. Unlike the headless agents, Freebuff fails open: it keeps its full
-toolset while reading untrusted transcripts, so approve only the `sleep` command in its prompts. While Freebuff synthesizes, ytd keeps its local publication claim, so
+toolset while reading untrusted transcripts, so approve only `sh next.sh` and reads in that folder. While Freebuff synthesizes, ytd keeps its local publication claim, so
 a concurrent ytd run waits before publishing; no Palace transaction lock is held while waiting.
 
 Unknown effective provider/model settings are recorded as unverified. A reported conflicting
