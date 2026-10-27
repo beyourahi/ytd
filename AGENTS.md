@@ -21,6 +21,10 @@ See README.md for user commands, recovery, settings, and isolation details. Pres
 - Legacy data is backed up, imported idempotently, and preserved when ambiguous/corrupt.
 - Tools/MCP/command/network/subagent restrictions are adapter-specific and fail closed.
 - Custom trusted executable/argument arrays use stdin/stdout; wrappers own isolation.
+- Local transcription is opt-in (`--transcribe`), never downloads an engine/model, is labelled as
+  local rather than published caption text, cached per video, and never fails the run.
+- Listing is streamed and staged; an unfinished listing is reported as partial and its saved
+  videos stay included.
 - `bun install --frozen-lockfile`, `bun test`, `bun run check`, `bun run lint` before landing.
 - Keep TypeScript 7 compiler / TypeScript 6 ESLint compatibility; no unrelated upgrades.
 - Tests use fake processes and temporary SQLite/Git fixtures; never publish test notes to Palace.
@@ -33,7 +37,10 @@ See README.md for user commands, recovery, settings, and isolation details. Pres
 - `opencode.ts`: isolated install/auth inspection, guided `opencode auth login`, provider grouping.
 - `process.ts`: concurrent stdout/stderr, owned process cancellation/timeouts, exit checking.
 - `enumerate.ts`: validated hostname/path parsing, playlists, actual creators, collision-safe identities.
+- `discovery.ts`: staged streaming listing log (`<slug>.list.partial` → `<slug>.list.jsonl`), batch reads.
 - `fetch.ts`: paced captions/description/pinned comments, tolerant parsers and atomic global video caches.
+- `transcribe.ts`: optional local whisper.cpp transcription — opt-in, provider-neutral, cached, labelled.
+- `pipeline.ts` / `scheduler.ts` / `limits.ts`: durable job queue, stage checkpoints, concurrency leases.
 - `manifest.ts`: SQLite transactions for runs, candidates, stages, migrations and publication receipts.
 - `distill.ts`: extraction/glean, complete validation, prompt budgeting, synthesis and cached shard comparisons.
 - `palace.ts`: deterministic rendering, canonical snapshots, locked append/publication and remote verification.

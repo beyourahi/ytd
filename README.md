@@ -39,6 +39,14 @@ metadata supplies a context window when discovered. Advanced overrides:
 `--context-tokens N` and `--timeout-ms N` (default 15 minutes per agent call). The complete
 assembled prompt is budgeted; transcripts and notes are sharded without truncation.
 
+Optional local transcription is off unless asked for:
+`--transcribe --whisper-command PATH --whisper-model PATH`. It applies only to videos with no
+usable captions. Nothing is downloaded for you — the whisper.cpp executable and the model file
+must already exist locally, and if either is missing the run refuses before downloading any audio.
+Each result is cached per video, labelled in the transcript itself as a local transcription rather
+than published caption text, and reused on later runs. Transcription is bounded by its own
+concurrency setting, and a failure leaves that video captionless instead of failing the run.
+
 ## Agents and isolation
 
 Install/configure `yt-dlp`, Bun, a JavaScript runtime for YouTube (Node is auto-detected),
@@ -199,6 +207,13 @@ Playlists list themselves; channels enumerate videos and Shorts separately. List
 are reported separately from empty tabs. Fetches stay paced and retry failures. Description
 and pinned-comment context remains useful when captions are unavailable or malformed.
 
+A listing is read as a stream and staged as it arrives, so a channel larger than a single capture
+buffer does not fail and a long run does not wait for the whole tab before starting work. Rows are
+appended to `<slug>.list.partial` and the file is only renamed to `<slug>.list.jsonl` once every
+tab finished. A listing that did not finish stays staged, is reported as partial rather than as a
+complete inventory, and its saved videos remain included: the staged rows are the record of what
+was seen, and a later listing never silently drops them.
+
 Palace publication requires the approved `scripts/mind-palace-sync` with
 `--require-unchanged-base`. It operates in isolated transactions, preserves foreign dirty/staged
 work, allocates global `[Mn]` IDs under the writer lock, and makes one commit per room/creator.
@@ -207,6 +222,43 @@ receipts. Remote base movement automatically refreshes affected deduplication an
 publication up to three times, reusing unchanged comparisons and verified rooms. Continued
 movement preserves progress for the next run. Ingestion completes only after every intended room is
 remotely verified. Tests never publish experimental notes to the real Palace.
+
+## Benchmarks
+
+```sh
+bun run bench                    # 100, 1,000 and 10,000-video synthetic channels
+bun run bench --sizes 100,1000   # smaller
+bun run bench --no-rust          # skip the comparison
+```
+
+Everything is local: a stub on this machine produces the listings, so the numbers measure ytd's
+own work at a given channel size, not YouTube's or a provider's speed. No network, no model call
+and no real palace is touched. Each workload reports the fastest of three runs, plus the measured
+slope between the smallest and largest size — the fixed cost a bigger channel does not shrink is
+reported separately from the per-item cost, because an average per item hides both. Timings from
+one machine (darwin arm64, bun 1.4.2, 10 CPUs):
+
+| workload                 | 100 videos | 1,000 | 10,000 | per item                                   |
+| ------------------------ | ---------- | ----- | ------ | ------------------------------------------ |
+| listing stream + stage   | 175ms      | 191ms | 188ms  | constant ≈ 177ms (two stub process starts) |
+| discovery staging        | 0.6ms      | 0.9ms | 2.0ms  | 0.14µs/row                                 |
+| discovery read back      | 0.5ms      | 0.5ms | 3.1ms  | 0.26µs/row                                 |
+| manifest + queue setup   | 7ms        | 22ms  | 120ms  | 11µs/video                                 |
+| queue claim + complete   | 54ms       | 545ms | 3.2s   | 158µs/transition                           |
+| dedup normalise + lookup | 0.1ms      | 0.6ms | 3.7ms  | 0.36µs/principle                           |
+| caption parse            | 2.4ms      | 22ms  | 124ms  | 123µs/track                                |
+
+**Verdict: no Rust rewrite.** `bench/rust/kernels.rs` implements the two plausible kernels
+(principle normalisation and json3 caption extraction) and is compiled and hash-verified against
+the Bun implementations on identical input, so this is a measurement, not a guess. Bun wins both:
+normalising 200,000 principles takes 68.7ms in Bun against 96.1ms in Rust, with a measured
+marginal cost of 0.324µs per key in Bun against 0.467µs in Rust, and parsing 40 caption tracks
+takes 2.39ms in Bun against 5.31ms in Rust (0.059ms against 0.079ms per track). Each Rust call
+also pays 2.2–2.7ms of process start and pipe, more than the work it would replace. The local cost
+that does scale is SQLite job transitions (158µs each, twice per video) and process starts for
+yt-dlp and the harness — I/O-bound work a faster parser cannot touch, and under 5 seconds of the
+10,000-video run measured above. Rust stays out of the runtime; the kernels are kept as the
+reproducible evidence for that decision.
 
 ## Development
 
