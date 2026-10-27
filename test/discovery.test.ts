@@ -105,7 +105,8 @@ test("discovery stages batches, commits only a complete listing and reads them b
 		const item = (n: number): VideoItem => ({
 			id: String(n).padStart(11, "0"),
 			title: `Video ${n}`,
-			creator: "Fixture"
+			creator: "Fixture",
+			creatorUrl: "https://www.youtube.com/@fixture"
 		});
 		const log = new DiscoveryLog("slug", root);
 		log.begin();
@@ -119,6 +120,9 @@ test("discovery stages batches, commits only a complete listing and reads them b
 		expect(abandoned.complete).toBe(false);
 		expect(abandoned.items).toBe(3);
 		expect([...log.read(2)].map((batch) => batch.length)).toEqual([2, 1]);
+		// Reading a staged row back with the listing parser's own field names once dropped every
+		// creator: the creator and its URL must survive the round trip.
+		expect([...log.read()].flat()[0]).toEqual(item(1));
 
 		log.begin();
 		log.append([item(4)]);

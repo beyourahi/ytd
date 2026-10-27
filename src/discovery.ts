@@ -34,10 +34,22 @@ export function discoveryPaths(
 	return { path: join(dir, `${slug}.list.jsonl`), partialPath: join(dir, `${slug}.list.partial`) };
 }
 
-/** A staged row is only usable if it still carries a valid video identity. */
+/**
+ * A staged row is only usable if it still carries a valid video identity.
+ *
+ * The staged file uses ytd's own field names, while the listing parser reads yt-dlp's, so the
+ * creator is mapped across before validation: reading a staged row with the listing parser alone
+ * silently dropped every creator and creator URL it stored.
+ */
 function parseStaged(line: string): VideoItem | null {
 	try {
-		return metadataItem(JSON.parse(line));
+		const row = JSON.parse(line) as Record<string, unknown>;
+		return metadataItem({
+			id: row.id,
+			title: row.title,
+			channel: row.channel ?? row.creator,
+			channel_url: row.channel_url ?? row.creatorUrl
+		});
 	} catch {
 		return null;
 	}
