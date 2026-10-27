@@ -63,12 +63,22 @@ export function atomicCache(path: string, value: string): void {
 	}
 }
 
+export type FetchReason = "no_captions" | "fetch_blocked" | "yt_dlp_error" | "unavailable";
+
 export interface FetchResult {
 	id: string;
 	ok: boolean;
 	metadata?: VideoItem;
-	reason?: "no_captions" | "fetch_blocked" | "yt_dlp_error";
+	reason?: FetchReason;
 }
+
+/**
+ * yt-dlp prose for sources that can never succeed. Retrying these forever would burn the retry
+ * budget and pad the report, so they are classified apart from ordinary extractor errors.
+ * Deliberately narrow: an ambiguous failure stays retryable.
+ */
+const PERMANENTLY_UNAVAILABLE =
+	/video unavailable|private video|removed by the uploader|has been terminated|no longer available|members-only|this video is not available|account associated with this video has been terminated/i;
 
 export async function fetchTranscript(
 	slug: string,
@@ -149,6 +159,8 @@ export async function fetchTranscript(
 		const failure = (result.stderr + result.stdout).toLowerCase();
 		if (/sign in to confirm|not a bot|blocked|http error 4|429|forbidden/.test(failure))
 			return { id, ok: false, reason: "fetch_blocked", metadata };
+		if (PERMANENTLY_UNAVAILABLE.test(failure))
+			return { id, ok: false, reason: "unavailable", metadata };
 		return {
 			id,
 			ok: false,

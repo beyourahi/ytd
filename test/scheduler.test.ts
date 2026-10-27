@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -252,6 +253,67 @@ test("a crashed session's leased work is reclaimed by the next session and compl
 		retried.forEach((job) => resumed.jobs.succeed(job));
 		expect(resumed.jobs.depth("fetch")).toBe(0);
 		resumed.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+/** A PID that provably has no process behind it, so ESRCH-based reclamation is exercised. */
+function absentPid(): number {
+	for (let pid = 900_000; pid < 900_500; pid++) {
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return pid;
+		}
+	}
+	throw new Error("No absent process id available to simulate a killed owner");
+}
+
+test("a killed owner's claim is reclaimed at once instead of waiting out its lease", () => {
+	const f = fixture();
+	try {
+		const manifest = withRun(f.dir, ["a"]);
+		const base = Date.now();
+		manifest.jobs.sync("fetch", new Set(["a"]), base);
+		// A killed session leaves a lease that is still well inside its lifetime.
+		const raw = new Database(join(f.dir, "library.sqlite"));
+		try {
+			raw.run(
+				"UPDATE jobs SET state='running', lease_token='dead', lease_expires=?, owner_pid=?, attempts=1 WHERE id='a'",
+				[base + 60_000, absentPid()]
+			);
+		} finally {
+			raw.close();
+		}
+		const reclaimed = manifest.jobs.claim("fetch", { now: base, leaseMs: 60_000 });
+		expect(reclaimed).toHaveLength(1);
+		expect(reclaimed[0]!.id).toBe("a");
+		manifest.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("a lease held by a live unknown owner is left alone until it expires", () => {
+	const f = fixture();
+	try {
+		const manifest = withRun(f.dir, ["a"]);
+		const base = Date.now();
+		manifest.jobs.sync("fetch", new Set(["a"]), base);
+		// Ownership that cannot be read must fail closed: the lease stands until it expires.
+		const raw = new Database(join(f.dir, "library.sqlite"));
+		try {
+			raw.run(
+				"UPDATE jobs SET state='running', lease_token='live', lease_expires=?, owner_pid=NULL WHERE id='a'",
+				[base + 60_000]
+			);
+		} finally {
+			raw.close();
+		}
+		expect(manifest.jobs.claim("fetch", { now: base, leaseMs: 60_000 })).toEqual([]);
+		expect(manifest.jobs.resetExpired(base + 60_001)).toBe(1);
+		manifest.close();
 	} finally {
 		f.cleanup();
 	}

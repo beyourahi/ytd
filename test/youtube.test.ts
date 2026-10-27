@@ -106,7 +106,16 @@ test("video cache migration is identity-based and preserves legacy material", as
 	}
 });
 
-for (const mode of ["captions", "description", "pinned", "blocked", "error", "empty", "cancel"]) {
+for (const mode of [
+	"captions",
+	"description",
+	"pinned",
+	"blocked",
+	"error",
+	"unavailable",
+	"empty",
+	"cancel"
+]) {
 	test(`isolated fetch handles ${mode}, cache reuse and scratch cleanup`, async () => {
 		const root = mkdtempSync(join(tmpdir(), "ytd-fetch-test-"));
 		try {
@@ -132,7 +141,8 @@ else {
  } else if(mode === "pinned") info.comments=[{text:"Useful pinned context",is_pinned:true}];
  if(["captions","description","pinned"].includes(mode)) writeFileSync(template.replace("%(ext)s","info.json"),JSON.stringify(info));
  if(["blocked","description"].includes(mode)) {console.error("HTTP Error 429: Too Many Requests");process.exitCode=1;}
- if(mode === "error") {console.error("Video unavailable");process.exitCode=1;}
+ if(mode === "error") {console.error("ERROR: unable to download webpage: HTTP Error 500 Internal Server Error");process.exitCode=1;}
+ if(mode === "unavailable") {console.error("ERROR: [youtube] 0Rqoe5quCJQ: Video unavailable");process.exitCode=1;}
 }
 `
 			);
@@ -194,7 +204,9 @@ console.log(JSON.stringify({...outcome,cached,text:existsSync(path)?readFileSync
 								? "fetch_blocked"
 								: mode === "error"
 									? "yt_dlp_error"
-									: "no_captions"
+									: mode === "unavailable"
+										? "unavailable"
+										: "no_captions"
 					});
 			}
 		} finally {

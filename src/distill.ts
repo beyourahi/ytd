@@ -3,6 +3,16 @@ import { join } from "node:path";
 import { agentPrompt, type AgentProfile } from "./agents.ts";
 import { RUN_DIR, ROOMS } from "./config.ts";
 import { stableHash, type Manifest } from "./manifest.ts";
+import type { Metrics, Stage } from "./metrics.ts";
+
+/** Each labelled model call maps to the pipeline stage it belongs to, for honest timing. */
+const LABEL_STAGE: Record<string, Stage> = {
+	extract: "extract",
+	glean: "glean",
+	synthesis: "synthesis",
+	"notes-comparison": "dedup",
+	"accepted-comparison": "dedup"
+};
 
 export interface Transcript {
 	id: string;
@@ -57,6 +67,8 @@ export interface DistillOptions {
 		error?: string;
 		reportedModel?: string;
 	}>;
+	/** Optional instrumentation. Counts and timings only — never prompt or transcript text. */
+	metrics?: Metrics;
 }
 interface JsonResult<T> {
 	obj?: T;
@@ -187,9 +199,17 @@ export async function agentJson<T>(
 		return error ? { error } : { obj: cached.obj };
 	}
 	let last = "";
+	const stage = LABEL_STAGE[label];
 	for (let i = 0; i < attempts; i++) {
 		if (options.signal?.aborted) return { error: "Distillation cancelled" };
+		options.metrics?.counter("ai-calls");
+		const started = stage ? options.metrics?.now() : undefined;
 		const result = await (options.call ?? agentPrompt)(prompt, options.profile, options.signal);
+		if (stage && started !== undefined)
+			options.metrics?.record(stage, options.metrics!.now() - started, {
+				ok: result.ok && !result.limited,
+				chars: prompt.length
+			});
 		if (result.limited) return { limited: true };
 		if (!result.ok) return { error: result.error ?? "Agent call failed" };
 		const identityError = pinIdentity(result.reportedModel);

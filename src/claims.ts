@@ -9,7 +9,7 @@ export interface WaitOptions {
 }
 
 /** Only ESRCH proves an owner has gone. EPERM and unknown ownership stay locked. */
-function absent(pid: number): boolean {
+export function absent(pid: number): boolean {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	try {
 		process.kill(pid, 0);

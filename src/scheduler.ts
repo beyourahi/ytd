@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
+import { absent } from "./claims.ts";
 
 /**
  * Durable scheduling memory for the processing pipeline.
@@ -35,8 +36,8 @@ export interface JobRecord {
 }
 
 export interface ClaimOptions {
-	/** Maximum number of jobs to claim in one atomic step. */
-	limit: number;
+	/** Maximum number of jobs to claim in one atomic step. Defaults to one unit. */
+	limit?: number;
 	/** Lease lifetime in milliseconds. */
 	leaseMs?: number;
 	/** Attempts allowed per job before it is blocked instead of retried. */
@@ -56,6 +57,7 @@ export interface JobStats {
 
 const DEFAULT_LEASE_MS = 15 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_CLAIM_LIMIT = 1;
 
 export class JobScheduler {
 	constructor(
@@ -75,11 +77,16 @@ export class JobScheduler {
 				available_at INTEGER NOT NULL DEFAULT 0,
 				lease_token TEXT,
 				lease_expires INTEGER NOT NULL DEFAULT 0,
+				owner_pid INTEGER,
 				reason TEXT,
 				updated INTEGER NOT NULL DEFAULT 0,
 				PRIMARY KEY (run_id, id, stage)
 			)`
 		);
+		// Additive: an existing version-3 table predates PID-based lease reclamation.
+		const columns = db.query("PRAGMA table_info(jobs)").all() as { name: string }[];
+		if (!columns.some((column) => column.name === "owner_pid"))
+			db.run("ALTER TABLE jobs ADD COLUMN owner_pid INTEGER");
 		db.run("CREATE INDEX IF NOT EXISTS jobs_eligible ON jobs(run_id, stage, state, available_at)");
 	}
 
@@ -87,11 +94,14 @@ export class JobScheduler {
 	 * Align the job rows for one stage with the work that actually remains. Job rows for units
 	 * that are no longer needed are dropped, so a completed or re-scoped source cannot be
 	 * re-claimed from stale scheduling memory.
+	 *
+	 * Blocked rows are deliberately preserved: they are the record that a source was tried and
+	 * refused, and dropping them would let the next run retry it forever.
 	 */
 	sync(stage: JobStage, needed: ReadonlySet<string>, now = Date.now()): void {
 		const runId = this.runId();
 		const existing = this.db
-			.query("SELECT id FROM jobs WHERE run_id=? AND stage=?")
+			.query("SELECT id FROM jobs WHERE run_id=? AND stage=? AND state!='blocked'")
 			.all(runId, stage) as { id: string }[];
 		const known = new Set(existing.map((row) => row.id));
 		const drop = existing.filter((row) => !needed.has(row.id));
@@ -107,13 +117,54 @@ export class JobScheduler {
 		})();
 	}
 
+	/**
+	 * Register one unit of work if it is not already known. Used on the hot path when a stage
+	 * produces work for the next one, where a full `sync` over every id would be wasteful.
+	 */
+	ensure(stage: JobStage, id: string, now = Date.now()): void {
+		this.db.run(
+			"INSERT OR IGNORE INTO jobs(run_id,id,stage,state,attempts,available_at,lease_token,lease_expires,reason,updated) VALUES (?,?,?,'pending',0,?,NULL,0,NULL,?)",
+			[this.runId(), id, stage, now, now]
+		);
+	}
+
+	/**
+	 * Reclaim work whose owner is gone. A killed process proves ownership only through its PID:
+	 * ESRCH means the owner cannot still be running, so waiting out a lease would delay recovery
+	 * for no safety benefit. Unknown or unreadable ownership keeps the lease until it expires.
+	 */
+	private reclaimAbandoned(stage: JobStage | null, now: number): number {
+		const runId = this.runId();
+		const rows = this.db
+			.query(
+				`SELECT id, stage, lease_token, lease_expires, owner_pid FROM jobs
+				 WHERE run_id=? AND state='running' AND (lease_expires<=? OR owner_pid IS NULL OR owner_pid<>?)${
+						stage ? " AND stage=?" : ""
+					}`
+			)
+			.all(...(stage ? [runId, now, process.pid, stage] : [runId, now, process.pid])) as {
+			id: string;
+			stage: string;
+			lease_token: string | null;
+			lease_expires: number;
+			owner_pid: number | null;
+		}[];
+		let reclaimed = 0;
+		const update = this.db.prepare(
+			"UPDATE jobs SET state='pending', lease_token=NULL, lease_expires=0, updated=? WHERE run_id=? AND id=? AND stage=? AND lease_token=?"
+		);
+		for (const row of rows) {
+			const expired = row.lease_expires <= now;
+			const orphaned = typeof row.owner_pid === "number" && absent(row.owner_pid);
+			if (!expired && !orphaned) continue;
+			reclaimed += update.run(now, runId, row.id, row.stage, row.lease_token).changes;
+		}
+		return reclaimed;
+	}
+
 	/** Reclaim work abandoned by a crashed or killed session. */
 	resetExpired(now = Date.now()): number {
-		const result = this.db.run(
-			"UPDATE jobs SET state='pending', lease_token=NULL, lease_expires=0, updated=? WHERE state='running' AND lease_expires<=?",
-			[now, now]
-		);
-		return result.changes;
+		return this.reclaimAbandoned(null, now);
 	}
 
 	/**
@@ -125,29 +176,40 @@ export class JobScheduler {
 		const now = options.now ?? Date.now();
 		const leaseMs = Math.max(1_000, options.leaseMs ?? DEFAULT_LEASE_MS);
 		const maxAttempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
-		const limit = Math.max(1, Math.floor(options.limit));
+		// A missing or non-finite limit must never reach SQLite: a NaN LIMIT is a hard datatype error.
+		const requested = options.limit;
+		const limit = Math.max(
+			1,
+			Math.floor(
+				typeof requested === "number" && Number.isFinite(requested)
+					? requested
+					: DEFAULT_CLAIM_LIMIT
+			)
+		);
 		return this.db
 			.transaction(() => {
+				// Orphaned claims from a killed session are released in the same transaction, so a
+				// crashed run never delays its own recovery for a full lease lifetime.
+				this.reclaimAbandoned(stage, now);
 				const eligible = this.db
 					.query(
 						`SELECT id, attempts FROM jobs
-						 WHERE run_id=? AND stage=? AND state IN ('pending','running')
+						 WHERE run_id=? AND stage=? AND state='pending'
 						   AND available_at<=?
-						   AND (state='pending' OR lease_expires<=?)
 						   AND attempts<?
 						 ORDER BY available_at, rowid LIMIT ?`
 					)
-					.all(runId, stage, now, now, maxAttempts, limit) as {
+					.all(runId, stage, now, maxAttempts, limit) as {
 					id: string;
 					attempts: number;
 				}[];
 				const claimed: JobRecord[] = [];
 				const update = this.db.prepare(
-					"UPDATE jobs SET state='running', attempts=attempts+1, lease_token=?, lease_expires=?, updated=? WHERE run_id=? AND id=? AND stage=?"
+					"UPDATE jobs SET state='running', attempts=attempts+1, lease_token=?, lease_expires=?, owner_pid=?, updated=? WHERE run_id=? AND id=? AND stage=?"
 				);
 				for (const row of eligible) {
 					const token = randomUUID();
-					const changed = update.run(token, now + leaseMs, now, runId, row.id, stage);
+					const changed = update.run(token, now + leaseMs, process.pid, now, runId, row.id, stage);
 					if (!changed.changes) continue;
 					claimed.push({
 						id: row.id,

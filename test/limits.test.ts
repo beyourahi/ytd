@@ -65,6 +65,8 @@ test("a killed session's slot is reclaimed once its lease expires", async () => 
 	const dir = root();
 	const limiter = new GlobalLimiter(dir);
 	try {
+		// A dead session implies the shared file was already initialised by it, so open it first.
+		(await limiter.acquire("youtube", 1))();
 		const holder = new Database(join(dir, "limits.sqlite"));
 		holder.run("INSERT INTO leases(key,token,expires) VALUES ('youtube','dead:1',?)", [
 			Date.now() - 1

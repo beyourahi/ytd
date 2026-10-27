@@ -66,24 +66,45 @@ export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export class GlobalLimiter {
-	private db: Database;
+	private db: Database | null = null;
 	private token = randomUUID();
 	private closed = false;
 
 	constructor(
-		root = DATA_DIR,
+		private readonly root = DATA_DIR,
 		private readonly clock: () => number = () => Date.now()
-	) {
-		mkdirSync(root, { recursive: true });
-		this.db = new Database(join(root, "limits.sqlite"));
-		this.db.run("PRAGMA busy_timeout=5000");
-		this.db.run("PRAGMA journal_mode=WAL");
-		this.db.run(
-			"CREATE TABLE IF NOT EXISTS leases (key TEXT NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(key,token))"
-		);
-		this.db.run(
-			"CREATE TABLE IF NOT EXISTS pacing (key TEXT PRIMARY KEY, next_allowed INTEGER NOT NULL)"
-		);
+	) {}
+
+	/**
+	 * Opened on first use, not at construction: a session that never fetches must not create or
+	 * lock a file that other sessions are opening at the same moment. Setting the journal mode
+	 * is best-effort — two sessions racing to initialise the same new database can lose that
+	 * latch, and rollback-journal mode with a busy timeout is a correct fallback.
+	 */
+	private open(): Database {
+		if (this.db) return this.db;
+		const db = new Database(join(this.root, "limits.sqlite"));
+		this.db = db;
+		try {
+			mkdirSync(this.root, { recursive: true });
+			db.run("PRAGMA busy_timeout=5000");
+			try {
+				db.run("PRAGMA journal_mode=WAL");
+			} catch {
+				/* another session holds the latch; the default journal stays correct */
+			}
+			db.run(
+				"CREATE TABLE IF NOT EXISTS leases (key TEXT NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(key,token))"
+			);
+			db.run(
+				"CREATE TABLE IF NOT EXISTS pacing (key TEXT PRIMARY KEY, next_allowed INTEGER NOT NULL)"
+			);
+		} catch (error) {
+			this.db = null;
+			db.close();
+			throw error;
+		}
+		return this.db;
 	}
 
 	/**
@@ -92,6 +113,7 @@ export class GlobalLimiter {
 	 */
 	async acquire(key: string, limit: number, options: LimiterOptions = {}): Promise<() => void> {
 		if (this.closed) throw new Error("Limiter is closed");
+		const db = this.open();
 		const width = Math.max(1, Math.floor(limit) || 1);
 		const ttl = Math.max(1_000, options.ttlMs ?? DEFAULT_TTL_MS);
 		const heartbeat = Math.max(
@@ -102,26 +124,22 @@ export class GlobalLimiter {
 		let announced = false;
 		for (;;) {
 			options.signal?.throwIfAborted();
-			const acquired = this.db
+			const acquired = db
 				.transaction(() => {
 					const now = this.clock();
-					this.db.run("DELETE FROM leases WHERE key=? AND expires<=?", [key, now]);
-					const row = this.db
-						.query("SELECT COUNT(*) AS active FROM leases WHERE key=?")
-						.get(key) as { active: number };
+					db.run("DELETE FROM leases WHERE key=? AND expires<=?", [key, now]);
+					const row = db.query("SELECT COUNT(*) AS active FROM leases WHERE key=?").get(key) as {
+						active: number;
+					};
 					if (row.active >= width) return false;
-					this.db.run("INSERT INTO leases(key,token,expires) VALUES (?,?,?)", [
-						key,
-						token,
-						now + ttl
-					]);
+					db.run("INSERT INTO leases(key,token,expires) VALUES (?,?,?)", [key, token, now + ttl]);
 					return true;
 				})
 				.immediate();
 			if (acquired) {
 				const renew = setInterval(() => {
 					try {
-						this.db.run("UPDATE leases SET expires=? WHERE key=? AND token=?", [
+						db.run("UPDATE leases SET expires=? WHERE key=? AND token=?", [
 							this.clock() + ttl,
 							key,
 							token
@@ -138,7 +156,7 @@ export class GlobalLimiter {
 					clearInterval(renew);
 					if (this.closed) return;
 					try {
-						this.db.run("DELETE FROM leases WHERE key=? AND token=?", [key, token]);
+						db.run("DELETE FROM leases WHERE key=? AND token=?", [key, token]);
 					} catch {
 						/* already closed */
 					}
@@ -159,14 +177,15 @@ export class GlobalLimiter {
 	async pace(key: string, intervalMs: number, options: LimiterOptions = {}): Promise<void> {
 		if (this.closed) throw new Error("Limiter is closed");
 		if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
-		const slot = this.db
+		const db = this.open();
+		const slot = db
 			.transaction(() => {
 				const now = this.clock();
-				const row = this.db.query("SELECT next_allowed FROM pacing WHERE key=?").get(key) as {
+				const row = db.query("SELECT next_allowed FROM pacing WHERE key=?").get(key) as {
 					next_allowed: number;
 				} | null;
 				const at = Math.max(now, row?.next_allowed ?? 0);
-				this.db.run(
+				db.run(
 					"INSERT INTO pacing(key,next_allowed) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET next_allowed=excluded.next_allowed",
 					[key, at + Math.floor(intervalMs)]
 				);
@@ -179,6 +198,7 @@ export class GlobalLimiter {
 
 	/** Observable limiter state, for diagnostics only. */
 	state(key: string): LimiterState {
+		if (!this.db) return { key, active: 0, nextAllowedAt: null };
 		const now = this.clock();
 		const active = (
 			this.db
@@ -194,12 +214,15 @@ export class GlobalLimiter {
 	/** Release every lease this process still holds; safe after a partial failure. */
 	close(): void {
 		if (this.closed) return;
+		this.closed = true;
+		const db = this.db;
+		this.db = null;
+		if (!db) return;
 		try {
-			this.db.run("DELETE FROM leases WHERE token LIKE ?", [`${this.token}:%`]);
-			this.db.close();
+			db.run("DELETE FROM leases WHERE token LIKE ?", [`${this.token}:%`]);
+			db.close();
 		} catch {
 			/* closing a closed database is not an error worth surfacing */
 		}
-		this.closed = true;
 	}
 }

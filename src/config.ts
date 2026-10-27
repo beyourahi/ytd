@@ -30,6 +30,43 @@ export const DEFAULTS = {
 	retryDelayMs: 4000
 };
 
+export interface ConcurrencySettings {
+	/** Concurrent YouTube fetches inside this process. Shared with other sessions by the limiter. */
+	fetch: number;
+	/** Concurrent extraction+glean jobs. Bounded low because each one spends provider quota. */
+	extract: number;
+	/** Concurrent local transcription jobs. */
+	transcribe: number;
+	/** Minimum spacing between YouTube request starts, shared across every active session. */
+	fetchPacingMs: number;
+	/** Attempts allowed per unit of work before it is blocked. */
+	maxAttempts: number;
+	/** Base delay for the jittered exponential retry backoff. */
+	retryDelayMs: number;
+	/** Videos above which progress is aggregated instead of one line per video. */
+	progressThreshold: number;
+	/** How often aggregate progress may be rendered. */
+	progressIntervalMs: number;
+	/** Age at which an abandoned work claim may be reclaimed by anyone. */
+	leaseMs: number;
+}
+
+/**
+ * Concurrency defaults, chosen to be conservative rather than maximal: higher is not
+ * automatically faster, and YouTube pacing plus provider quotas are the real ceilings.
+ */
+export const CONCURRENCY: ConcurrencySettings = {
+	fetch: 4,
+	extract: 2,
+	transcribe: 2,
+	fetchPacingMs: 1000,
+	maxAttempts: DEFAULTS.retryRounds,
+	retryDelayMs: DEFAULTS.retryDelayMs,
+	progressThreshold: 10,
+	progressIntervalMs: 2000,
+	leaseMs: 60_000
+};
+
 /**
  * yt-dlp 2026+ needs a JavaScript runtime to extract YouTube's player (and thus
  * caption tracks). deno is its default; Rahi has node via nvm (not on the bare PATH),

@@ -19,6 +19,7 @@ import {
 	type CustomAdapter,
 	type ModelSuggestion
 } from "./agents.ts";
+import type { ConcurrencySettings } from "./config.ts";
 import {
 	opencodeOnboarding,
 	providerGroups,
@@ -144,6 +145,22 @@ export interface CliArgs {
 	effort?: string;
 	contextTokens?: number;
 	timeoutMs?: number;
+	fetchConcurrency?: number;
+	extractConcurrency?: number;
+	fetchPacingMs?: number;
+	maxAttempts?: number;
+	perf?: boolean;
+	verbose?: boolean;
+}
+
+/** Operational controls for one run. Defaults come from CONCURRENCY and stay conservative. */
+export interface RunSettings {
+	replaceRouting: boolean;
+	concurrency: Partial<ConcurrencySettings>;
+	/** Print the measured performance report when the run ends. */
+	perf: boolean;
+	/** Narrate every video instead of aggregating progress on large runs. */
+	verbose: boolean;
 }
 export function parseArgs(argv: string[]): CliArgs {
 	const out: CliArgs = { command: "run" };
@@ -163,24 +180,63 @@ export function parseArgs(argv: string[]): CliArgs {
 		}
 		if (arg.startsWith("--")) {
 			const [flag, inline] = arg.split(/=(.*)/s);
-			const keys: Record<string, "agent" | "model" | "effort" | "contextTokens" | "timeoutMs"> = {
+			const booleans: Record<string, "perf" | "verbose"> = {
+				"--perf": "perf",
+				"--verbose": "verbose"
+			};
+			const boolKey = booleans[flag];
+			if (boolKey) {
+				if (inline !== undefined) throw new Error(`${flag} does not take a value`);
+				if (out[boolKey]) throw new Error(`${flag} was supplied more than once`);
+				out[boolKey] = true;
+				continue;
+			}
+			// Numeric and textual flags are mapped separately so each assignment has one type.
+			const numeric: Record<
+				string,
+				| "contextTokens"
+				| "timeoutMs"
+				| "fetchConcurrency"
+				| "extractConcurrency"
+				| "fetchPacingMs"
+				| "maxAttempts"
+			> = {
+				"--context-tokens": "contextTokens",
+				"--timeout-ms": "timeoutMs",
+				"--fetch-concurrency": "fetchConcurrency",
+				"--extract-concurrency": "extractConcurrency",
+				"--fetch-pacing-ms": "fetchPacingMs",
+				"--max-attempts": "maxAttempts"
+			};
+			const textual: Record<string, "agent" | "model" | "effort"> = {
 				"--agent": "agent",
 				"--model": "model",
-				"--effort": "effort",
-				"--context-tokens": "contextTokens",
-				"--timeout-ms": "timeoutMs"
+				"--effort": "effort"
 			};
-			const key = keys[flag];
-			if (!key) throw new Error(`Unknown argument: ${flag}`);
+			const ranges: Record<string, [number, number]> = {
+				contextTokens: [4096, Number.MAX_SAFE_INTEGER],
+				timeoutMs: [1, Number.MAX_SAFE_INTEGER],
+				fetchConcurrency: [1, 64],
+				extractConcurrency: [1, 32],
+				fetchPacingMs: [0, 600_000],
+				maxAttempts: [1, 10]
+			};
+			const numericKey = numeric[flag];
+			const textualKey = textual[flag];
+			if (!numericKey && !textualKey) throw new Error(`Unknown argument: ${flag}`);
 			const value = inline ?? args[++i];
 			if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
-			if (out[key] !== undefined) throw new Error(`${flag} was supplied more than once`);
-			if (key === "contextTokens" || key === "timeoutMs") {
+			const duplicate = (lookup: keyof CliArgs) => out[lookup] !== undefined;
+			if (numericKey) {
+				if (duplicate(numericKey)) throw new Error(`${flag} was supplied more than once`);
+				const [min, max] = ranges[numericKey]!;
 				const n = Number(value);
-				if (!Number.isSafeInteger(n) || n < (key === "contextTokens" ? 4096 : 1))
-					throw new Error(`Invalid ${flag}`);
-				out[key] = n;
-			} else out[key] = value;
+				if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`Invalid ${flag}`);
+				out[numericKey] = n;
+			} else if (textualKey) {
+				if (duplicate(textualKey)) throw new Error(`${flag} was supplied more than once`);
+				out[textualKey] = value;
+			}
 		} else if (!out.url && out.command === "run") out.url = arg;
 		else throw new Error(`Unexpected argument: ${arg}`);
 	}
@@ -525,7 +581,7 @@ async function chooseProfile(
 }
 
 export const USAGE =
-	"Usage: ytd [youtube-url] [--agent NAME --model ID] [--effort LEVEL]\n       ytd settings | ytd agents add\nAdvanced: --context-tokens N --timeout-ms N\nNon-interactive runs require a URL and a saved or explicit agent/model.";
+	"Usage: ytd [youtube-url] [--agent NAME --model ID] [--effort LEVEL]\n       ytd settings | ytd agents add\nAdvanced: --context-tokens N --timeout-ms N --fetch-concurrency N --extract-concurrency N\n          --fetch-pacing-ms N --max-attempts N --perf --verbose\nNon-interactive runs require a URL and a saved or explicit agent/model.";
 
 export async function resolveCli(
 	argv = process.argv.slice(2),
@@ -537,7 +593,12 @@ export async function resolveCli(
 		installed?: (name: string) => boolean;
 		onboarding?: OpencodeOnboarding;
 	} = {}
-): Promise<{ url: string; profile: AgentProfile; replaceRouting: boolean } | null> {
+): Promise<{
+	url: string;
+	profile: AgentProfile;
+	replaceRouting: boolean;
+	run: RunSettings;
+} | null> {
 	const args = parseArgs(argv);
 	if (args.command === "help") {
 		console.log(USAGE);
@@ -641,5 +702,20 @@ export async function resolveCli(
 		console.log(`Saved ${profile.agent} / ${profile.model}`);
 		return null;
 	}
-	return { url: url!.trim(), profile, replaceRouting };
+	return {
+		url: url!.trim(),
+		profile,
+		replaceRouting,
+		run: {
+			replaceRouting,
+			concurrency: {
+				...(args.fetchConcurrency !== undefined ? { fetch: args.fetchConcurrency } : {}),
+				...(args.extractConcurrency !== undefined ? { extract: args.extractConcurrency } : {}),
+				...(args.fetchPacingMs !== undefined ? { fetchPacingMs: args.fetchPacingMs } : {}),
+				...(args.maxAttempts !== undefined ? { maxAttempts: args.maxAttempts } : {})
+			},
+			perf: args.perf ?? false,
+			verbose: args.verbose ?? false
+		}
+	};
 }

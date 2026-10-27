@@ -190,6 +190,12 @@ export class Metrics {
 		}
 	}
 
+	/** Current total for one counter, without building a whole snapshot. */
+	counterValue(key: string): number {
+		const safe = safeKey("counter", key);
+		return safe ? (this.counterTotals.get(safe) ?? 0) : 0;
+	}
+
 	counter(key: string, delta = 1): void {
 		const safe = safeKey("counter", key);
 		if (!safe) {

@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, DEFAULTS, type Room } from "./config.ts";
+import { CONCURRENCY, DATA_DIR, type ConcurrencySettings, type Room } from "./config.ts";
 import { Manifest, stableHash, type VideoRow } from "./manifest.ts";
 import { canonicalSource, enumerate, type VideoItem } from "./enumerate.ts";
-import { fetchTranscript, transcriptPath } from "./fetch.ts";
-import { mapBatch, reduce, type ReduceOutput, type SourceHalalNote } from "./distill.ts";
+import { reduce, type ReduceOutput, type SourceHalalNote } from "./distill.ts";
+import { Metrics, formatReport } from "./metrics.ts";
+import { GlobalLimiter } from "./limits.ts";
+import { runIngestPipeline } from "./pipeline.ts";
+import { formatProgress, shouldAggregate } from "./progress.ts";
 import {
 	loadPalaceSnapshot,
 	publishBatch,
@@ -15,7 +17,7 @@ import {
 	type PublicationReceipt
 } from "./palace.ts";
 import { preflight, type AgentProfile } from "./agents.ts";
-import { resolveCli } from "./settings.ts";
+import { resolveCli, type RunSettings } from "./settings.ts";
 
 interface PublicationPlan {
 	channel: string;
@@ -37,33 +39,6 @@ export function withoutPublishedBlocks(text: string, receipts: PublicationReceip
 		if (start >= 0 && end >= 0) text = text.slice(0, start) + text.slice(end + endMarker.length);
 	}
 	return text;
-}
-
-async function fetchInto(
-	manifest: Manifest,
-	slug: string,
-	rows: VideoRow[],
-	aliases: string[],
-	signal: AbortSignal
-): Promise<void> {
-	for (const [i, row] of rows.entries()) {
-		console.log(`Fetch ${i + 1}/${rows.length}: ${row.id}`);
-		const result = await fetchTranscript(slug, row.id, { aliases, signal });
-		if (result.metadata)
-			manifest.addVideos([
-				{
-					id: row.id,
-					title: result.metadata.title,
-					channel: result.metadata.creator !== "unknown" ? result.metadata.creator : undefined,
-					channelUrl: result.metadata.creatorUrl
-				}
-			]);
-		manifest.setStatus(
-			row.id,
-			result.ok ? "fetched" : result.reason === "no_captions" ? "no_captions" : "failed",
-			result.ok ? null : (result.reason ?? "fetch_failed")
-		);
-	}
 }
 
 function scopeRows(manifest: Manifest, ids: Set<string>): VideoRow[] {
@@ -315,15 +290,20 @@ async function publishCreatorAttempt(
 	return plan.receipts;
 }
 
-async function ingest(
+export async function ingest(
 	url: string,
 	profile: AgentProfile,
 	signal: AbortSignal,
-	replaceRouting = false
+	run: RunSettings
 ): Promise<void> {
 	const source = canonicalSource(url);
 	if (!Bun.which("yt-dlp", { PATH: process.env.PATH }))
 		throw new Error("yt-dlp not found. Install separately with: uv tool install yt-dlp");
+	const settings: ConcurrencySettings = { ...CONCURRENCY, ...run.concurrency };
+	const metrics = new Metrics();
+	const limiter = new GlobalLimiter();
+	const verbose = run.verbose;
+	let replaceRouting = run.replaceRouting;
 	const selected = await preflight(profile);
 	console.log(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
@@ -388,49 +368,30 @@ async function ingest(
 				);
 			const scoped = () => scopeRows(manifest!, ids);
 			if (!publishing) {
-				await fetchInto(
+				// Fetching and extraction run as one bounded, pipelined stage: extraction starts as
+				// soon as a source is ready, instead of after the whole channel has downloaded.
+				const aggregate = shouldAggregate(scoped().length, settings.progressThreshold);
+				const result = await runIngestPipeline({
 					manifest,
-					listing.slug,
-					scoped().filter((row) => row.status === "pending"),
-					listing.aliases,
-					signal
-				);
-				for (let round = 1; round <= DEFAULTS.retryRounds; round++) {
-					const failed = scoped().filter((row) => row.status === "failed");
-					if (!failed.length) break;
-					signal.throwIfAborted();
-					console.log(`Retry ${round}/${DEFAULTS.retryRounds}: ${failed.length} videos…`);
-					await Bun.sleep(DEFAULTS.retryDelayMs);
-					signal.throwIfAborted();
-					await fetchInto(manifest, listing.slug, failed, listing.aliases, signal);
-				}
-				for (const row of scoped().filter((item) => item.status === "fetched")) {
-					signal.throwIfAborted();
-					const path = transcriptPath(row.id);
-					if (!existsSync(path)) {
-						// A legacy fetched row can reuse its preserved cache without a network request.
-						const result = await fetchTranscript(listing.slug, row.id, {
-							aliases: listing.aliases,
-							signal
-						});
-						if (!result.ok) {
-							manifest.setStatus(row.id, "failed", result.reason ?? "cache_missing");
-							continue;
-						}
-					}
-					console.log(`Extract and glean ${row.id}…`);
-					const result = await mapBatch(
-						[{ id: row.id, title: row.title || row.id, text: readFileSync(path, "utf8") }],
-						{ profile: selected, manifest, signal }
+					slug: listing.slug,
+					aliases: listing.aliases,
+					profile: selected,
+					scope: () => scoped(),
+					signal,
+					metrics,
+					limiter,
+					concurrency: settings,
+					titles: new Map(scoped().map((row) => [row.id, row.title || row.id])),
+					onProgress: aggregate ? (progress) => console.log(formatProgress(progress)) : undefined,
+					log: aggregate && !verbose ? null : (line) => console.log(line)
+				});
+				for (const entry of result.blocked)
+					console.log(`Blocked ${entry.id} (${entry.stage}): ${entry.reason ?? "unknown reason"}`);
+				if (result.blocked.length) process.exitCode = 1;
+				if (result.incomplete.length)
+					throw new Error(
+						`Extraction remains incomplete for ${result.incomplete.length} source(s); progress preserved.`
 					);
-					if (result.limited)
-						throw new Error(
-							"Agent usage limit reached; progress saved. Re-run later with the same selection."
-						);
-					if (result.error) throw new Error(result.error);
-				}
-				if (scoped().some((row) => row.status === "fetched"))
-					throw new Error("Extraction remains incomplete; progress preserved.");
 			}
 			for (const [key, rows] of creatorGroups(scoped().filter((row) => row.status === "distilled")))
 				receipts.push(...(await publishCreator(manifest, selected, key, rows, source, signal)));
@@ -466,7 +427,12 @@ async function ingest(
 			try {
 				release?.();
 			} finally {
-				manifest?.close();
+				try {
+					limiter.close();
+				} finally {
+					manifest?.close();
+					if (run.perf) for (const line of formatReport(metrics.snapshot())) console.log(line);
+				}
 			}
 		}
 	}
@@ -480,7 +446,7 @@ export async function main(): Promise<void> {
 	process.on("SIGINT", cancel);
 	process.on("SIGTERM", cancel);
 	try {
-		await ingest(selection.url, selection.profile, controller.signal, selection.replaceRouting);
+		await ingest(selection.url, selection.profile, controller.signal, selection.run);
 	} finally {
 		process.off("SIGINT", cancel);
 		process.off("SIGTERM", cancel);
