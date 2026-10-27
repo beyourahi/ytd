@@ -5,6 +5,13 @@ import { RUN_DIR, ROOMS } from "./config.ts";
 import { stableHash, type Manifest } from "./manifest.ts";
 import type { Metrics, Stage } from "./metrics.ts";
 
+/**
+ * The conservative context window used when a model reports none. Unknown context must stay
+ * pessimistic, and this is the single source of that number: the budget below and the summary
+ * shown before a run both read it.
+ */
+export const DEFAULT_CONTEXT_TOKENS = 8192;
+
 /** Each labelled model call maps to the pipeline stage it belongs to, for honest timing. */
 const LABEL_STAGE: Record<string, Stage> = {
 	extract: "extract",
@@ -214,7 +221,7 @@ function noteIndex(shards: { path: string; text: string }[]): Set<string> {
 }
 /** UTF-8 bytes upper-bound input tokens; reserve output plus protocol overhead for unknown tokenizers. */
 export function promptBudget(profile: AgentProfile): number {
-	const context = profile.contextTokens ?? 8192;
+	const context = profile.contextTokens ?? DEFAULT_CONTEXT_TOKENS;
 	if (!Number.isSafeInteger(context) || context < 4096)
 		throw new Error("Context window must be at least 4096 tokens");
 	return context - Math.max(2048, Math.floor(context / 4)) - 512;

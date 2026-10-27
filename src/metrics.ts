@@ -130,15 +130,23 @@ export class Metrics {
 	private stageSeries = new Map<string, StageSeries>();
 	private counterTotals = new Map<string, number>();
 	private eventTotals = new Map<string, number>();
-	private started = performance.now();
+	private started: number;
 	private samples = 0;
 	private peakRssMb = 0;
 	private lastRssMb = 0;
 	/** Rejected keys are counted, not stored — a silent guard against leaking source text. */
 	rejectedKeys = 0;
 
+	/**
+	 * `now` is the monotonic clock. It is injectable so a test can drive a whole session
+	 * deterministically, and defaults to `performance.now()` everywhere else.
+	 */
+	constructor(private readonly clock: () => number = () => performance.now()) {
+		this.started = clock();
+	}
+
 	now(): number {
-		return performance.now();
+		return this.clock();
 	}
 
 	elapsedMs(): number {
@@ -316,4 +324,43 @@ export function formatReport(snapshot: MetricsSnapshot): string[] {
 	);
 	if (snapshot.rejectedKeys) lines.push(`  (${snapshot.rejectedKeys} unsafe metric keys dropped)`);
 	return lines;
+}
+
+/**
+ * Session runtime.
+ *
+ * One wall-clock measurement per invocation, from the moment the last interactive input was
+ * accepted until automatic processing and its cleanup have finished. Stage totals are not
+ * additive and never stand in for it: parallel stages overlap, and the report says so.
+ */
+
+/** `HH:MM:SS`, with the hour field growing past 24 instead of wrapping at a day. */
+export function formatClock(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	const seconds = total % 60;
+	const minutes = Math.floor(total / 60) % 60;
+	const hours = Math.floor(total / 3600);
+	return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+/** The same measurement in words: milliseconds, seconds, minutes, hours, or days. */
+export function formatDuration(ms: number): string {
+	const safe = Math.max(0, ms);
+	if (safe < 1000) return `${Math.round(safe)}ms`;
+	const total = Math.floor(safe / 1000);
+	if (total < 60) return `${total}s`;
+	const minutes = Math.floor(total / 60);
+	const seconds = total % 60;
+	if (minutes < 60) return `${minutes}m ${seconds}s`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ${minutes % 60}m`;
+	return `${Math.floor(hours / 24)}d ${hours % 24}h ${minutes % 60}m`;
+}
+
+/**
+ * The one line that closes every started session, in a fixed shape so it can be read and
+ * compared mechanically:  `Total runtime: 00:12:34 (12m 34s)`.
+ */
+export function formatTotalRuntime(ms: number): string {
+	return `Total runtime: ${formatClock(ms)} (${formatDuration(ms)})`;
 }

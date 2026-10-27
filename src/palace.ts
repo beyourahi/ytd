@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { PALACE_DIR, ROOMS, RUN_DIR, type Room } from "./config.ts";
 import type { ReducedPrinciple } from "./distill.ts";
 import { runCommand } from "./process.ts";
+import { createPresenter } from "./ui.ts";
 
 export interface RenderInput {
 	room: Room;
@@ -477,7 +478,10 @@ export async function publishBatch(
 
 if (import.meta.main && process.argv[2] === "--append-transaction") {
 	appendTransaction(process.argv[3]).catch((error: unknown) => {
-		console.error(error instanceof Error ? error.message : String(error));
+		// This child's stderr is never parsed for meaning — the caller classifies races from
+		// canonical Git state, not from error prose — so it is displayed through the same
+		// sanitising surface as every other diagnostic instead of reaching the terminal raw.
+		createPresenter().fail(error instanceof Error ? error.message : String(error));
 		process.exitCode = 1;
 	});
 }

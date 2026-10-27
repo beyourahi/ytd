@@ -29,6 +29,7 @@ import {
 	type OpencodeOnboarding,
 	type OpencodeProvider
 } from "./opencode.ts";
+import { Presenter, createPresenter, oneLine } from "./ui.ts";
 
 export const SETTINGS_PATH = join(homedir(), ".ytd/config.json");
 export interface Settings {
@@ -287,7 +288,7 @@ export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile
 	return profile;
 }
 
-type Choice = { value: string; label: string; hint?: string; disabled?: boolean };
+export type Choice = { value: string; label: string; hint?: string; disabled?: boolean };
 export interface Picker {
 	text(message: string, initial?: string): Promise<string>;
 	select(
@@ -306,6 +307,23 @@ function checked<T>(value: T | symbol): T {
 	if (prompts.isCancel(value)) throw new Cancelled();
 	return value as T;
 }
+
+/**
+ * Make picker display text safe to draw.
+ *
+ * A label or a hint is built from something outside this process — an agent's own provider list,
+ * a model catalog, a trusted adapter's name — so it is printed as text and never allowed to move
+ * the cursor or clear the screen. A long label is bounded rather than allowed to wrap the menu
+ * into unreadability on a small terminal. The value is returned untouched: it is what gets
+ * selected, saved and searched, so shortening it would change the run.
+ */
+export function displayChoices(choices: Choice[]): Choice[] {
+	return choices.map((choice) => ({
+		...choice,
+		label: oneLine(choice.label, 100),
+		...(choice.hint === undefined ? {} : { hint: oneLine(choice.hint, 200) })
+	}));
+}
 const picker: Picker = {
 	async text(message, initial) {
 		return checked<string>(
@@ -318,10 +336,11 @@ const picker: Picker = {
 	},
 	async select(message, options, initialValue, searchable = false) {
 		const maxItems = Math.max(2, Math.min(8, (process.stdout.rows ?? 24) - 8));
+		const shown = displayChoices(options);
 		return checked<string>(
 			await (searchable
-				? prompts.autocomplete({ message, options, initialValue, maxItems })
-				: prompts.select({ message, options, initialValue, maxItems }))
+				? prompts.autocomplete({ message, options: shown, initialValue, maxItems })
+				: prompts.select({ message, options: shown, initialValue, maxItems }))
 		);
 	}
 };
@@ -352,7 +371,8 @@ const connectedNames = (providers: OpencodeProvider[]) =>
 
 /** Reads OpenCode's providers; a failed read is reported, never treated as "none connected". */
 async function inspectProviders(
-	onboarding: OpencodeOnboarding
+	onboarding: OpencodeOnboarding,
+	present: Presenter
 ): Promise<OpencodeProvider[] | undefined> {
 	let inspection: OpencodeInspection;
 	try {
@@ -361,11 +381,11 @@ async function inspectProviders(
 		inspection = { standalone: false, error: (error as Error).message };
 	}
 	if (!inspection.providers) {
-		console.log(`OpenCode: ${inspection.error ?? "providers are unavailable"}.`);
+		present.line(`OpenCode: ${inspection.error ?? "providers are unavailable"}.`);
 		return undefined;
 	}
 	if (inspection.providers.some((provider) => provider.connected))
-		console.log(`OpenCode providers: ${connectedNames(inspection.providers)}.`);
+		present.line(`OpenCode providers: ${connectedNames(inspection.providers)}.`);
 	return inspection.providers;
 }
 
@@ -375,22 +395,23 @@ async function inspectProviders(
  * saved until a selection completes.
  */
 async function connectProvider(
-	onboarding: OpencodeOnboarding
+	onboarding: OpencodeOnboarding,
+	present: Presenter
 ): Promise<OpencodeProvider[] | undefined> {
 	let code: number;
 	try {
 		code = await onboarding.login();
 	} catch (error) {
-		console.log(`OpenCode: login could not start: ${(error as Error).message}.`);
+		present.line(`OpenCode: login could not start: ${(error as Error).message}.`);
 		code = 1;
 	}
-	const providers = await inspectProviders(onboarding);
+	const providers = await inspectProviders(onboarding, present);
 	if (code !== 0)
-		console.log(
+		present.line(
 			"OpenCode: login did not complete; saved settings are unchanged. Connect later with: opencode auth login"
 		);
 	else if (providers && !providers.some((provider) => provider.connected))
-		console.log(
+		present.line(
 			"OpenCode: login finished without a connected provider; saved settings are unchanged."
 		);
 	return providers;
@@ -399,9 +420,10 @@ async function connectProvider(
 /** Shows connected providers and, when none is connected, offers OpenCode's own login. */
 async function prepareOpencode(
 	ui: Picker,
-	onboarding: OpencodeOnboarding
+	onboarding: OpencodeOnboarding,
+	present: Presenter
 ): Promise<OpencodeProvider[] | undefined> {
-	const providers = await inspectProviders(onboarding);
+	const providers = await inspectProviders(onboarding, present);
 	if (!providers || providers.some((provider) => provider.connected)) return providers;
 	const action = await ui.select(
 		"No OpenCode provider is connected",
@@ -415,8 +437,8 @@ async function prepareOpencode(
 		],
 		"login"
 	);
-	if (action === "login") return connectProvider(onboarding);
-	console.log("OpenCode: no provider connected. Connect one with: opencode auth login");
+	if (action === "login") return connectProvider(onboarding, present);
+	present.line("OpenCode: no provider connected. Connect one with: opencode auth login");
 	return providers;
 }
 
@@ -425,20 +447,42 @@ async function chooseProfile(
 	ui: Picker,
 	models: typeof discoverModels,
 	installed: (name: string) => boolean,
-	onboarding: OpencodeOnboarding = opencodeOnboarding
+	onboarding: OpencodeOnboarding = opencodeOnboarding,
+	present: Presenter = createPresenter()
 ): Promise<AgentProfile> {
+	const names = [...BUILT_INS, ...Object.keys(config.adapters)];
+	const readyNames = new Set(
+		names.filter((value) => installed(config.adapters[value]?.executable ?? value))
+	);
+	const savedAgent = names.find(
+		(value) => readyNames.has(value) && value === config.selected?.agent
+	);
+	// A configuration with no saved agent starts on OpenCode when it is installed, without
+	// overriding a saved preference, connecting anything, or choosing a model on the user's
+	// behalf: every other installed adapter stays one keystroke away.
+	const defaultAgent =
+		savedAgent ?? [...readyNames].find((value) => value === "opencode") ?? [...readyNames][0];
 	// Clack draws no hint for disabled rows and may start on one, so name the state in the label
-	// and start on an installed agent.
-	const agents = [...BUILT_INS, ...Object.keys(config.adapters)]
+	// and start on an installed agent. Installed rows say whether they are simply available, the
+	// saved choice, or the one the cursor starts on.
+	const agents = names
 		.map((value) => {
-			const ready = installed(config.adapters[value]?.executable ?? value);
-			return ready
-				? {
-						value,
-						label: value,
-						hint: config.adapters[value] ? "trusted wrapper" : "headless"
-					}
-				: { value, label: `${value} (not installed)`, disabled: true };
+			if (!readyNames.has(value))
+				return { value, label: `${value} (not installed)`, disabled: true };
+			const state =
+				value === savedAgent ? "saved" : value === defaultAgent ? "preferred" : undefined;
+			return {
+				value,
+				// An adapter name is a file's own text: it is displayed, never allowed to drive the
+				// terminal. The value stays exact, because it is what gets saved and re-searched.
+				label: oneLine(value, 60),
+				hint: oneLine(
+					[config.adapters[value] ? "trusted wrapper" : "headless", state]
+						.filter(Boolean)
+						.join(" \u00b7 "),
+					80
+				)
+			};
 		})
 		.sort((a, b) => Number(Boolean(a.disabled)) - Number(Boolean(b.disabled)));
 	const ready = agents.filter((choice) => !choice.disabled);
@@ -446,18 +490,13 @@ async function chooseProfile(
 		throw new Error(
 			"No installed agents found. Configure one separately or add a trusted wrapper with ytd agents add."
 		);
-	const saved = ready.find((choice) => choice.value === config.selected?.agent);
-	// A configuration with no saved agent starts on OpenCode when it is installed, without
-	// overriding a saved preference, connecting anything, or choosing a model on the user's
-	// behalf: every other installed adapter stays one keystroke away.
-	const preferred = ready.find((choice) => choice.value === "opencode") ?? ready[0];
-	const agent = await ui.select("Agent", agents, (saved ?? preferred).value, true);
+	const agent = await ui.select("Agent", agents, (defaultAgent ?? ready[0]!.value) as string, true);
 	if (!ready.some((choice) => choice.value === agent))
 		throw new Error(
 			agent ? `${agent} is not installed; no agent was selected` : "No installed agent was selected"
 		);
 	// OpenCode lists models only for connected providers, so it is prepared before discovery.
-	let providers = agent === "opencode" ? await prepareOpencode(ui, onboarding) : undefined;
+	let providers = agent === "opencode" ? await prepareOpencode(ui, onboarding, present) : undefined;
 	let suggestions = await models(agent);
 	const recent = config.recent.filter((p) => p.agent === agent);
 	const merged = () =>
@@ -497,6 +536,14 @@ async function chooseProfile(
 		const options = [...unique.values()].filter(
 			(option) => !provider || providerOf(option.id) === provider
 		);
+		// An empty list is a state worth naming: it means nothing was reported or nothing is
+		// connected, not that the agent has no models. Exact entry and refresh stay available.
+		if (!options.length)
+			present.line(
+				agent === "opencode"
+					? "No models are listed for this provider. Enter an exact model ID, connect another provider, or refresh the catalog."
+					: `No model suggestions were reported by ${agent}. Enter an exact model ID.`
+			);
 		const savedModel = config.selected?.agent === agent ? config.selected.model : undefined;
 		const modelChoice = await ui.select(
 			"Model",
@@ -546,8 +593,8 @@ async function chooseProfile(
 		if (modelChoice === "__refresh__" || modelChoice === "__connect__") {
 			providers =
 				modelChoice === "__connect__"
-					? await connectProvider(onboarding)
-					: await inspectProviders(onboarding);
+					? await connectProvider(onboarding, present)
+					: await inspectProviders(onboarding, present);
 			suggestions = await models(agent);
 			continue;
 		}
@@ -566,7 +613,10 @@ async function chooseProfile(
 					"Effort",
 					[
 						{ value: "__default__", label: "Use configured agent default" },
-						...(variants ?? EFFORTS[agent] ?? []).map((value) => ({ value, label: value })),
+						...(variants ?? EFFORTS[agent] ?? []).map((value) => ({
+							value,
+							label: oneLine(value, 40)
+						})),
 						{ value: "__exact__", label: "Enter exact effort/variant" }
 					],
 					"__default__"
@@ -608,6 +658,7 @@ export async function resolveCli(
 		models?: typeof discoverModels;
 		installed?: (name: string) => boolean;
 		onboarding?: OpencodeOnboarding;
+		present?: Presenter;
 	} = {}
 ): Promise<{
 	url: string;
@@ -629,6 +680,7 @@ export async function resolveCli(
 	const installed =
 		options.installed ?? ((name: string) => Boolean(Bun.which(name, { PATH: process.env.PATH })));
 	const onboarding = options.onboarding ?? opencodeOnboarding;
+	const present = options.present ?? createPresenter();
 	prompts.updateSettings({
 		withGuide: false,
 		accessible: Boolean(process.env.NO_COLOR || process.env.TERM === "dumb")
@@ -636,6 +688,15 @@ export async function resolveCli(
 	if (args.command !== "run" && !interactive)
 		throw new Error(
 			"Settings and adapter setup require an interactive terminal; config.json remains unchanged."
+		);
+	// Orientation before the first prompt, and nothing more: a person should know what the menus
+	// below are for. It is skipped entirely when output is redirected or unstyled.
+	if (interactive && args.command !== "add")
+		present.header(
+			"ytd \u2014 YouTube to verified field notes",
+			args.command === "settings"
+				? "Choose the agent, model and effort to remember for future runs."
+				: "Choose the agent and model for this run, then the source to ingest."
 		);
 	if (args.command === "add") {
 		const name = (await ui.text("Adapter name")).trim();
@@ -671,7 +732,7 @@ export async function resolveCli(
 		args.contextTokens !== undefined ||
 		args.timeoutMs !== undefined;
 	if (args.command === "settings")
-		profile = await chooseProfile(config, ui, models, installed, onboarding);
+		profile = await chooseProfile(config, ui, models, installed, onboarding, present);
 	else {
 		try {
 			profile = profileFromArgs(args, config);
@@ -694,7 +755,7 @@ export async function resolveCli(
 			if (action === "change") profile = undefined;
 		}
 		if (!profile) {
-			profile = await chooseProfile(config, ui, models, installed, onboarding);
+			profile = await chooseProfile(config, ui, models, installed, onboarding, present);
 			replaceRouting = true;
 		}
 	}
@@ -715,7 +776,7 @@ export async function resolveCli(
 		saveSettings(config, options.path);
 	}
 	if (args.command === "settings") {
-		console.log(`Saved ${profile.agent} / ${profile.model}`);
+		present.stage("ok", `Saved ${profile.agent} / ${profile.model}`);
 		return null;
 	}
 	return {

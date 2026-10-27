@@ -7,7 +7,10 @@ import { normalisePrinciple } from "../src/distill.ts";
 import { discoverStream } from "../src/enumerate.ts";
 import { json3ToText } from "../src/fetch.ts";
 import { Manifest } from "../src/manifest.ts";
+import type { PipelineProgress } from "../src/pipeline.ts";
+import { progressSegments } from "../src/progress.ts";
 import { runCommand } from "../src/process.ts";
+import { Presenter } from "../src/ui.ts";
 
 /**
  * Deterministic benchmarks over synthetic workloads.
@@ -289,6 +292,83 @@ function benchCaptionParse(tracks: number): void {
 	return;
 }
 
+/**
+ * Startup of a real, non-interactive invocation: the whole module graph plus argument parsing,
+ * with no ingestion. `--help` is the cheapest honest stand-in for what a command costs before it
+ * does anything.
+ */
+async function benchStartup(): Promise<void> {
+	const cli = join(import.meta.dir, "..", "src", "cli.ts");
+	for (let i = 0; i < REPEATS; i++) {
+		const started = performance.now();
+		const result = await runCommand([process.execPath, cli, "--help"], { timeoutMs: 60_000 });
+		if (result.code !== 0) throw new Error(`ytd --help exited ${result.code}`);
+		record("startup: ytd --help", 1, started, `${result.stdout.split("\n").length} lines of usage`);
+	}
+}
+
+/**
+ * Presentation overhead, measured through controlled streams.
+ *
+ * The renderer is optional, so its cost is shown rather than asserted. Both columns render the
+ * identical progress line for the identical counts: one writes to a counting sink as a redirected
+ * log does, the other to a styled fake terminal that also trims the line to its width. The
+ * difference between them is what the styling itself costs per line.
+ */
+function benchPresentation(lines: number): void {
+	const view = { phase: "Fetching", discovering: true, discovered: 3_420, totalKnown: false };
+	const sample = (index: number): PipelineProgress => ({
+		total: 10_000,
+		fetched: index,
+		noCaptions: 3,
+		distilled: index,
+		failed: 1,
+		blocked: 2,
+		retries: 4,
+		activeFetchers: 3,
+		activeExtractors: 2,
+		queuedFetch: 60,
+		queuedExtract: 55,
+		aiCalls: 300,
+		elapsedMs: 120_000
+	});
+	const render = (styled: boolean): { ms: number; chars: number; writes: number } => {
+		let chars = 0;
+		let writes = 0;
+		const present = new Presenter(
+			{ styled, color: styled, unicode: styled, width: 100 },
+			{
+				out: (line) => {
+					writes++;
+					chars += line.length;
+				},
+				err: () => {}
+			}
+		);
+		const started = performance.now();
+		for (let index = 0; index < lines; index++)
+			present.progress(progressSegments(sample(index), view));
+		return { ms: performance.now() - started, chars, writes };
+	};
+	const plain = render(false);
+	const styled = render(true);
+	const perLine = (ms: number): string => `${((ms * 1000) / lines).toFixed(2)}µs/line`;
+	record("ui: plain progress line", lines, performance.now() - plain.ms, perLine(plain.ms));
+	record(
+		"ui: styled progress line",
+		lines,
+		performance.now() - styled.ms,
+		`${perLine(styled.ms)}, ${styled.chars} chars written`
+	);
+	// Derived, not measured on its own: the difference between the two columns above.
+	record(
+		"ui: styling delta (derived)",
+		lines,
+		performance.now() - (styled.ms - plain.ms),
+		`${((styled.ms - plain.ms) * 1000) / lines >= 0 ? "+" : ""}${(((styled.ms - plain.ms) * 1000) / lines).toFixed(2)}µs/line`
+	);
+}
+
 function fnv(bytes: string): string {
 	let hash = 0xcbf29ce484222325n;
 	for (const byte of Buffer.from(bytes, "utf8")) {
@@ -472,6 +552,8 @@ async function main(): Promise<void> {
 		`platform ${process.platform} ${process.arch} · bun ${Bun.version} · ${navigator.hardwareConcurrency} CPUs`
 	);
 	console.log(`sizes: ${sizes.join(", ")}`);
+	await benchStartup();
+	benchPresentation(10_000);
 	for (const size of sizes) {
 		for (let repeat = 0; repeat < REPEATS; repeat++) {
 			const f = fixture();
@@ -488,6 +570,10 @@ async function main(): Promise<void> {
 	}
 	console.log(`\nMeasured results (best of ${REPEATS} runs per workload)`);
 	for (const workload of [
+		"startup: ytd --help",
+		"ui: plain progress line",
+		"ui: styled progress line",
+		"ui: styling delta (derived)",
 		"listing stub startup",
 		"listing stream + stage",
 		"discovery staging",

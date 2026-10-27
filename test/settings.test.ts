@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { Manifest } from "../src/manifest.ts";
 import {
 	Cancelled,
+	displayChoices,
 	legacyBackupPath,
 	loadSettings,
 	parseArgs,
@@ -931,4 +932,30 @@ test("a custom wrapper named freebuff stays selectable from the command line", (
 	expect(
 		profileFromArgs(parseArgs(["--agent", "freebuff", "--model", "wrapper-model"]), settings)
 	).toEqual({ agent: "freebuff", model: "wrapper-model", custom });
+});
+
+test("picker display text is bounded and inert, while every value stays exact", () => {
+	const id = "provider/very-long-model-name-\u001b[2J\u0007".padEnd(180, "x") + "#max";
+	const choices = displayChoices([
+		{ value: id, label: `Readable name\u001b]0;owned\u0007`.padEnd(400, "y"), hint: id },
+		{ value: "plain", label: "Plain" },
+		{ value: "off", label: "Off", hint: "listed variant", disabled: true }
+	]);
+	// The selection is unchanged: a label is display text, never the thing that is saved.
+	expect(choices.map((choice) => choice.value)).toEqual([id, "plain", "off"]);
+	// Nothing a catalog or an agent reported can reach the terminal as a control sequence.
+	for (const choice of choices) {
+		expect(choice.label).not.toContain("\u001b");
+		expect(choice.label).not.toContain("\u0007");
+		expect(choice.label.length).toBeLessThanOrEqual(100);
+		expect(choice.hint ?? "").not.toContain("\u001b");
+	}
+	// Clean rows are untouched, and a disabled row keeps the state the picker draws.
+	expect(choices[1]).toEqual({ value: "plain", label: "Plain" });
+	expect(choices[2]).toEqual({
+		value: "off",
+		label: "Off",
+		hint: "listed variant",
+		disabled: true
+	});
 });

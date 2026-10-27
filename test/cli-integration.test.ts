@@ -419,6 +419,92 @@ for (const secondUrl of [
 }
 
 test.skipIf(!hasPalacePrerequisite)(
+	"a started ingestion reports exactly one total runtime, as its last output",
+	async () => {
+		const f = createCliFixture();
+		try {
+			const result = await runCommand(f.command, { env: f.env, timeoutMs: 60_000 });
+			expect(result.code).toBe(0);
+			expect(result.stderr).toBe("");
+			const totals = result.stdout.match(/Total runtime: \d{2}:\d{2}:\d{2} \([^)]+\)/g) ?? [];
+			expect(totals).toHaveLength(1);
+			// It closes the session: every diagnostic, including the performance report, precedes it.
+			expect(result.stdout.trim().split("\n").at(-1)).toBe(totals[0]!);
+		} finally {
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	120_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"styled output publishes exactly what plain output publishes and never styles a redirected log",
+	async () => {
+		const plain = createCliFixture();
+		const styled = createCliFixture();
+		try {
+			const plainRun = await runCommand(plain.command, { env: plain.env, timeoutMs: 60_000 });
+			// The same fixture, with the styling a live terminal would get.
+			const styledRun = await runCommand(styled.command, {
+				env: { ...styled.env, YTD_UI: "styled" },
+				timeoutMs: 60_000
+			});
+			expect(plainRun.code).toBe(0);
+			expect(styledRun.code).toBe(0);
+			expect(plainRun.stderr).toBe("");
+			expect(styledRun.stderr).toBe("");
+			// Presentation only: the same rooms, the same notes, the same global ids. Only the
+			// run's own identity marker can differ, since it names the invocation and not the note.
+			const withoutRunMarkers = (text: string): string =>
+				text.replace(/<!-- \/?ytd:ytd-[0-9a-f]+ -->/g, "");
+			for (const room of ["content", "craft"]) {
+				expect(
+					withoutRunMarkers(fixtureGit(styled.remote, "show", `main:${room}/field-notes.md`))
+				).toBe(withoutRunMarkers(fixtureGit(plain.remote, "show", `main:${room}/field-notes.md`)));
+			}
+			expect(publicationReceipts(styled)).toHaveLength(publicationReceipts(plain).length);
+			// Styling adds markers, never information: strip colour and the stage marker and the two
+			// runs say exactly the same thing about what happened. The durations are two different
+			// invocations, so only their format is comparable, not their value.
+			const ESC = String.fromCharCode(27);
+			const readable = (line: string): string =>
+				line
+					.split(ESC)
+					.map((part, index) => (index === 0 ? part : part.slice(part.indexOf("m") + 1)))
+					.join("")
+					.replace(/^[^\w]*\s*/, "");
+			const closing = (text: string): { summary: string; runtime: string; last: string } => {
+				const lines = text
+					.split("\n")
+					.map(readable)
+					.filter((line) => line.length > 0);
+				return {
+					summary: lines.find((line) => line.includes("Complete:")) ?? "",
+					runtime: lines.find((line) => line.startsWith("Total runtime:")) ?? "",
+					last: lines.at(-1) ?? ""
+				};
+			};
+			const plainClosing = closing(plainRun.stdout);
+			const styledClosing = closing(styledRun.stdout);
+			expect(plainClosing.summary).toContain("Complete:");
+			expect(plainClosing.summary).toContain("1 source distilled");
+			expect(styledClosing.summary).toBe(plainClosing.summary);
+			// Exactly one runtime line each, in one format, and it closes the session in both modes.
+			for (const result of [plainClosing, styledClosing]) {
+				expect(result.runtime).toMatch(/^Total runtime: \d{2}:\d{2}:\d{2} \([^)]+\)$/);
+				expect(result.last).toBe(result.runtime);
+			}
+			// A redirected log is never styled, even when the run believes a terminal is watching.
+			expect(plainRun.stdout).not.toContain("\u001b");
+		} finally {
+			rmSync(plain.root, { recursive: true, force: true });
+			rmSync(styled.root, { recursive: true, force: true });
+		}
+	},
+	180_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
 	"waiting CLI cancellation preserves the live owner and crashed-owner recovery reuses extraction",
 	async () => {
 		const f = createCliFixture();
@@ -444,6 +530,8 @@ test.skipIf(!hasPalacePrerequisite)(
 			const cancelled = await second.result;
 			expect(cancelled.code).toBe(1);
 			expect(cancelled.stderr).toContain("Cancelled; progress preserved");
+			// Cancellation after ingestion started is still a session: it reports what it cost.
+			expect(cancelled.stdout).toContain("Total runtime:");
 			expect(first.child.exitCode).toBeNull();
 			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(1);
 			// Abrupt exit leaves real claims; release the owned fake harness so no orphan remains.
@@ -576,6 +664,8 @@ test.skipIf(!hasPalacePrerequisite)(
 			// The failure is reported as what it is, with the action that fixes it.
 			expect(failed.stderr).toContain("invalid API key");
 			expect(failed.stderr).toContain("Re-authenticate");
+			// A run that stops on a provider fault still reports its duration, exactly once.
+			expect(failed.stdout.match(/Total runtime: \d{2}:\d{2}:\d{2} \(/g)).toHaveLength(1);
 			// One extraction succeeded, the next was refused, and no further paid call was made.
 			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(2);
 			// Nothing incomplete was published and the Palace was not touched.
@@ -1439,3 +1529,30 @@ process.exit(code);
 		180_000
 	);
 }
+
+test.skipIf(!hasPalacePrerequisite)(
+	"the measured performance report precedes exactly one final runtime line",
+	async () => {
+		const f = createCliFixture();
+		try {
+			const started = startCli(f, "https://youtu.be/dQw4w9WgXcQ", {}, ["--perf"]);
+			const run = await started.result;
+			expect(run.code).toBe(0);
+			expect(run.stderr).toBe("");
+			const lines = run.stdout.split("\n").filter((line) => line.length > 0);
+			// The detailed report belongs to the session and is printed above its total.
+			const report = lines.findIndex((line) => line.startsWith("Performance (measured):"));
+			expect(report).toBeGreaterThan(-1);
+			const totals = lines.filter((line) => line.startsWith("Total runtime:"));
+			expect(totals).toHaveLength(1);
+			expect(report).toBeLessThan(lines.indexOf(totals[0]!));
+			// The total closes the output, and the log it closed stayed plain.
+			expect(lines.at(-1)).toBe(totals[0]!);
+			expect(run.stdout).toContain("Complete:");
+			expect(run.stdout).not.toContain("\u001b");
+		} finally {
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	180_000
+);

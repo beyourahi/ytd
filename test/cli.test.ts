@@ -157,3 +157,49 @@ test("failed calls without successful checkpoints do not claim that no calls occ
 		rmSync(dir, { recursive: true });
 	}
 });
+
+test("a hostile harness-reported model is sanitised for display, never for identity", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "ytd-report-hostile-"));
+	const manifest = new Manifest("library", dir);
+	const log = spyOn(console, "log").mockImplementation(() => {});
+	try {
+		manifest.beginRun({ agent: "custom", model: "configured-model", effort: "high" });
+		// What a harness reports is external text; an operator's terminal is not the place to
+		// find out that it contained a control sequence.
+		const hostile = "reported\u001b[2J\u0007]0;owned-model";
+		let calls = 0;
+		await agentJson(
+			"hostile",
+			(v): v is { ok: boolean } => !!v && typeof v === "object" && "ok" in v,
+			"test",
+			{
+				profile: { agent: "custom", model: "configured-model" },
+				manifest,
+				call: async () => ({
+					ok: true,
+					text: '{"ok":true}',
+					reportedModel: ++calls === 1 ? hostile : undefined
+				})
+			}
+		);
+		// Stored evidence keeps the exact string that was reported: sanitising is presentation.
+		const stored = manifest.modelCallSummary();
+		expect(stored.models.map((entry) => entry.model)).toEqual([hostile]);
+		expect(stored.reported).toBe(1);
+		expect(stored.total).toBe(1);
+		reportAuditEvidence(manifest, []);
+		const output = log.mock.calls.flat().join("\n");
+		expect(output).not.toContain("\u001b");
+		expect(output).not.toContain("\u0007");
+		expect(output).toContain("Harness-reported model: reported]0;owned-model (1 call)");
+		// The counts an operator uses to judge the evidence are intact.
+		expect(output).toContain("1 total; 1 harness-reported; 0 unverified");
+		// And nothing about the configured routing was rewritten by a display call.
+		expect(output).not.toContain("configured-model");
+		expect(manifest.modelCallSummary()).toEqual(stored);
+	} finally {
+		log.mockRestore();
+		manifest.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

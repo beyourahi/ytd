@@ -15,11 +15,17 @@ import {
 import { transcriptPath } from "./fetch.ts";
 import { Signaler } from "./concurrency.ts";
 import { DiscoveryLog } from "./discovery.ts";
-import { reduce, type ReduceOutput, type SourceHalalNote } from "./distill.ts";
-import { Metrics, formatReport } from "./metrics.ts";
+import {
+	reduce,
+	DEFAULT_CONTEXT_TOKENS,
+	type ReduceOutput,
+	type SourceHalalNote
+} from "./distill.ts";
+import { Metrics, formatReport, formatTotalRuntime } from "./metrics.ts";
 import { GlobalLimiter } from "./limits.ts";
 import { FatalIngestError, runIngestPipeline, workFor, type FatalKind } from "./pipeline.ts";
-import { formatProgress, shouldAggregate } from "./progress.ts";
+import { groupCount, progressSegments, shouldAggregate } from "./progress.ts";
+import { Presenter, createPresenter, oneLine } from "./ui.ts";
 import { localTranscript, resolveEngine, transcribeVideo } from "./transcribe.ts";
 import {
 	loadPalaceSnapshot,
@@ -226,7 +232,12 @@ export function reportAuditEvidence(
 			`Model identity (saved successful calls for this run): ${summary.total} total; ${summary.reported} harness-reported; ${summary.unverified} unverified.`
 		);
 		for (const { model, calls } of summary.models)
-			console.log(`Harness-reported model: ${model} (${calls} call${calls === 1 ? "" : "s"}).`);
+			// Display only: the name a harness reported is external text, bounded and stripped of
+			// control characters for the terminal. The identity ytd routed by, and the evidence it
+			// saved, are untouched — this line reports them, it does not define them.
+			console.log(
+				`Harness-reported model: ${oneLine(model, 200)} (${calls} call${calls === 1 ? "" : "s"}).`
+			);
 	}
 	const completed = rows.filter((row) => row.status === "distilled" || row.status === "done");
 	const review = manifest.sourceReviews(
@@ -245,17 +256,18 @@ async function publishCreator(
 	key: string,
 	rows: VideoRow[],
 	source: string,
-	signal: AbortSignal
+	signal: AbortSignal,
+	present: Presenter
 ): Promise<PublicationReceipt[]> {
 	const release = await manifest.acquirePublication({
 		signal,
-		onWait: () => console.log("Waiting for Palace synthesis and publication…")
+		onWait: () => present.line("Waiting for Palace synthesis and publication…")
 	});
 	try {
 		for (let attempt = 1; ; attempt++) {
 			signal.throwIfAborted();
 			try {
-				return await publishCreatorAttempt(manifest, profile, key, rows, source, signal);
+				return await publishCreatorAttempt(manifest, profile, key, rows, source, signal, present);
 			} catch (error) {
 				signal.throwIfAborted();
 				if (!(error instanceof PalaceBaseChangedError)) throw error;
@@ -264,7 +276,10 @@ async function publishCreator(
 						`Palace kept moving after ${attempt} publication attempts; progress preserved. Re-run the same command. ${error.message}`,
 						{ cause: error }
 					);
-				console.log("Palace changed; refreshing affected deduplication and retrying publication…");
+				present.stage(
+					"run",
+					"Palace changed; refreshing affected deduplication and retrying publication…"
+				);
 			}
 		}
 	} finally {
@@ -278,7 +293,8 @@ async function publishCreatorAttempt(
 	key: string,
 	rows: VideoRow[],
 	source: string,
-	signal: AbortSignal
+	signal: AbortSignal,
+	present: Presenter
 ): Promise<PublicationReceipt[]> {
 	const checkpointKey = `publication:${stableHash(key)}`;
 	let plan = manifest.getCheckpoint<PublicationPlan>(checkpointKey);
@@ -310,7 +326,7 @@ async function publishCreatorAttempt(
 	const sourceReview = manifest.sourceReviews(rows.map((row) => row.id));
 	if (!candidates.length) {
 		for (const note of sourceReview.halalNotes)
-			console.log(`Halal gate (${note.room}, YouTube ${note.sourceId}): ${note.note}`);
+			present.line(`Halal gate (${note.room}, YouTube ${note.sourceId}): ${note.note}`);
 		return [];
 	}
 	const snapshot = await loadPalaceSnapshot(undefined, signal);
@@ -326,12 +342,12 @@ async function publishCreatorAttempt(
 		manifest.checkpoint(checkpointKey, plan);
 	}
 	if (!plan || plan.notesHash !== notesHash) {
-		console.log(`Reduce ${candidates.length} candidates from ${channel}…`);
+		present.stage("run", `Reduce ${candidates.length} candidates from ${channel}…`);
 		const result = await reduce(
 			candidates,
 			channel,
 			notes,
-			(pass, total) => console.log(`Reduce ${pass}/${total}…`),
+			(pass, total) => present.stage("run", `Reduce ${pass}/${total}…`),
 			{ profile, manifest, signal }
 		);
 		if (result.limited)
@@ -359,7 +375,7 @@ async function publishCreatorAttempt(
 	manifest.checkpoint(checkpointKey, plan);
 	if (!plan.out.rooms.some((room) => room.principles.length)) {
 		for (const room of plan.out.rooms)
-			for (const note of room.halalNotes) console.log(`Halal gate (${room.room}): ${note}`);
+			for (const note of room.halalNotes) present.line(`Halal gate (${room.room}): ${note}`);
 	}
 	const titles = new Map(rows.map((row) => [row.id, row.title || row.id]));
 	for (const room of plan.out.rooms) {
@@ -384,7 +400,8 @@ async function publishCreatorAttempt(
 		plan.base = receipt.verifiedHead;
 		manifest.recordReceipt(`${receipt.runId}:${receipt.room}`, receipt);
 		manifest.checkpoint(checkpointKey, plan);
-		console.log(
+		present.stage(
+			"ok",
 			`Published and remotely verified ${receipt.path} (${receipt.commit.slice(0, 12)}).`
 		);
 		// A verified head may include a foreign commit made just after our successful push.
@@ -394,38 +411,52 @@ async function publishCreatorAttempt(
 					next.principles.length && !plan!.receipts.some((saved) => saved.room === next.room)
 			)
 		)
-			return publishCreatorAttempt(manifest, profile, key, rows, source, signal);
+			return publishCreatorAttempt(manifest, profile, key, rows, source, signal, present);
 	}
 	plan.complete = true;
 	manifest.checkpoint(checkpointKey, plan);
 	return plan.receipts;
 }
 
+/** What the session hands to ingestion: its one clock and its one presentation surface. */
+export interface IngestRuntime {
+	/** The session clock, started by the caller the moment selection was accepted. */
+	metrics?: Metrics;
+	/** The session's presentation surface; a bare call renders plainly. */
+	present?: Presenter;
+}
+
 export async function ingest(
 	url: string,
 	profile: AgentProfile,
 	signal: AbortSignal,
-	run: RunSettings
+	run: RunSettings,
+	runtime: IngestRuntime = {}
 ): Promise<void> {
 	const source = canonicalSource(url);
 	if (!Bun.which("yt-dlp", { PATH: process.env.PATH }))
 		throw new Error("yt-dlp not found. Install separately with: uv tool install yt-dlp");
 	const settings: ConcurrencySettings = { ...CONCURRENCY, ...run.concurrency };
+	const present = runtime.present ?? createPresenter();
 	if (settings.fetch <= 1)
-		console.log(
+		present.line(
 			"YouTube concurrency 1: listing and fetching share the one request slot, so fetching starts when the listing releases it."
 		);
-	const metrics = new Metrics();
+	// The session's clock, not a second one: a stage total and the end-to-end runtime must never
+	// be able to disagree about how long the run took.
+	const metrics = runtime.metrics ?? new Metrics();
 	const limiter = new GlobalLimiter();
 	// Local transcription stays off unless asked for, and refuses before any download when the
 	// operator has not provided an engine and model.
 	const transcription = run.transcription?.enabled ? resolveEngine(run.transcription) : undefined;
 	if (transcription && !transcription.ok) throw new Error(transcription.reason);
-	if (transcription?.ok) console.log("Local transcription: enabled for videos without captions.");
+	if (transcription?.ok) present.line("Local transcription: enabled for videos without captions.");
 	const verbose = run.verbose;
 	let replaceRouting = run.replaceRouting;
+	// Preflight runs inside the measured session: verifying the selected provider/model is
+	// automatic work that follows selection, not part of it.
 	const selected = await preflight(profile);
-	console.log(
+	present.line(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
 	);
 	/**
@@ -462,7 +493,7 @@ export async function ingest(
 		}
 		return release;
 	};
-	console.log("Enumerating…");
+	present.stage("run", "Enumerating…");
 	// Discovery and ingestion run at the same time. The listing appends every batch it finds to its
 	// durable staging file; a registrar reads that file as it grows, claims each new identity and
 	// schedules its work, while the pipeline is already draining those jobs. The first video's
@@ -519,8 +550,13 @@ export async function ingest(
 			(batch, progress) => {
 				collectAliases(aliases, aliasSeen, batch);
 				stage(batch);
+				// One line per thousand videos, from counts the listing already produced: never a
+				// render per video, and never a query or a filesystem scan to fill the line in.
 				if (progress.discovered % 1000 === 0 && progress.discovered > 0)
-					console.log(`Listing ${progress.tab}: ${progress.discovered} videos discovered…`);
+					present.stage(
+						"run",
+						`Listing ${progress.tab} \u00b7 ${groupCount(progress.discovered)} discovered`
+					);
 			},
 			{ batchSize: CONCURRENCY.discoveryBatch, beginRequest }
 		);
@@ -562,7 +598,7 @@ export async function ingest(
 		if (!listingResolved || listingPartial) {
 			const state = discovery.abandon();
 			if (existsSync(state.partialPath))
-				console.warn(
+				present.warn(
 					`Partial listing staged at ${state.partialPath}; it is not a complete inventory.`
 				);
 			return;
@@ -571,7 +607,7 @@ export async function ingest(
 			discovery.commit();
 		} catch (error) {
 			discovery.abandon();
-			console.warn(
+			present.warn(
 				`The listing could not be committed as a complete inventory: ${error instanceof Error ? error.message : String(error)}`
 			);
 		}
@@ -581,6 +617,8 @@ export async function ingest(
 	let sourceClaim: SourceClaim | undefined;
 	let ids = new Set<string>();
 	let completed = false;
+	/** The fetch/extract stage announces itself once per session, however often it resumes. */
+	let announcedPipeline = false;
 	/**
 	 * The registrar, owned here so cleanup can wait for it.
 	 *
@@ -602,7 +640,7 @@ export async function ingest(
 	 */
 	const guard = (): void => {
 		if (completed) return;
-		console.error(
+		present.fail(
 			"Error: the run ended while work was still pending; progress is preserved. Re-run to continue."
 		);
 		process.exitCode = 1;
@@ -627,7 +665,7 @@ export async function ingest(
 		while (!listedIds.size && listingOpen) await staged.wait(50, signal);
 		if (!listedIds.size) {
 			const result = await listing;
-			for (const failure of result.listingFailures) console.warn(`Listing warning: ${failure}`);
+			for (const failure of result.listingFailures) present.warn(`Listing warning: ${failure}`);
 			throw new Error(
 				result.listingFailures.length
 					? "Listings failed; no videos were confirmed."
@@ -653,6 +691,8 @@ export async function ingest(
 		const receipts: PublicationReceipt[] = [];
 		for (;;) {
 			completed = false;
+			// Carried out of the work block so the run's own summary can report it.
+			let blockedEntries = 0;
 			const run = manifest.beginRun(
 				{ profile: selected, source, videoIds: requestedIds.sort() },
 				{ replaceRouting }
@@ -670,6 +710,10 @@ export async function ingest(
 				);
 			const scoped = () => manifest!.all();
 			if (!publishing) {
+				if (!announcedPipeline) {
+					announcedPipeline = true;
+					present.stage("run", "Fetching and extracting");
+				}
 				if (!streaming) {
 					// Registration runs alongside the pipeline and keeps adding discovered videos to this
 					// run and scheduling their work. `mayGrow` stays true until it finishes, so an
@@ -728,7 +772,7 @@ export async function ingest(
 									try {
 										const outcome = await transcribeVideo(id, transcription.engine, { signal });
 										if (outcome.reason)
-											console.log(`No local transcript for ${id}: ${outcome.reason}`);
+											present.line(`No local transcript for ${id}: ${outcome.reason}`);
 										return outcome.text ?? null;
 									} finally {
 										request();
@@ -739,8 +783,21 @@ export async function ingest(
 							}
 						: undefined,
 					titles: new Map(scoped().map((row) => [row.id, row.title || row.id])),
-					onProgress: aggregate ? (progress) => console.log(formatProgress(progress)) : undefined,
-					log: aggregate && !verbose ? null : (line) => console.log(line)
+					// One throttled line, built from counts the pipeline already has: the dominant
+					// activity first, then what is happening beside it. Enumeration, fetching and
+					// extraction overlap, so the secondary counts are shown rather than a stage queue.
+					onProgress: aggregate
+						? (progress) =>
+								present.progress(
+									progressSegments(progress, {
+										discovering: listingOpen,
+										discovered: listedIds.size,
+										// A growing inventory has no final denominator.
+										totalKnown: !listingOpen && listingResolved && !listingPartial
+									})
+								)
+						: undefined,
+					log: aggregate && !verbose ? null : (line) => present.line(line)
 				});
 				// Discovery has stopped producing: the staged listing is committed as this source's
 				// inventory, or preserved as a partial one instead of posing as a complete listing.
@@ -750,22 +807,27 @@ export async function ingest(
 				// legacy manifest is filed under its creator's identity: import what the finished listing
 				// revealed, under the same lock and with the same per-alias idempotence as the first pass.
 				await manifest.importLateAliases(aliases, DATA_DIR, { signal });
-				for (const failure of listingFailures) console.warn(`Listing warning: ${failure}`);
+				for (const failure of listingFailures) present.warn(`Listing warning: ${failure}`);
 				for (const id of held)
-					console.warn(`Held by another session, not processed this run: ${id}`);
+					present.warn(`Held by another session, not processed this run: ${id}`);
 				if (held.size) process.exitCode = 1;
 				await streaming;
 				ids = new Set(manifest.all().map((row) => row.id));
 				for (const entry of result.blocked)
-					console.log(`Blocked ${entry.id} (${entry.stage}): ${entry.reason ?? "unknown reason"}`);
+					present.line(`Blocked ${entry.id} (${entry.stage}): ${entry.reason ?? "unknown reason"}`);
+				blockedEntries = result.blocked.length;
 				if (result.blocked.length) process.exitCode = 1;
 				if (result.incomplete.length)
 					throw new Error(
 						`Extraction remains incomplete for ${result.incomplete.length} source(s); progress preserved.`
 					);
 			}
-			for (const [key, rows] of creatorGroups(scoped().filter((row) => row.status === "distilled")))
-				receipts.push(...(await publishCreator(manifest, selected, key, rows, source, signal)));
+			const groups = creatorGroups(scoped().filter((row) => row.status === "distilled"));
+			for (const [key, group] of groups) {
+				receipts.push(
+					...(await publishCreator(manifest, selected, key, group, source, signal, present))
+				);
+			}
 			signal.throwIfAborted();
 			const unfinished = scoped().filter((row) =>
 				["pending", "fetched", "failed"].includes(row.status)
@@ -780,17 +842,28 @@ export async function ingest(
 				requestedIds = [...new Set([...listedIds, ...ids])].sort();
 				manifest.completeRun({ profile: selected, source, videoIds: requestedIds });
 				ids = new Set(manifest.all().map((row) => row.id));
-				console.log("Saved run recovered; processing remaining videos…");
+				present.stage("run", "Saved run recovered; processing remaining videos…");
 				continue;
 			}
 			manifest.completeRun();
 			completed = true;
 			const rows = scoped();
 			const failed = rows.filter((row) => row.status === "failed");
-			console.log(
-				`\nComplete: ${receipts.length} room/creator publications remotely verified; ${rows.filter((row) => row.status === "no_captions").length} videos without captions or description context; ${failed.length} fetch failures; ${listingFailures.length} listing warnings.`
+			const distilled = rows.filter(
+				(row) => row.status === "distilled" || row.status === "done"
+			).length;
+			const captionless = rows.filter((row) => row.status === "no_captions").length;
+			// A run that left something behind says so in its own summary line instead of posing as
+			// a clean success: the marker is the only difference, the counts are the same either way.
+			const partial = Boolean(
+				failed.length || listingFailures.length || blockedEntries || held.size
 			);
-			for (const row of failed) console.log(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
+			present.line();
+			present.stage(
+				partial ? "warn" : "ok",
+				`Complete: ${receipts.length} room/creator publications remotely verified; ${distilled} source${distilled === 1 ? "" : "s"} distilled; ${captionless} videos without captions or description context; ${failed.length} fetch failures; ${listingFailures.length} listing warnings.`
+			);
+			for (const row of failed) present.line(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
 			if (failed.length || listingFailures.length) process.exitCode = 1;
 			break;
 		}
@@ -814,7 +887,7 @@ export async function ingest(
 				await streaming;
 			} catch (error) {
 				if (!registrationSignal.aborted)
-					console.warn(
+					present.warn(
 						`Registration stopped: ${error instanceof Error ? error.message : String(error)}`
 					);
 			}
@@ -839,19 +912,96 @@ export async function ingest(
 	}
 }
 
-export async function main(): Promise<void> {
-	const selection = await resolveCli();
-	if (!selection) return;
-	const controller = new AbortController();
+/** What a caller can substitute to drive a session deterministically. */
+export interface SessionOptions {
+	ingest?: typeof ingest;
+	present?: Presenter;
+	/** The monotonic session clock, in milliseconds. */
+	now?: () => number;
+	/** The cancellation controller; a bare call owns one. */
+	controller?: AbortController;
+}
+
+/** The compact selected-configuration summary, printed once the last input has been accepted. */
+function selectedConfiguration(profile: AgentProfile): [string, string][] {
+	const rows: [string, string][] = [
+		["agent", profile.agent],
+		["model", profile.model]
+	];
+	if (profile.effort) rows.push(["effort", profile.effort]);
+	rows.push([
+		"context",
+		// A reported window is a fact; anything else is the conservative default in force.
+		profile.contextTokens
+			? `${Math.round(profile.contextTokens / 1000)}k reported`
+			: `${Math.round(DEFAULT_CONTEXT_TOKENS / 1000)}k default`
+	]);
+	return rows;
+}
+
+/**
+ * Run one ingestion session.
+ *
+ * The clock starts here: after the last interactive selection has been accepted and after
+ * argument resolution finished, and before any automatic work begins. It stops after ingestion's
+ * own cleanup has finished — locks released, listing settled, manifest closed.
+ *
+ * Everything between those two points is counted: validation, preflight, provider verification,
+ * waiting for other sessions, enumeration, metadata, fetching, optional transcription, extraction,
+ * gleaning, retries, pacing, backoff, reduction, deduplication, publication, verification,
+ * automatic recovery and cleanup. None of it is optional to the measurement.
+ *
+ * Exactly one runtime line is printed per session, whatever the run did, and the original error
+ * and exit code are preserved unchanged.
+ */
+export async function runSession(
+	selection: { url: string; profile: AgentProfile; run: RunSettings },
+	options: SessionOptions = {}
+): Promise<void> {
+	const present = options.present ?? createPresenter();
+	const metrics = new Metrics(options.now);
+	const controller = options.controller ?? new AbortController();
 	const cancel = () => controller.abort(new Error("Cancelled; progress preserved."));
 	process.on("SIGINT", cancel);
 	process.on("SIGTERM", cancel);
 	try {
-		await ingest(selection.url, selection.profile, controller.signal, selection.run);
+		present.entries("Selected", selectedConfiguration(selection.profile));
+		await (options.ingest ?? ingest)(
+			selection.url,
+			selection.profile,
+			controller.signal,
+			selection.run,
+			{
+				metrics,
+				present
+			}
+		);
+	} catch (error) {
+		// The failure keeps its message, its recovery hint and its exit code; the runtime line is
+		// added after it, never instead of it, and never as a success.
+		present.fail(`Error: ${error instanceof Error ? error.message : String(error)}`);
+		if (error instanceof FatalIngestError) present.fail(RECOVERY_HINT[error.kind]);
+		process.exitCode = 1;
 	} finally {
 		process.off("SIGINT", cancel);
 		process.off("SIGTERM", cancel);
+		present.runtime(formatTotalRuntime(metrics.elapsedMs()));
 	}
+}
+
+/**
+ * The entry point: resolve what to run, then run it under one measured session.
+ *
+ * `help`, `settings`, adapter management and a cancellation before ingestion begins all return
+ * without a session, and therefore without an ingestion runtime and without a run row: there is
+ * nothing to measure yet, and inventing a duration for setup would be a lie about the run.
+ */
+export async function main(
+	options: SessionOptions & { resolve?: typeof resolveCli } = {}
+): Promise<void> {
+	const selection = await (options.resolve ?? resolveCli)();
+	if (!selection) return;
+	await runSession(selection, options);
 }
 
 /** What the operator has to do about a fault that stops the whole run. */

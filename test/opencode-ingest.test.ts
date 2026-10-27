@@ -242,9 +242,21 @@ test.skipIf(!hasPalacePrerequisite)(
 		const f = createFixture();
 		f.save("opencode-go/not-offered");
 		try {
-			const run = await runCommand(f.command, { env: f.env, timeoutMs: 120_000 });
+			// `--perf` is asked for on a run that fails during preflight: the session still reports
+			// its duration, once, as the last line, and claims no success it did not earn.
+			const run = await runCommand([...f.command, "--perf"], {
+				env: f.env,
+				timeoutMs: 120_000
+			});
 			expect(run.code).toBe(1);
 			expect(run.stderr).toContain("does not offer opencode-go/not-offered");
+			const lines = run.stdout.trimEnd().split("\n");
+			const totals = lines.filter((line) => line.startsWith("Total runtime:"));
+			expect(totals).toHaveLength(1);
+			expect(lines.at(-1)).toBe(totals[0]!);
+			expect(run.stdout).toMatch(/Total runtime: \d{2}:\d{2}:\d{2} \([^)]+\)/);
+			expect(run.stdout).not.toContain("\u001b");
+			expect(run.stdout).not.toContain("Complete:");
 			// No extraction was attempted and the palace was left untouched.
 			expect(opencodeCalls(f.calls).filter((call) => call.startsWith("run --standalone"))).toEqual(
 				[]

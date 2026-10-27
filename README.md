@@ -47,6 +47,48 @@ Each result is cached per video, labelled in the transcript itself as a local tr
 than published caption text, and reused on later runs. Transcription is bounded by its own
 concurrency setting, and a failure leaves that video captionless instead of failing the run.
 
+## Runtime and interface
+
+Every invocation that starts ingestion ends with one line, on stdout, by default:
+
+```
+Total runtime: 00:12:34 (12m 34s)
+```
+
+The clock starts the moment the last interactive selection or input is accepted — choosing an
+agent, browsing providers, searching models, picking an effort, typing a model ID and entering the
+URL are setup and are never counted — and it runs until automatic processing and its cleanup have
+finished. It counts preflight and provider verification, waiting for locks or another session,
+enumeration, metadata, fetching, optional local transcription, extraction, gleaning, retries,
+pacing and backoff, reduction, deduplication, publication and remote verification, automatic
+recovery, and resource release. Waiting on a network or a provider is wall-clock time like any
+other. `--perf` still prints the detailed per-stage report; parallel stage totals overlap and are
+never presented as the session total.
+
+The summary is printed exactly once whether the run succeeded, resumed saved work, was cancelled
+after starting, or failed. A failed run keeps its message, its recovery hint and its exit code, and
+never claims success. `help`, `settings`, adapter management, and a cancellation before ingestion
+begins print no runtime, because no ingestion session started. A `SIGKILL` cannot be reported, and
+nothing is claimed for one.
+
+Progress is append-only: a few stage lines plus one throttled progress line whose numbers are all
+counts this run observed. A growing inventory has no final denominator, so it shows counts instead
+of a percentage until the listing closes; an estimated time remaining appears only once enough
+work has completed for it to mean anything, and is always marked as an estimate. Enumeration,
+fetching and extraction overlap, so the line leads with the dominant activity and shows the
+concurrent counts beside it rather than drawing a stage queue that never happened.
+
+Output is styled only where a terminal can be trusted with it. Plain text is used when stdout is
+not a TTY, when `NO_COLOR` is set, when `TERM=dumb`, in CI, and in a window too narrow for
+hierarchy. `YTD_UI=plain` forces plain output and `YTD_UI=styled` forces styling; neither changes
+what a run does. The renderer never redraws a line, never moves the cursor, never hides output, and
+keeps every diagnostic intact — warnings and errors keep their full text on stderr, split into
+bounded chunks when a message is longer than one terminal line, and an omission is only ever made
+at an extreme ceiling and is always stated in the output itself. Trimming to the terminal width
+only ever drops the least important fields of the progress line on a live terminal; a redirected
+log keeps every field. Rendering is best-effort: a broken stream cannot abort
+ingestion, and the pipeline itself has no dependency on the renderer.
+
 ## Agents and isolation
 
 Install/configure `yt-dlp`, Bun, a JavaScript runtime for YouTube (Node is auto-detected),
