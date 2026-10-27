@@ -273,20 +273,13 @@ export class Manifest {
 				const sameRouteSelection =
 					old &&
 					requested(previous, false) === requested(profile as Record<string, unknown>, false);
-				// The Freebuff exchange folder is a location, not routing; runs paused under the
-				// earlier shared folder resume into their per-source one.
-				const comparable = (value: Record<string, unknown>) => {
-					const p = selectedProfile(value) as Record<string, unknown>;
-					// canonical() drops undefined keys
-					return p.routing && typeof p.routing === "object"
-						? { ...p, routing: { ...p.routing, workspace: undefined } }
-						: p;
-				};
-				const route = (value: Record<string, unknown>) => canonical(comparable(value).routing);
+				// The saved selection's routing is compared as stored; only routing keys count.
+				const route = (value: Record<string, unknown>) =>
+					canonical((selectedProfile(value) as Record<string, unknown>).routing);
 				const sameProfile =
 					old &&
-					canonical(comparable(previous)) ===
-						canonical(comparable(profile as Record<string, unknown>));
+					canonical(selectedProfile(previous)) ===
+						canonical(selectedProfile(profile as Record<string, unknown>));
 				if (old && (sameProfile || (sameSelection && options.replaceRouting))) {
 					if (!sameProfile) {
 						const selected = selectedProfile(profile as Record<string, unknown>);

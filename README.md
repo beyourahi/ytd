@@ -27,8 +27,7 @@ Automation skips the picker:
 ```sh
 ytd 'https://youtu.be/VIDEO_ID' --agent claude --model opus --effort high
 ytd 'https://youtu.be/VIDEO_ID' --agent codex --model YOUR_MODEL_ID
-ytd 'https://youtu.be/VIDEO_ID' --agent opencode --model opencode/MODEL_ID --effort VARIANT
-ytd 'https://youtu.be/VIDEO_ID' --agent freebuff --model deepseek-v4.1-flash-10-17 --effort high
+ytd 'https://youtu.be/VIDEO_ID' --agent opencode --model PROVIDER/MODEL_ID --effort VARIANT
 ```
 
 Explicit arguments override remembered settings for that invocation. Changing agent requires
@@ -44,10 +43,8 @@ assembled prompt is budgeted; transcripts and notes are sharded without truncati
 
 Install/configure `yt-dlp`, Bun, a JavaScript runtime for YouTube (Node is auto-detected),
 and the desired coding-agent CLI separately. Existing harness provider/auth/account settings
-remain in effect. ytd invokes installed headless protocols for Claude, Codex, Pi, and OpenCode,
-and an interactive file handoff for Freebuff (below).
-Each headless built-in checks restriction support before ingestion and refuses unsupported
-versions. Freebuff is the exception: ytd cannot restrict its tools (see below).
+remain in effect. ytd invokes installed headless protocols for Claude, Codex, Pi, and OpenCode.
+Each built-in checks restriction support before ingestion and refuses unsupported versions.
 Claude explicitly disables tools/MCP; Codex uses read-only execution and disables command,
 network-tool, integration, hook, and subagent surfaces; Pi disables tools and external context;
 OpenCode denies tools and isolates plugins/MCP using its supported configuration.
@@ -72,65 +69,64 @@ come from OpenCode's model metadata, including context windows, variants, and wh
 cost is zero. A listed model, even a zero-cost one, is not proof that your account can use it;
 OpenCode's free tier has quotas, and an exhausted quota pauses the run like any other quota.
 
-### Freebuff (interactive handoff)
+### OpenCode setup, providers and models
 
-Freebuff 0.2.34 is an interactive terminal app only: no prompt argument, model flag, model
-listing, or machine-readable output
-([CodebuffAI/freebuff#947](https://github.com/CodebuffAI/freebuff/issues/947)). ytd never runs,
-scripts, or steers it, and never reads its login or settings. Instead, each AI call becomes a
-job file that your own Freebuff session answers:
+Choosing OpenCode (or `ytd settings`) runs onboarding before model discovery:
 
-```sh
-ytd 'https://youtu.be/VIDEO_ID' --agent freebuff --model deepseek-v4.1-flash-10-17 --effort high
-# in a second terminal, the folder ytd prints:
-freebuff --cwd ~/.ytd/freebuff/deepseek-v4.1-flash-10-17-VIDEO_ID-<hash>
-# in Freebuff: select DeepSeek V4.1 Flash 10/17 (effort high), then send: Follow INSTRUCTIONS.md
-```
+1. The installed CLI is checked; an OpenCode 1 install is reported instead of being probed with
+   OpenCode 2 commands.
+2. Connected providers are read with `opencode auth list --standalone --format json`, in the same
+   isolated configuration used for discovery and execution: deny-all `ytd` agent, every configured
+   MCP server disabled, and declared external plugins refused before a private server starts.
+   Credential IDs and labels are dropped.
+3. Providers are shown by name. When none is connected, ytd offers to start OpenCode's own
+   `opencode auth login --standalone` in your terminal. ytd never reads, captures, logs or stores
+   the credentials it writes, and a cancelled or failed login leaves `~/.ytd/config.json` unchanged.
+   You can also skip it, connect later, and type an exact model ID.
+4. Models are re-read after login, grouped by the exact provider OpenCode reports (with its
+   connection state), and searchable. Each entry shows OpenCode's display name, the exact
+   `provider/model` ID and its context window when OpenCode reports one.
+5. Only reasoning variants the selected model lists are offered as effort. An OpenCode model ID
+   ending in `#variant` already selects its variant.
+6. **Connect another provider** runs OpenCode's own login to add or refresh one provider (for
+   example Go while Console is already connected); ytd does not log out or change other
+   connections. **Refresh model catalog** re-reads providers and models. Both work without
+   restarting ytd. Choosing the saved agent/model again (**Run**) never repeats authentication.
 
-Each source URL gets its own folder (model, source label, hash of model, effort and URL), so
-ytd runs in several terminals with the same model and effort each need their own Freebuff
-session and never share jobs. Rerunning the same URL reuses its folder, so a paused run resumes
-there.
+Models are saved as the exact `provider/model` ID OpenCode reports, with the variant as effort.
+Preflight rejects a model or variant OpenCode does not list, and reports a changed model access or
+credential clearly instead of falling back to another provider.
 
-What is automated: ytd writes each exact prompt to `jobs/<id>.prompt.txt`, with a
-`[[ytd-check <code>]]` line after about every 24 KB and at the end. Freebuff runs `sh next.sh`,
-which prints the next job the moment one exists, and starts its answer with
-`ytd-proof: <codes>`. ytd imports `responses/<id>.txt` once it is a private regular file that has
-stopped changing and its proof lists every code in order, so an answer written from a truncated
-read is asked again instead of trusted. ytd removes the proof line and runs the
-same validation, checkpoints, deduplication, halal gate, and publication as every other agent.
-Answers that fail validation get `jobs/<id>.note.txt` and are asked again (three attempts);
-empty, oversized, linked or special files are moved unread to `rejected/` and asked again. An
-agent that cannot answer writes `responses/<id>.error.txt`; usage-limit reasons pause the run
-like any quota, but a settled answer wins over an error. Ctrl-C leaves the pending job in place,
-and an answer written while ytd is stopped is imported if ytd is rerun within a day. Jobs whose ytd process
-has exited are retired at the next start so Freebuff does not spend quota on them; answers and
-rejected files older than a day are removed. Answers are untrusted text and never execute anything.
+OpenCode Go (provider `opencode-go`) and OpenCode Zen/Console (provider `opencode`) are separate
+OpenCode integrations with separate billing: Go is a subscription, Console is pay-as-you-go. Go
+Plus is the same `opencode-go` integration and models with higher usage limits, so ytd cannot and
+does not tell Go from Go Plus. ytd never merges catalogs, prices or allowances, and shows each model
+under the provider OpenCode reports, so connect the integration you intend to use. A listed model
+is not proof of account entitlement, and ytd cannot verify a plan or subscription.
 
-What stays interactive: opening Freebuff, choosing its model and effort, sending the single
-instruction, and nudging Freebuff if it stops (ytd reminds you every 10 minutes). Whether
-Freebuff keeps looping without supervision is not verified; its own agent runs `sh next.sh`
-between jobs and may ask you to approve it. A
-sudden kill between importing an answer and saving its checkpoint loses that one answer, which is
-then asked again.
+Custom provider definitions in your global OpenCode configuration are not loaded: ytd runs with an
+empty ytd-owned config home and an inline deny-all `ytd` agent, so isolation is never bypassed to
+expose them. Connect providers through `opencode auth login` instead. If an external plugin or
+other config source cannot be disabled, ytd refuses to run rather than running unrestricted.
 
-The model picker shows a versioned catalog from the Freebuff 0.2.34 README (picker models) and
-its installed catalog (efforts, fallbacks), with each model's mode/plan eligibility and data-use
-notes. It flags itself as possibly outdated when another or an unknown Freebuff version is installed. A listed
-model is advertised, not confirmed for your account, region, or plan; only Freebuff's own picker
-confirms access. ytd cannot change or detect Freebuff's active model, so every Freebuff call is
-recorded as unverified, and some models may answer on a fallback model (noted in the picker).
-Effort choices appear only for models that list efforts, and `--effort` must be one of them. Models with a large catalog context use
-a 128k-token handoff budget, so deduplicating against the Palace takes a few jobs per principle
-rather than dozens; proof codes catch reads that miss part of a job. Saved selections from the
-first 32k release are upgraded on load; `--context-tokens` overrides.
+Authentication and quota failures stop the run with an actionable error and keep the selected
+model unchanged. For an authentication failure, reconnect with `opencode auth login` and re-run the
+same command; saved checkpoints resume and no automatic paid usage, plan change or credit purchase
+is made.
 
-Each model/effort pair has its own folder holding only `INSTRUCTIONS.md`, `next.sh`, job
-prompts, answers and rejected files (mode 0700). Prompts include transcripts and the Mind Palace field notes used for deduplication.
-Freebuff's tools, network access, and data use are governed by Freebuff, not ytd; a working
-directory is not isolation. Unlike the headless agents, Freebuff fails open: it keeps its full
-toolset while reading untrusted transcripts, so approve only `sh next.sh` and reads in that folder. While Freebuff synthesizes, ytd keeps its local publication claim, so
-a concurrent ytd run waits before publishing; no Palace transaction lock is held while waiting.
+### Removed: Freebuff
+
+Freebuff is no longer a ytd agent. Saved settings that still select it migrate on load, before
+strict validation: the previous file is preserved as `config.json.freebuff-backup.json`, the active
+and recent Freebuff selections are removed, and everything else (other selections, custom
+adapters) is kept. The migration is idempotent and needs no manual step.
+
+No replacement agent is invented. Interactive startup asks for a new agent and model, `ytd
+settings` saves the one you choose, and `--agent freebuff` fails with a clear error, so automation
+must pass `--agent NAME --model ID`. Runs paused under Freebuff keep their manifests, checkpoints,
+identities and publication receipts; the replacement selection creates the usual replacement run.
+`~/.ytd/freebuff`, its job folders and historical SQLite data are left in place, and Freebuff itself
+is not uninstalled, run or configured by ytd.
 
 Unknown effective provider/model settings are recorded as unverified. A reported conflicting
 model identity fails the call. Routing changes pause a run rather than silently reroute it.

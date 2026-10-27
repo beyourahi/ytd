@@ -68,16 +68,42 @@ test("routing-only changes stop paused runs; explicit source/model changes creat
 	}
 });
 
-test("a moved Freebuff exchange folder alone resumes the paused run", () => {
+test("a run paused under the removed Freebuff agent is replaced, never resumed or lost", () => {
 	const f = fixture();
 	try {
 		const m = new Manifest("library", f.dir);
-		const at = (workspace: string) => ({
-			profile: { ...profile, routing: { verified: false, workspace } },
-			source: "one"
+		const legacy = {
+			profile: {
+				agent: "freebuff",
+				model: "deepseek-v4.1-flash-10-17",
+				routing: { verified: false, protocol: "freebuff-handoff", workspace: "/x/model-one" }
+			},
+			source: "one",
+			videoIds: ["done", "pending"]
+		};
+		const old = m.beginRun(legacy);
+		m.addVideos([
+			{ id: "done", title: "Done" },
+			{ id: "pending", title: "Pending" }
+		]);
+		m.recordReceipt("room", { verified: true, commit: "abc" });
+		// The same historical selection still resumes its own run unchanged.
+		expect(m.beginRun(legacy)).toEqual({ id: old.id, replaced: false });
+		const replacement = m.beginRun({
+			profile: { agent: "opencode", model: "opencode/model", routing: { verified: false } },
+			source: "one",
+			videoIds: ["done"]
 		});
-		const old = m.beginRun(at("/x/model-shared"));
-		expect(m.beginRun(at("/x/model-one-1234abcd"))).toEqual({ id: old.id, replaced: false });
+		expect(replacement).toMatchObject({ replaced: true });
+		expect(replacement.id).not.toBe(old.id);
+		// Unfinished legacy membership carries over; prior receipts stay on record.
+		expect(
+			m
+				.all()
+				.map((row) => row.id)
+				.sort()
+		).toEqual(["done", "pending"]);
+		expect(m.receipts()).toEqual([{ verified: true, commit: "abc" }]);
 		m.close();
 	} finally {
 		f.cleanup();

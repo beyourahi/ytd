@@ -5,9 +5,8 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { OPENCODE_CONFIG_HOME, RUN_DIR } from "./config.ts";
 import { runCommand, type CommandResult } from "./process.ts";
-import { FREEBUFF_CATALOG, handoff, isWorkspaceFor, prepareWorkspace } from "./freebuff.ts";
 
-export const BUILT_INS = ["claude", "codex", "pi", "opencode", "freebuff"] as const;
+export const BUILT_INS = ["claude", "codex", "pi", "opencode"] as const;
 export interface CustomAdapter {
 	executable: string;
 	args: string[];
@@ -20,9 +19,7 @@ export interface RoutingSnapshot {
 	verified: false;
 	mcpServers?: string[];
 	/** OpenCode 2 runs a private --standalone server and takes variants as model#variant. */
-	protocol?: "opencode-v2" | "freebuff-handoff";
-	/** Freebuff job exchange folder; the user's interactive Freebuff session answers there. */
-	workspace?: string;
+	protocol?: "opencode-v2";
 }
 export interface AgentProfile {
 	agent: string;
@@ -410,9 +407,13 @@ function parseInlineConfig(): Record<string, unknown> {
 }
 
 const DENY_ALL = [{ action: "*", resource: "*", effect: "deny" }];
-/** v2 resolves its location from PWD, so pin it to the neutral run directory. */
-function opencodeV2Env(mcpServers: string[] = []): NodeJS.ProcessEnv {
+/**
+ * v2 resolves its location from PWD, so pin it to the neutral run directory. Onboarding uses the
+ * same isolated environment, so discovery, authentication and execution see one configuration.
+ */
+export function opencodeV2Env(mcpServers: string[] = []): NodeJS.ProcessEnv {
 	mkdirSync(OPENCODE_CONFIG_HOME, { recursive: true });
+	mkdirSync(RUN_DIR, { recursive: true });
 	return {
 		...process.env,
 		PWD: RUN_DIR,
@@ -479,6 +480,14 @@ async function opencodeV2McpNames(executable: string): Promise<string[]> {
 		);
 	const names = sources.flatMap((source) => Object.keys(source?.info?.mcp?.servers ?? {}));
 	return [...new Set(names)].sort();
+}
+
+/**
+ * The execution environment for private servers that run before preflight (auth listing, login,
+ * model discovery): every configured MCP server disabled, and declared plugins refused.
+ */
+export async function opencodeV2IsolatedEnv(executable = "opencode"): Promise<NodeJS.ProcessEnv> {
+	return opencodeV2Env(await opencodeV2McpNames(executable));
 }
 
 /**
@@ -597,8 +606,7 @@ async function verifyOpencodeV2(
 	}
 }
 
-/** `source` gives Freebuff a job folder of its own for that URL. */
-export async function preflight(profile: AgentProfile, source?: string): Promise<AgentProfile> {
+export async function preflight(profile: AgentProfile): Promise<AgentProfile> {
 	if (!validateProfile(profile)) throw new Error("Invalid agent/model settings");
 	if (
 		profile.custom &&
@@ -619,16 +627,6 @@ export async function preflight(profile: AgentProfile, source?: string): Promise
 			"Agent routing configuration changed. Select the profile again to create a replacement run."
 		);
 	mkdirSync(RUN_DIR, { recursive: true });
-	// Freebuff is never executed by ytd: it has no headless mode or model selection to verify.
-	if (profile.agent === "freebuff")
-		return {
-			...profile,
-			routing: {
-				...routing,
-				protocol: "freebuff-handoff",
-				workspace: prepareWorkspace(profile.model, profile.effort, source)
-			}
-		};
 	if (!profile.custom) {
 		const help = await runCommand(
 			[
@@ -963,28 +961,6 @@ export async function agentPrompt(
 				"Agent routing configuration changed; select it again to create a replacement run",
 				"routing"
 			);
-		if (profile.agent === "freebuff") {
-			const workspace = profile.routing.workspace;
-			if (
-				profile.routing.protocol !== "freebuff-handoff" ||
-				!workspace ||
-				!isWorkspaceFor(workspace, profile.model)
-			)
-				return failure(
-					profile,
-					"Freebuff profile must pass preflight before execution",
-					"restriction"
-				);
-			const answer = await handoff(prompt, profile.model, profile.effort, workspace, {
-				signal,
-				timeoutMs: profile.timeoutMs
-			});
-			if (answer.text === undefined)
-				return failure(profile, answer.error!, answer.kind ?? "process");
-			// No reported identity: the model chosen inside Freebuff stays unverified. Blank or
-			// malformed answers fail validation, so ytd asks for that job again.
-			return { ok: true, text: answer.text, requestedModel: profile.model };
-		}
 		const command = commandFor(profile);
 		command.argv[0] = profile.routing.executable;
 		return parseAgentOutput(
@@ -1034,6 +1010,7 @@ export function parseOpencodeModels(stdout: string): ModelSuggestion[] {
 				m.cost.every((c: any) => c?.input === 0 && c?.output === 0);
 			return {
 				id: `${m.providerID}/${m.id}`,
+				...(typeof m.name === "string" && m.name.trim() ? { label: m.name.trim() } : {}),
 				...(Number.isSafeInteger(m.limit?.context) && m.limit.context >= 4096
 					? { contextTokens: m.limit.context }
 					: {}),
@@ -1050,15 +1027,6 @@ export function parseOpencodeModels(stdout: string): ModelSuggestion[] {
 export async function discoverModels(agent: string): Promise<ModelSuggestion[]> {
 	try {
 		if (agent === "claude") return ["opus", "sonnet", "haiku"].map((id) => ({ id }));
-		// Freebuff has no model listing; offer its versioned picker catalog as advertised models.
-		if (agent === "freebuff")
-			return FREEBUFF_CATALOG.models.map((m) => ({
-				id: m.id,
-				label: m.name,
-				...(m.contextTokens ? { contextTokens: m.contextTokens } : {}),
-				variants: m.efforts ?? [],
-				hint: [m.access, m.notes].filter(Boolean).join("; ")
-			}));
 		if (agent === "codex") {
 			const r = await runCommand(["codex", "debug", "models", "--bundled"], { timeoutMs: 15000 });
 			if (r.code !== 0) return [];
@@ -1095,7 +1063,7 @@ export async function discoverModels(agent: string): Promise<ModelSuggestion[]> 
 			if (/--standalone\b/.test(help.stdout)) {
 				const v2 = await runCommand(["opencode", "api", "--standalone", "GET", "/api/model"], {
 					cwd: RUN_DIR,
-					env: opencodeV2Env(),
+					env: await opencodeV2IsolatedEnv(),
 					timeoutMs: 30000
 				});
 				return v2.code === 0 ? parseOpencodeModels(v2.stdout) : [];

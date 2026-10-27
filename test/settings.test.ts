@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Manifest } from "../src/manifest.ts";
 import {
 	Cancelled,
+	legacyBackupPath,
 	loadSettings,
 	parseArgs,
 	profileFromArgs,
@@ -19,6 +20,17 @@ function configPath() {
 	dirs.push(dir);
 	return join(dir, "config.json");
 }
+const connectedConsole = [
+	{ id: "opencode", name: "OpenCode Console", connected: true },
+	{ id: "opencode-go", name: "OpenCode Go", connected: false }
+];
+/** Onboarding that never touches the installed OpenCode CLI. */
+const onboarding = (providers: typeof connectedConsole) => ({
+	inspect: async () => ({ standalone: true, providers }),
+	login: async () => {
+		throw new Error("login must not run here");
+	}
+});
 afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -317,7 +329,7 @@ test("picker offers model-specific variants and discovery hints", async () => {
 			if (message === "Agent") return "opencode";
 			if (message === "Model") {
 				expect(choices.find((o) => o.value === "opencode/free")?.hint).toBe(
-					"listed at no cost; free-tier quotas apply"
+					"200k context · listed at no cost; free-tier quotas apply"
 				);
 				return "opencode/free";
 			}
@@ -333,6 +345,12 @@ test("picker offers model-specific variants and discovery hints", async () => {
 		interactive: true,
 		ui,
 		installed: (name) => name === "opencode",
+		onboarding: {
+			inspect: async () => ({ standalone: true, providers: connectedConsole }),
+			login: async () => {
+				throw new Error("login must not run when a provider is connected");
+			}
+		},
 		models: async () => [
 			{
 				id: "opencode/free",
@@ -367,8 +385,485 @@ test("an OpenCode model ID with #variant skips the effort step", async () => {
 		interactive: true,
 		ui,
 		installed: (name) => name === "opencode",
+		onboarding: {
+			inspect: async () => ({ standalone: true, providers: connectedConsole }),
+			login: async () => {
+				throw new Error("login must not run when a provider is connected");
+			}
+		},
 		models: async () => [{ id: "opencode/free", variants: ["low", "max"] }]
 	});
 	expect(calls).toEqual(["Agent", "Model"]);
 	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode/free#max" });
+});
+
+test("legacy Freebuff selections migrate once, keep a backup and preserve everything else", () => {
+	const path = configPath();
+	const adapter = { executable: "/bin/cat", args: ["--model", "{model}"] };
+	const original = {
+		version: 1,
+		selected: { agent: "freebuff", model: "deepseek-v4.1-flash-10-17", effort: "high" },
+		recent: [
+			{ agent: "freebuff", model: "gpt-6-luna" },
+			{ agent: "claude", model: "opus", effort: "high" },
+			// A trusted wrapper may legitimately reuse the name; it is not the removed built-in.
+			{ agent: "freebuff", model: "wrapper-model", custom: adapter }
+		],
+		adapters: { helper: adapter, freebuff: adapter }
+	};
+	writeFileSync(path, JSON.stringify(original));
+	const backup = legacyBackupPath(path);
+	const migrated = loadSettings(path);
+	expect(migrated.selected).toBeUndefined();
+	expect(migrated.recent).toEqual([
+		{ agent: "claude", model: "opus", effort: "high" },
+		{ agent: "freebuff", model: "wrapper-model", custom: adapter }
+	]);
+	expect(migrated.adapters).toEqual({ helper: adapter, freebuff: adapter });
+	// The original file is preserved byte for byte before anything is rewritten.
+	expect(JSON.parse(readFileSync(backup, "utf8"))).toEqual(original);
+	// Idempotent: a second load changes nothing and never rewrites the file or the backup.
+	const saved = readFileSync(path, "utf8");
+	expect(loadSettings(path)).toEqual(migrated);
+	expect(readFileSync(path, "utf8")).toBe(saved);
+	expect(JSON.parse(readFileSync(backup, "utf8"))).toEqual(original);
+});
+
+test("a legacy custom wrapper named Freebuff is never migrated away", () => {
+	const path = configPath();
+	const adapter = { executable: "/bin/cat", args: [] };
+	const custom = { agent: "freebuff", model: "wrapper-model", custom: adapter };
+	writeFileSync(
+		path,
+		JSON.stringify({
+			version: 1,
+			selected: custom,
+			recent: [custom],
+			adapters: { freebuff: adapter }
+		})
+	);
+	expect(loadSettings(path).selected).toEqual(custom);
+	expect(existsSync(legacyBackupPath(path))).toBe(false);
+});
+
+test("obsolete Freebuff arguments fail clearly instead of selecting a removed agent", async () => {
+	const path = configPath();
+	const settings = { version: 1 as const, recent: [], adapters: {} };
+	expect(() =>
+		profileFromArgs(parseArgs(["--agent", "freebuff", "--model", "x"]), settings)
+	).toThrow("Freebuff support was removed");
+	await expect(
+		resolveCli(["https://youtu.be/abcdefghijk", "--agent", "freebuff", "--model", "x"], {
+			path,
+			interactive: false
+		})
+	).rejects.toThrow("Freebuff support was removed");
+	// A saved legacy selection asks for an explicit replacement instead of inventing one.
+	writeFileSync(
+		path,
+		JSON.stringify({
+			version: 1,
+			selected: { agent: "freebuff", model: "deepseek-v4.1-flash-10-17" },
+			recent: [],
+			adapters: {}
+		})
+	);
+	await expect(
+		resolveCli(["https://youtu.be/abcdefghijk"], { path, interactive: false })
+	).rejects.toThrow("No saved agent/model");
+});
+
+test("no connected provider offers OpenCode's own login, then re-reads providers and models", async () => {
+	const path = configPath();
+	const events: string[] = [];
+	let connected = false;
+	const ui: Picker = {
+		async select(message, choices) {
+			events.push(message);
+			if (message === "Agent") return "opencode";
+			if (message === "No OpenCode provider is connected") {
+				expect(choices.map((o) => o.value)).toEqual(["login", "skip"]);
+				return "login";
+			}
+			if (message === "Model") return "opencode/free";
+			expect(choices.map((o) => o.value)).toEqual(["__default__", "high", "__exact__"]);
+			return "high";
+		},
+		async text() {
+			throw new Error("unused");
+		}
+	};
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		ui,
+		installed: (name) => name === "opencode",
+		onboarding: {
+			inspect: async () => ({
+				standalone: true,
+				providers: [
+					{ id: "opencode", name: "OpenCode Console", connected },
+					{ id: "opencode-go", name: "OpenCode Go", connected: false }
+				]
+			}),
+			login: async () => {
+				events.push("login");
+				connected = true;
+				return 0;
+			}
+		},
+		models: async () => {
+			events.push("models");
+			// Models appear only once the provider is connected, like a real OpenCode.
+			return connected ? [{ id: "opencode/free", contextTokens: 200000, variants: ["high"] }] : [];
+		}
+	});
+	expect(events).toEqual([
+		"Agent",
+		"No OpenCode provider is connected",
+		"login",
+		"models",
+		"Model",
+		"Effort"
+	]);
+	expect(loadSettings(path).selected).toEqual({
+		agent: "opencode",
+		model: "opencode/free",
+		effort: "high",
+		contextTokens: 200000
+	});
+});
+
+test("a cancelled or failed OpenCode login never corrupts saved settings", async () => {
+	const path = configPath();
+	const saved = { agent: "claude", model: "opus" };
+	saveSettings({ version: 1, selected: saved, recent: [], adapters: {} }, path);
+	const before = readFileSync(path, "utf8");
+	const logged: string[] = [];
+	const log = console.log;
+	console.log = (...args: unknown[]) => void logged.push(args.join(" "));
+	try {
+		await expect(
+			resolveCli(["settings"], {
+				path,
+				interactive: true,
+				installed: (name) => name === "opencode",
+				onboarding: {
+					inspect: async () => ({
+						standalone: true,
+						providers: [{ id: "opencode", name: "OpenCode Console", connected: false }]
+					}),
+					login: async () => 130 // interrupted
+				},
+				models: async () => [],
+				ui: {
+					select: async (message) => {
+						if (message === "Agent") return "opencode";
+						if (message === "No OpenCode provider is connected") return "login";
+						throw new Cancelled();
+					},
+					text: async () => {
+						throw new Cancelled();
+					}
+				}
+			})
+		).rejects.toThrow("Cancelled");
+	} finally {
+		console.log = log;
+	}
+	expect(readFileSync(path, "utf8")).toBe(before);
+	expect(existsSync(legacyBackupPath(path))).toBe(false);
+	expect(logged.join("\n")).toContain("opencode auth login");
+});
+
+test("an unreadable OpenCode auth state still allows an exact model ID", async () => {
+	const path = configPath();
+	const logged: string[] = [];
+	const log = console.log;
+	console.log = (...args: unknown[]) => void logged.push(args.join(" "));
+	try {
+		await resolveCli(["settings"], {
+			path,
+			interactive: true,
+			installed: (name) => name === "opencode",
+			onboarding: {
+				inspect: async () => ({ standalone: false, error: "OpenCode provider list is malformed" }),
+				login: async () => {
+					throw new Error("login must not run when detection failed");
+				}
+			},
+			models: async () => [],
+			ui: {
+				select: async (message) =>
+					message === "Agent" ? "opencode" : message === "Model" ? "__exact__" : "__default__",
+				text: async () => "opencode/manual-model"
+			}
+		});
+	} finally {
+		console.log = log;
+	}
+	expect(logged.join("\n")).toContain("OpenCode provider list is malformed");
+	expect(loadSettings(path).selected).toEqual({
+		agent: "opencode",
+		model: "opencode/manual-model"
+	});
+});
+
+test("models split by provider only when OpenCode reports several providers", async () => {
+	const path = configPath();
+	const events: string[] = [];
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		installed: (name) => name === "opencode",
+		onboarding: onboarding([
+			{ id: "opencode", name: "OpenCode Console", connected: true },
+			{ id: "opencode-go", name: "OpenCode Go", connected: true }
+		]),
+		models: async () => [
+			{ id: "opencode/zen-only", contextTokens: 200000 },
+			{ id: "opencode-go/go-only", contextTokens: 131072 }
+		],
+		ui: {
+			select: async (message, choices, initial) => {
+				events.push(message);
+				if (message === "Agent") return "opencode";
+				if (message === "Provider") {
+					expect(choices.map((o) => [o.value, o.label, o.hint])).toEqual([
+						["opencode", "OpenCode Console", "1 model · connected"],
+						["opencode-go", "OpenCode Go", "1 model · connected"]
+					]);
+					// Go and Zen are distinct providers; Go is never folded into the console catalog.
+					expect(initial).toBe("opencode");
+					return "opencode-go";
+				}
+				if (message === "Model") {
+					expect(choices.map((o) => o.value)).toEqual([
+						"opencode-go/go-only",
+						"__exact__",
+						"__connect__",
+						"__refresh__"
+					]);
+					return "opencode-go/go-only";
+				}
+				return "__default__";
+			},
+			text: async () => {
+				throw new Error("unused");
+			}
+		}
+	});
+	expect(events).toEqual(["Agent", "Provider", "Model", "Effort"]);
+	expect(loadSettings(path).selected).toEqual({
+		agent: "opencode",
+		model: "opencode-go/go-only",
+		contextTokens: 131072
+	});
+});
+
+test("refreshing the OpenCode catalog re-reads models without restarting", async () => {
+	const path = configPath();
+	let discoveries = 0;
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		installed: (name) => name === "opencode",
+		onboarding: onboarding([{ id: "opencode", name: "OpenCode Console", connected: true }]),
+		models: async () => {
+			discoveries++;
+			return discoveries === 1
+				? [{ id: "opencode/first", variants: ["low"] }]
+				: [{ id: "opencode/first", variants: ["low"] }, { id: "opencode/second" }];
+		},
+		ui: {
+			select: async (message, choices) => {
+				if (message === "Agent") return "opencode";
+				if (message === "Model")
+					return choices.some((o) => o.value === "opencode/second")
+						? "opencode/second"
+						: "__refresh__";
+				expect(choices).toEqual([
+					{ value: "__default__", label: "Use configured agent default" },
+					{ value: "__exact__", label: "Enter exact effort/variant" }
+				]);
+				return "__default__";
+			},
+			text: async () => {
+				throw new Error("unused");
+			}
+		}
+	});
+	expect(discoveries).toBe(2);
+	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode/second" });
+});
+
+test("a user with Zen connected can add Go without leaving ytd; existing auth is untouched", async () => {
+	const path = configPath();
+	const events: string[] = [];
+	let goConnected = false;
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		installed: (name) => name === "opencode",
+		onboarding: {
+			inspect: async () => {
+				events.push("inspect");
+				return {
+					standalone: true,
+					providers: [
+						{ id: "opencode", name: "OpenCode Console", connected: true },
+						{ id: "opencode-go", name: "OpenCode Go", connected: goConnected }
+					]
+				};
+			},
+			login: async () => {
+				events.push("login");
+				goConnected = true;
+				return 0;
+			}
+		},
+		models: async () => [
+			{ id: "opencode/zen-only", label: "Zen Only", contextTokens: 200000 },
+			...(goConnected ? [{ id: "opencode-go/go-only", label: "Go Only" }] : [])
+		],
+		ui: {
+			select: async (message, choices) => {
+				events.push(message);
+				if (message === "Agent") return "opencode";
+				if (message === "Provider") {
+					// The refreshed provider list reflects the new connection without a restart.
+					expect(choices.map((o) => o.hint)).toEqual([
+						"1 model · connected",
+						"1 model · connected"
+					]);
+					return "opencode-go";
+				}
+				if (message === "Model" && !goConnected) {
+					// Readable names keep the exact provider/model ID visible and searchable.
+					expect(choices[0]).toEqual({
+						value: "opencode/zen-only",
+						label: "Zen Only",
+						hint: "opencode/zen-only · 200k context · suggestion; availability depends on your account"
+					});
+					return "__connect__";
+				}
+				if (message === "Model") return "opencode-go/go-only";
+				return "__default__";
+			},
+			text: async () => {
+				throw new Error("unused");
+			}
+		}
+	});
+	// A connected provider skips the first-run login prompt; login runs only when asked for.
+	expect(events).toEqual([
+		"Agent",
+		"inspect",
+		"Model",
+		"login",
+		"inspect",
+		"Provider",
+		"Model",
+		"Effort"
+	]);
+	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode-go/go-only" });
+});
+
+test("refreshing the OpenCode catalog also re-reads providers", async () => {
+	const path = configPath();
+	let inspections = 0;
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		installed: (name) => name === "opencode",
+		onboarding: {
+			inspect: async () => {
+				inspections++;
+				return {
+					standalone: true,
+					providers: [{ id: "opencode", name: "OpenCode Console", connected: true }]
+				};
+			},
+			login: async () => {
+				throw new Error("refresh must not log in");
+			}
+		},
+		models: async () => [{ id: "opencode/first" }],
+		ui: {
+			select: async (message) => {
+				if (message === "Agent") return "opencode";
+				if (message === "Model") return inspections < 2 ? "__refresh__" : "opencode/first";
+				return "__default__";
+			},
+			text: async () => {
+				throw new Error("unused");
+			}
+		}
+	});
+	expect(inspections).toBe(2);
+});
+
+test("a failed login from the model picker is reported and keeps the picker usable", async () => {
+	const path = configPath();
+	const logged: string[] = [];
+	const log = console.log;
+	console.log = (...args: unknown[]) => void logged.push(args.join(" "));
+	let attempts = 0;
+	try {
+		await resolveCli(["settings"], {
+			path,
+			interactive: true,
+			installed: (name) => name === "opencode",
+			onboarding: {
+				inspect: async () => ({ standalone: true, providers: connectedConsole }),
+				login: async () => {
+					throw new Error("spawn opencode ENOENT");
+				}
+			},
+			models: async () => [{ id: "opencode/first" }],
+			ui: {
+				select: async (message) => {
+					if (message === "Agent") return "opencode";
+					if (message === "Model") return attempts++ === 0 ? "__connect__" : "opencode/first";
+					return "__default__";
+				},
+				text: async () => {
+					throw new Error("unused");
+				}
+			}
+		});
+	} finally {
+		console.log = log;
+	}
+	expect(logged.join("\n")).toContain("login could not start: spawn opencode ENOENT");
+	expect(logged.join("\n")).toContain("login did not complete");
+	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode/first" });
+});
+
+test("an invalid settings file naming Freebuff is reported and never rewritten", () => {
+	const path = configPath();
+	for (const invalid of [
+		{ version: 2, selected: { agent: "freebuff", model: "m" }, recent: [], adapters: {} },
+		{
+			version: 1,
+			selected: { agent: "freebuff", model: "m" },
+			recent: [{ agent: "unknown-agent", model: "m" }],
+			adapters: {}
+		},
+		{ version: 1, selected: { agent: "freebuff", model: "m" }, recent: [], adapters: { pi: {} } }
+	]) {
+		const original = JSON.stringify(invalid);
+		writeFileSync(path, original);
+		expect(() => loadSettings(path)).toThrow();
+		expect(readFileSync(path, "utf8")).toBe(original);
+		expect(existsSync(legacyBackupPath(path))).toBe(false);
+	}
+});
+
+test("a custom wrapper named freebuff stays selectable from the command line", () => {
+	const custom = { executable: "/bin/cat", args: ["--model", "{model}"] };
+	const settings = { version: 1 as const, recent: [], adapters: { freebuff: custom } };
+	expect(
+		profileFromArgs(parseArgs(["--agent", "freebuff", "--model", "wrapper-model"]), settings)
+	).toEqual({ agent: "freebuff", model: "wrapper-model", custom });
 });

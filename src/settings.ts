@@ -19,7 +19,14 @@ import {
 	type CustomAdapter,
 	type ModelSuggestion
 } from "./agents.ts";
-import { catalogNote, freebuffModel, LEGACY_HANDOFF_CONTEXT } from "./freebuff.ts";
+import {
+	opencodeOnboarding,
+	providerGroups,
+	providerOf,
+	type OpencodeInspection,
+	type OpencodeOnboarding,
+	type OpencodeProvider
+} from "./opencode.ts";
 
 export const SETTINGS_PATH = join(homedir(), ".ytd/config.json");
 export interface Settings {
@@ -28,9 +35,68 @@ export interface Settings {
 	recent: AgentProfile[];
 	adapters: Record<string, CustomAdapter>;
 }
+
+/**
+ * Freebuff was a supported agent until it was removed. Saved files may still name it, so it is
+ * recognized before strict validation instead of leaving an install unable to start.
+ */
+const REMOVED_AGENT = "freebuff";
+export const REMOVED_AGENT_ERROR =
+	"Freebuff support was removed from ytd. Choose another agent and model: ytd settings, or --agent NAME --model ID.";
+
+/** The one pre-migration copy kept for recovery; written before any settings change. */
+export const legacyBackupPath = (path = SETTINGS_PATH) => `${path}.freebuff-backup.json`;
+
+const removedAgentProfile = (value: unknown): boolean => {
+	const profile = value as AgentProfile | undefined;
+	// A trusted custom wrapper that happens to use this name is unrelated to the removed agent.
+	return (
+		Boolean(profile) &&
+		typeof profile === "object" &&
+		!Array.isArray(profile) &&
+		profile!.agent === REMOVED_AGENT &&
+		!profile!.custom
+	);
+};
+
+function backupLegacySettings(path: string, original: string): void {
+	const backup = legacyBackupPath(path);
+	// An interrupted migration leaves the original untouched, so a second copy would be identical.
+	if (existsSync(backup)) return;
+	const temp = `${backup}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	const fd = openSync(temp, "wx", 0o600);
+	try {
+		writeFileSync(fd, original);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(temp, backup);
+}
+
+/**
+ * Drops the removed agent from the active and recent selections in memory, keeping every other
+ * setting intact. Idempotent: once migrated, later loads find nothing to change and write nothing.
+ */
+function migrateRemovedAgent(config: Settings): boolean {
+	const recent = Array.isArray(config.recent) ? config.recent : [];
+	if (!removedAgentProfile(config.selected) && !recent.some(removedAgentProfile)) return false;
+	if (removedAgentProfile(config.selected)) delete config.selected;
+	if (Array.isArray(config.recent))
+		config.recent = config.recent.filter((profile) => !removedAgentProfile(profile));
+	return true;
+}
+
 export function loadSettings(path = SETTINGS_PATH): Settings {
 	if (!existsSync(path)) return { version: 1, recent: [], adapters: {} };
-	const config = JSON.parse(readFileSync(path, "utf8")) as Settings;
+	const original = readFileSync(path, "utf8");
+	const config = JSON.parse(original) as Settings;
+	// Migrated in memory first: an invalid or unsupported file is reported and never rewritten.
+	const migrated =
+		Boolean(config) &&
+		typeof config === "object" &&
+		!Array.isArray(config) &&
+		migrateRemovedAgent(config);
 	if (
 		config.version !== 1 ||
 		!Array.isArray(config.recent) ||
@@ -48,11 +114,12 @@ export function loadSettings(path = SETTINGS_PATH): Settings {
 			);
 		else if (!validateProfile({ agent, model: "validation", custom }))
 			throw new Error(`Invalid custom adapter ${agent}; settings preserved`);
-	// The first Freebuff release saved a 32k handoff cap; move it to the current catalog value.
-	for (const profile of [config.selected, ...config.recent]) {
-		const listed = profile?.agent === "freebuff" ? freebuffModel(profile.model) : undefined;
-		if (listed?.contextTokens && profile!.contextTokens === LEGACY_HANDOFF_CONTEXT)
-			profile!.contextTokens = listed.contextTokens;
+	if (migrated) {
+		backupLegacySettings(path, original);
+		saveSettings(config, path);
+		console.warn(
+			`Removed Freebuff from saved agent settings; the previous file is preserved at ${legacyBackupPath(path)}`
+		);
 	}
 	return config;
 }
@@ -121,6 +188,9 @@ export function parseArgs(argv: string[]): CliArgs {
 }
 
 export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile | undefined {
+	// A trusted custom wrapper may reuse the removed name.
+	if (args.agent === REMOVED_AGENT && !settings.adapters[REMOVED_AGENT])
+		throw new Error(REMOVED_AGENT_ERROR);
 	const previous = settings.selected;
 	const agent = args.agent ?? previous?.agent;
 	if (!agent) return undefined;
@@ -130,16 +200,9 @@ export function profileFromArgs(args: CliArgs, settings: Settings): AgentProfile
 	const model = args.model ?? (!changed ? previous?.model : undefined);
 	if (!model) throw new Error("Select a model with --model or ytd settings");
 	const custom = settings.adapters[agent];
-	const listed = agent === "freebuff" ? freebuffModel(model) : undefined;
-	// Freebuff cannot be told an effort, so a choice its picker lacks would mislead the user.
-	if (listed && args.effort && !listed.efforts?.includes(args.effort))
-		throw new Error(
-			`${listed.name} ${listed.efforts?.length ? `offers effort ${listed.efforts.join(", ")}` : "has no effort setting"} in Freebuff`
-		);
 	const profile: AgentProfile = {
 		agent,
 		model,
-		...(listed?.contextTokens ? { contextTokens: listed.contextTokens } : {}),
 		...(!changed && previous?.model === model
 			? {
 					...(previous.contextTokens ? { contextTokens: previous.contextTokens } : {}),
@@ -194,21 +257,107 @@ const picker: Picker = {
 		);
 	}
 };
+
+// Fallback effort names for harnesses without per-model variants. OpenCode has none: only the
+// variants its model metadata lists are offered, because it rejects every other value.
 export const EFFORTS: Record<string, string[]> = {
 	claude: ["low", "medium", "high", "xhigh", "max"],
 	codex: ["none", "minimal", "low", "medium", "high", "xhigh"],
-	pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-	opencode: ["minimal", "low", "medium", "high", "max"]
+	pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 };
-const AGENT_HINTS: Record<string, string> = {
-	freebuff: "interactive handoff; no headless mode; login not checked"
-};
+
+/** Context windows are shown only when the harness reports one. */
+const contextHint = (tokens?: number) =>
+	tokens === undefined
+		? undefined
+		: `${
+				tokens >= 1_000_000
+					? `${Number((tokens / 1_000_000).toFixed(1))}M`
+					: `${Math.round(tokens / 1000)}k`
+			} context`;
+
+const connectedNames = (providers: OpencodeProvider[]) =>
+	providers
+		.filter((provider) => provider.connected)
+		.map((provider) => provider.name)
+		.join(", ");
+
+/** Reads OpenCode's providers; a failed read is reported, never treated as "none connected". */
+async function inspectProviders(
+	onboarding: OpencodeOnboarding
+): Promise<OpencodeProvider[] | undefined> {
+	let inspection: OpencodeInspection;
+	try {
+		inspection = await onboarding.inspect();
+	} catch (error) {
+		inspection = { standalone: false, error: (error as Error).message };
+	}
+	if (!inspection.providers) {
+		console.log(`OpenCode: ${inspection.error ?? "providers are unavailable"}.`);
+		return undefined;
+	}
+	if (inspection.providers.some((provider) => provider.connected))
+		console.log(`OpenCode providers: ${connectedNames(inspection.providers)}.`);
+	return inspection.providers;
+}
+
+/**
+ * Runs OpenCode's own login, which adds or refreshes one provider, then re-reads what OpenCode
+ * reports instead of assuming it succeeded. ytd never reads or stores credentials, and nothing is
+ * saved until a selection completes.
+ */
+async function connectProvider(
+	onboarding: OpencodeOnboarding
+): Promise<OpencodeProvider[] | undefined> {
+	let code: number;
+	try {
+		code = await onboarding.login();
+	} catch (error) {
+		console.log(`OpenCode: login could not start: ${(error as Error).message}.`);
+		code = 1;
+	}
+	const providers = await inspectProviders(onboarding);
+	if (code !== 0)
+		console.log(
+			"OpenCode: login did not complete; saved settings are unchanged. Connect later with: opencode auth login"
+		);
+	else if (providers && !providers.some((provider) => provider.connected))
+		console.log(
+			"OpenCode: login finished without a connected provider; saved settings are unchanged."
+		);
+	return providers;
+}
+
+/** Shows connected providers and, when none is connected, offers OpenCode's own login. */
+async function prepareOpencode(
+	ui: Picker,
+	onboarding: OpencodeOnboarding
+): Promise<OpencodeProvider[] | undefined> {
+	const providers = await inspectProviders(onboarding);
+	if (!providers || providers.some((provider) => provider.connected)) return providers;
+	const action = await ui.select(
+		"No OpenCode provider is connected",
+		[
+			{ value: "login", label: "Connect a provider now", hint: "runs opencode auth login" },
+			{
+				value: "skip",
+				label: "Enter a model ID instead",
+				hint: "connect later: opencode auth login"
+			}
+		],
+		"login"
+	);
+	if (action === "login") return connectProvider(onboarding);
+	console.log("OpenCode: no provider connected. Connect one with: opencode auth login");
+	return providers;
+}
 
 async function chooseProfile(
 	config: Settings,
 	ui: Picker,
 	models: typeof discoverModels,
-	installed: (name: string) => boolean
+	installed: (name: string) => boolean,
+	onboarding: OpencodeOnboarding = opencodeOnboarding
 ): Promise<AgentProfile> {
 	// Clack draws no hint for disabled rows and may start on one, so name the state in the label
 	// and start on an installed agent.
@@ -219,7 +368,7 @@ async function chooseProfile(
 				? {
 						value,
 						label: value,
-						hint: AGENT_HINTS[value] ?? (config.adapters[value] ? "trusted wrapper" : "headless")
+						hint: config.adapters[value] ? "trusted wrapper" : "headless"
 					}
 				: { value, label: `${value} (not installed)`, disabled: true };
 		})
@@ -235,50 +384,118 @@ async function chooseProfile(
 		throw new Error(
 			agent ? `${agent} is not installed; no agent was selected` : "No installed agent was selected"
 		);
-	const suggestions = await models(agent);
+	// OpenCode lists models only for connected providers, so it is prepared before discovery.
+	let providers = agent === "opencode" ? await prepareOpencode(ui, onboarding) : undefined;
+	let suggestions = await models(agent);
 	const recent = config.recent.filter((p) => p.agent === agent);
-	const unique = new Map<string, ModelSuggestion>(
-		[...recent.map((p) => ({ id: p.model, contextTokens: p.contextTokens })), ...suggestions].map(
-			(m) => [m.id, m]
-		)
-	);
-	const modelChoice = await ui.select(
-		agent === "freebuff" ? `Model · ${catalogNote()}` : "Model",
-		[...unique.values()]
-			.map((m) => ({
-				value: m.id,
-				label: m.label ?? suggestions.find((s) => s.id === m.id)?.label ?? m.id,
-				hint: recent.some((p) => p.model === m.id)
-					? ["recent", suggestions.find((s) => s.id === m.id)?.hint].filter(Boolean).join("; ")
-					: (m.hint ?? "suggestion; availability depends on your account")
-			}))
-			.concat([
-				{
-					value: "__exact__",
-					label: "Enter exact model ID",
-					hint: "Any text model supported by this agent and account"
-				}
-			]),
-		config.selected?.agent === agent ? config.selected.model : undefined,
-		true
-	);
-	const model =
-		modelChoice === "__exact__" ? (await ui.text("Exact model ID")).trim() : modelChoice;
-	const variants = suggestions.find((m) => m.id === model)?.variants;
-	// An OpenCode model ID ending in #variant already selects its variant; Freebuff offers
-	// effort only for catalog models that list efforts.
+	const merged = () =>
+		new Map<string, ModelSuggestion>(
+			[...recent.map((p) => ({ id: p.model, contextTokens: p.contextTokens })), ...suggestions].map(
+				(m) => [m.id, m]
+			)
+		);
+	let model: string;
+	let offered: ModelSuggestion[];
+	for (;;) {
+		const unique = merged();
+		// Only OpenCode reports many providers for one agent; other pickers stay one flat list.
+		const groups = agent === "opencode" ? providerGroups([...unique.values()]) : undefined;
+		const initialProvider = providers?.find((provider) => provider.connected)?.id;
+		const provider = groups
+			? await ui.select(
+					"Provider",
+					groups.map((group) => {
+						const entry = providers?.find((candidate) => candidate.id === group.id);
+						return {
+							value: group.id,
+							label: entry?.name ?? group.id,
+							// Connection state only as OpenCode reports it; a listed model is not entitlement.
+							hint: [
+								`${group.models.length} model${group.models.length === 1 ? "" : "s"}`,
+								entry ? (entry.connected ? "connected" : "not connected") : undefined
+							]
+								.filter(Boolean)
+								.join(" · ")
+						};
+					}),
+					groups.some((group) => group.id === initialProvider) ? initialProvider : undefined,
+					true
+				)
+			: undefined;
+		const options = [...unique.values()].filter(
+			(option) => !provider || providerOf(option.id) === provider
+		);
+		const savedModel = config.selected?.agent === agent ? config.selected.model : undefined;
+		const modelChoice = await ui.select(
+			"Model",
+			options
+				.map((option) => {
+					const label =
+						option.label ?? suggestions.find((s) => s.id === option.id)?.label ?? option.id;
+					return {
+						value: option.id,
+						label,
+						hint: [
+							// A display name never hides the exact ID that is saved and searched.
+							label === option.id ? undefined : option.id,
+							contextHint(option.contextTokens),
+							recent.some((p) => p.model === option.id) ? "recent" : undefined,
+							option.hint ?? "suggestion; availability depends on your account"
+						]
+							.filter(Boolean)
+							.join(" · ")
+					};
+				})
+				.concat([
+					{
+						value: "__exact__",
+						label: "Enter exact model ID",
+						hint: "Any text model supported by this agent and account"
+					},
+					// A dynamic catalog can change while ytd is open; re-read it without restarting.
+					...(agent === "opencode"
+						? [
+								{
+									value: "__connect__",
+									label: "Connect another provider",
+									hint: "runs opencode auth login to add or refresh one provider"
+								},
+								{
+									value: "__refresh__",
+									label: "Refresh model catalog",
+									hint: "Re-read providers and models from OpenCode"
+								}
+							]
+						: [])
+				]),
+			options.some((option) => option.id === savedModel) ? savedModel : undefined,
+			true
+		);
+		if (modelChoice === "__refresh__" || modelChoice === "__connect__") {
+			providers =
+				modelChoice === "__connect__"
+					? await connectProvider(onboarding)
+					: await inspectProviders(onboarding);
+			suggestions = await models(agent);
+			continue;
+		}
+		offered = [...unique.values()];
+		model = modelChoice === "__exact__" ? (await ui.text("Exact model ID")).trim() : modelChoice;
+		break;
+	}
+	// Only variants the model lists are offered; OpenCode rejects everything else at preflight.
+	const variants =
+		offered.find((m) => m.id === model)?.variants ?? (agent === "opencode" ? [] : undefined);
+	// An OpenCode model ID ending in #variant already selects its variant.
 	const effortChoice =
-		(agent === "opencode" && model.includes("#")) || (agent === "freebuff" && !variants?.length)
+		agent === "opencode" && model.includes("#")
 			? "__default__"
 			: await ui.select(
 					"Effort",
 					[
 						{ value: "__default__", label: "Use configured agent default" },
 						...(variants ?? EFFORTS[agent] ?? []).map((value) => ({ value, label: value })),
-						// Freebuff catalog efforts are exact; ytd cannot pass Freebuff anything else.
-						...(agent === "freebuff" && variants?.length
-							? []
-							: [{ value: "__exact__", label: "Enter exact effort/variant" }])
+						{ value: "__exact__", label: "Enter exact effort/variant" }
 					],
 					"__default__"
 				);
@@ -292,7 +509,9 @@ async function chooseProfile(
 		config.selected?.agent === agent && config.selected.model === model
 			? config.selected
 			: undefined;
-	const contextTokens = previous ? previous.contextTokens : unique.get(model)?.contextTokens;
+	const contextTokens = previous
+		? previous.contextTokens
+		: offered.find((m) => m.id === model)?.contextTokens;
 	const timeoutMs = previous?.timeoutMs;
 	const custom = config.adapters[agent];
 	return {
@@ -316,6 +535,7 @@ export async function resolveCli(
 		ui?: Picker;
 		models?: typeof discoverModels;
 		installed?: (name: string) => boolean;
+		onboarding?: OpencodeOnboarding;
 	} = {}
 ): Promise<{ url: string; profile: AgentProfile; replaceRouting: boolean } | null> {
 	const args = parseArgs(argv);
@@ -331,6 +551,7 @@ export async function resolveCli(
 	const models = options.models ?? discoverModels;
 	const installed =
 		options.installed ?? ((name: string) => Boolean(Bun.which(name, { PATH: process.env.PATH })));
+	const onboarding = options.onboarding ?? opencodeOnboarding;
 	prompts.updateSettings({
 		withGuide: false,
 		accessible: Boolean(process.env.NO_COLOR || process.env.TERM === "dumb")
@@ -372,7 +593,8 @@ export async function resolveCli(
 		args.effort !== undefined ||
 		args.contextTokens !== undefined ||
 		args.timeoutMs !== undefined;
-	if (args.command === "settings") profile = await chooseProfile(config, ui, models, installed);
+	if (args.command === "settings")
+		profile = await chooseProfile(config, ui, models, installed, onboarding);
 	else {
 		try {
 			profile = profileFromArgs(args, config);
@@ -395,7 +617,7 @@ export async function resolveCli(
 			if (action === "change") profile = undefined;
 		}
 		if (!profile) {
-			profile = await chooseProfile(config, ui, models, installed);
+			profile = await chooseProfile(config, ui, models, installed, onboarding);
 			replaceRouting = true;
 		}
 	}

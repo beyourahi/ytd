@@ -316,6 +316,7 @@ describe("OpenCode 2", () => {
 		{
 			id: "deepseek-v4.1-flash-free",
 			providerID: "opencode",
+			name: "DeepSeek V4.1 Flash Free",
 			enabled: true,
 			status: "active",
 			capabilities: { input: ["text", "image"], output: ["text"] },
@@ -543,6 +544,7 @@ else{let input="";process.stdin.on("data",d=>input+=d);process.stdin.on("end",()
 		expect(parsed).toEqual([
 			{
 				id: model,
+				label: "DeepSeek V4.1 Flash Free",
 				contextTokens: 200000,
 				variants: ["low", "high", "max"],
 				hint: "listed at no cost; free-tier quotas apply"
@@ -555,6 +557,10 @@ else{let input="";process.stdin.on("data",d=>input+=d);process.stdin.on("end",()
 		]);
 		await withFake(async (record) => {
 			expect(await discoverModels("opencode")).toEqual(parsed);
+			// Discovery starts its private server only under the execution restrictions.
+			process.env.YTD_TEST_DECLARED_PLUGIN = "1";
+			expect(await discoverModels("opencode")).toEqual([]);
+			delete process.env.YTD_TEST_DECLARED_PLUGIN;
 			process.env.YTD_TEST_API_FAIL = "1";
 			// A failed private listing never falls back to the shared background service.
 			expect(await discoverModels("opencode")).toEqual([]);
