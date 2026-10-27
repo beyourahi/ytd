@@ -11,7 +11,8 @@
 		"format": "prettier --write .",
 		"lint": "prettier --check . && eslint .",
 		"check": "tsc --noEmit",
-		"test": "bun test"
+		"test": "bun test",
+		"bench": "bun run bench/run.ts"
 	},
 	"devDependencies": {
 		"@eslint/js": "^10.0.1",

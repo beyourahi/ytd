@@ -170,7 +170,7 @@ const bytes = (s: string) => Buffer.byteLength(s, "utf8");
  * short-circuits; any wording difference — however small — still goes to the model, so nothing
  * is inferred from string similarity and the semantic decision is never decided locally.
  */
-function normalisePrinciple(value: string): string {
+export function normalisePrinciple(value: string): string {
 	return value
 		.normalize("NFKC")
 		.toLowerCase()
