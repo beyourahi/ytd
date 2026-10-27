@@ -56,7 +56,10 @@ if (process.argv[1].endsWith("yt-dlp")) {
    await Bun.sleep(10);
   }
  }
- const p={theme:"Reliable systems",principle:"Checkpoint completed work before advancing",ids:candidates.length ? [...new Set(candidates.map(c=>c.sourceId))] : [sourceId]};
+ const ids=candidates.length ? [...new Set(candidates.map(c=>c.sourceId))] : [sourceId];
+ // The principle names the sources it came from, so two different videos never assert the
+ // identical sentence: a verbatim repeat is a duplicate the palace must not publish twice.
+ const p={theme:"Reliable systems",principle:"Checkpoint completed work before advancing in "+ids.join(" and "),ids};
  if(prompt.startsWith("Distill")) console.log(JSON.stringify({candidates:process.env.YTD_FIXTURE_SOURCE_RESULT ? [] : [{principle:p.principle,detail:"Commit progress atomically so interruption does not lose work.",theme:p.theme,sourceId}],halalNotes:process.env.YTD_FIXTURE_SOURCE_RESULT === "empty" ? [] : [{sourceId,room:"business",note:"Rejected the source shortcut; supporting evidence is uncertain."}]}));
  else if(prompt.startsWith("Carefully")) console.log(JSON.stringify({candidates:[],halalNotes:process.env.YTD_FIXTURE_SOURCE_RESULT ? [] : [{sourceId,room:"craft",note:"Reframed the source advice as transferable workflow guidance."}]}));
  else if(prompt.startsWith("Merge")) console.log(JSON.stringify({rooms:[{room:"content",principles:[p],halalNotes:[]},{room:"craft",principles:[p],halalNotes:[]},{room:"business",principles:[],halalNotes:["Reject the doubtful shortcut"]}]}));
