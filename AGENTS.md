@@ -13,7 +13,7 @@ palace-wide deduplication → halal gate → transactional, remotely verified ro
 See README.md for user commands, recovery, settings, and isolation details. Preserve:
 
 - `ytd <url>` and bare `ytd` guided terminal workflow; `ytd settings`, `ytd agents add`.
-- One explicitly selected Claude/Codex/Pi/OpenCode/custom agent and model per run.
+- One explicitly selected supported agent or trusted custom command and model per run.
 - Optional `--agent`, `--model`, `--effort`; no fallback or auth/provider/billing changes.
 - Removed agents are migrated out of saved settings with a backup and never replaced silently.
 - Unknown context defaults to 8k; complete assembled prompts must fit including reserves.
@@ -25,17 +25,20 @@ See README.md for user commands, recovery, settings, and isolation details. Pres
   local rather than published caption text, cached per video, and never fails the run.
 - Listing is streamed and staged; an unfinished listing is reported as partial and its saved
   videos stay included.
+- Ingestion reports total wall-clock runtime once after cleanup; progress and diagnostics use the
+  sanitising presenter, with plain output for redirected or unsupported terminals.
 - `bun install --frozen-lockfile`, `bun test`, `bun run check`, `bun run lint` before landing.
 - Keep TypeScript 7 compiler / TypeScript 6 ESLint compatibility; no unrelated upgrades.
 - Tests use fake processes and temporary SQLite/Git fixtures; never publish test notes to Palace.
 
-## Source layout
+## Source layout (`src/`)
 
 - `cli.ts`: selection → enumerate/fetch → checkpointed distillation → publication/recovery/report.
 - `settings.ts`: atomic versioned settings, Clack keyboard/search picker, automation arguments.
 - `agents.ts`: installed protocol restrictions/preflight, routing snapshots, output validation/discovery.
 - `opencode.ts`: isolated install/auth inspection, guided `opencode auth login`, provider grouping.
 - `process.ts`: concurrent stdout/stderr, owned process cancellation/timeouts, exit checking.
+- `ui.ts` / `progress.ts` / `metrics.ts`: terminal presentation, progress and session timing.
 - `enumerate.ts`: validated hostname/path parsing, playlists, actual creators, collision-safe identities.
 - `discovery.ts`: staged streaming listing log (`<slug>.list.partial` → `<slug>.list.jsonl`), batch reads.
 - `fetch.ts`: paced captions/description/pinned comments, tolerant parsers and atomic global video caches.
