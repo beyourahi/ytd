@@ -565,7 +565,7 @@ test("v1 migration backs up active state and preserves checkpoints, candidates a
 		expect(m.getCheckpoint("publication:creator")).toEqual({ complete: false });
 		m.close();
 		const migrated = new Database(path, { readonly: true });
-		expect(migrated.query("PRAGMA user_version").get()).toEqual({ user_version: 2 });
+		expect(migrated.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
 		expect(migrated.query("SELECT status FROM videos").get()).toEqual({ status: "fetched" });
 		migrated.close();
 		const backup = new Database(`${path}.v1.bak`, { readonly: true });

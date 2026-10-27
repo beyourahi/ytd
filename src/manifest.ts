@@ -5,6 +5,10 @@ import { randomUUID, createHash } from "node:crypto";
 import { DATA_DIR } from "./config.ts";
 import { Claims, acquireLegacyLock, type WaitOptions } from "./claims.ts";
 import { validSourceReview, type Candidate, type SourceHalalNote } from "./distill.ts";
+import { JobScheduler } from "./scheduler.ts";
+
+/** Schema version written by this build. Version 3 adds the durable job scheduler table. */
+export const SCHEMA_VERSION = 3;
 
 export type Status = "pending" | "fetched" | "distilled" | "done" | "failed" | "no_captions";
 export interface VideoRow {
@@ -68,6 +72,8 @@ export class Manifest {
 	private dataDir: string;
 	private slug: string;
 	private claims: Claims;
+	/** Durable scheduling memory (leases, attempts, backoff) for the active run. */
+	readonly jobs: JobScheduler;
 	runId = "";
 
 	static async open(
@@ -104,6 +110,7 @@ export class Manifest {
 		this.db = new Database(path);
 		this.db.run("PRAGMA busy_timeout=5000");
 		this.claims = new Claims(dataDir);
+		this.jobs = new JobScheduler(this.db, () => this.runId);
 		try {
 			if (
 				(this.db.query("PRAGMA integrity_check").get() as { integrity_check: string })
@@ -113,12 +120,12 @@ export class Manifest {
 			const originalVersion = (
 				this.db.query("PRAGMA user_version").get() as { user_version: number }
 			).user_version;
-			if (originalVersion > 2)
+			if (originalVersion > SCHEMA_VERSION)
 				throw new Error("Manifest is newer than this ytd; original data preserved");
 			const backupPath =
 				originalVersion === 0 ? `${path}.legacy.bak` : `${path}.v${originalVersion}.bak`;
 			if (
-				originalVersion < 2 &&
+				originalVersion < SCHEMA_VERSION &&
 				this.db.query("SELECT name FROM sqlite_master WHERE name='videos'").get() &&
 				!existsSync(backupPath)
 			)
@@ -129,7 +136,7 @@ export class Manifest {
 				.transaction(() => {
 					const version = (this.db.query("PRAGMA user_version").get() as { user_version: number })
 						.user_version;
-					if (version > 2)
+					if (version > SCHEMA_VERSION)
 						throw new Error("Manifest is newer than this ytd; original data preserved");
 
 					this.db.run(
@@ -195,7 +202,9 @@ export class Manifest {
 						}
 						this.db.run("UPDATE videos SET status='fetched',reason=NULL WHERE status='distilled'");
 					}
-					this.db.run("PRAGMA user_version=2");
+					// Additive: the jobs table only ever holds scheduling memory for unfinished work.
+					JobScheduler.create(this.db);
+					this.db.run(`PRAGMA user_version=${SCHEMA_VERSION}`);
 				})
 				.immediate();
 		} catch (error) {
