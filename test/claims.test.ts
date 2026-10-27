@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Claims, acquireLegacyLock } from "../src/claims.ts";
-import { Manifest } from "../src/manifest.ts";
+import { Manifest, waitForClaim } from "../src/manifest.ts";
 
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "ytd-claims-"));
@@ -95,6 +95,71 @@ test("claim recovery reclaims only confirmed absent owners and preserves ambiguo
 	}
 });
 
+test("a bounded wait gives up visibly instead of taking or releasing somebody else's claim", async () => {
+	const f = fixture();
+	const a = new Claims(f.root);
+	const b = new Claims(f.root);
+	const db = new Database(join(f.root, "claims.sqlite"));
+	try {
+		const releaseA = await a.acquire(["source:a"]);
+		const started = Date.now();
+		await expect(b.acquire(["source:a"], { timeoutMs: 80 })).rejects.toThrow(
+			"still held by another session"
+		);
+		expect(Date.now() - started).toBeLessThan(2_000);
+		// Nothing was taken, and the owner's claim is untouched.
+		expect(db.query("SELECT key FROM claims").all()).toEqual([{ key: "source:a" }]);
+		releaseA();
+		const releaseB = await b.acquire(["source:a"], { timeoutMs: 80 });
+		expect(db.query("SELECT pid FROM claims WHERE key='source:a'").get()).toEqual({
+			pid: process.pid
+		});
+		releaseB();
+		expect(db.query("SELECT COUNT(*) AS n FROM claims").get()).toEqual({ n: 0 });
+	} finally {
+		a.close();
+		b.close();
+		db.close();
+		f.cleanup();
+	}
+});
+
+test("tryAcquire decides per key, keeps peers' claims and treats a token mismatch as a conflict", async () => {
+	const f = fixture();
+	const a = new Claims(f.root);
+	const b = new Claims(f.root);
+	const db = new Database(join(f.root, "claims.sqlite"));
+	try {
+		const releaseA = await a.acquire(["peer"]);
+		const taken = b.tryAcquire(["peer", "free"]);
+		expect(taken.claimed).toEqual(["free"]);
+		expect(taken.held).toEqual(["peer"]);
+		// Releasing what B took must never release A's claim.
+		taken.release();
+		expect(db.query("SELECT key FROM claims ORDER BY key").all()).toEqual([{ key: "peer" }]);
+
+		// A row whose owner is alive but whose token is not ours is ambiguous, not reclaimable.
+		db.run("INSERT OR REPLACE INTO claims(key,pid,token) VALUES (?,?,?)", [
+			"mismatch",
+			process.pid,
+			"foreign-token"
+		]);
+		expect(b.tryAcquire(["mismatch"]).held).toEqual(["mismatch"]);
+		expect(db.query("SELECT token FROM claims WHERE key='mismatch'").get()).toEqual({
+			token: "foreign-token"
+		});
+
+		// Re-acquiring what this session already holds succeeds instead of spinning.
+		expect(b.tryAcquire(["free"]).claimed).toEqual(["free"]);
+		releaseA();
+	} finally {
+		a.close();
+		b.close();
+		db.close();
+		f.cleanup();
+	}
+});
+
 test("close releases this invocation's claims and leaves foreign claims intact", async () => {
 	const f = fixture();
 	const a = new Claims(f.root);
@@ -111,6 +176,84 @@ test("close releases this invocation's claims and leaves foreign claims intact",
 	} finally {
 		a.close();
 		b.close();
+		f.cleanup();
+	}
+});
+
+test("a claim wait reports a peer only for a bounded timeout and takes work a peer releases", async () => {
+	const f = fixture();
+	const a = new Claims(f.root);
+	const b = new Claims(f.root);
+	try {
+		const releaseA = await a.acquire(["video:contested"]);
+		// A live peer for the whole allowed wait is contention: reported, with nothing taken and
+		// nothing of the peer's touched.
+		expect(await waitForClaim(b, ["contested"], { timeoutMs: 60 })).toMatchObject({
+			claimed: [],
+			held: ["contested"]
+		});
+		// Reacquisition after that peer releases is an ordinary success, not a conflict report.
+		setTimeout(releaseA, 80);
+		const reacquired = await waitForClaim(b, ["contested"], { timeoutMs: 5_000 });
+		expect(reacquired.claimed).toEqual(["contested"]);
+		expect(reacquired.held).toEqual([]);
+		reacquired.release();
+		expect(await waitForClaim(b, ["contested"])).toMatchObject({ claimed: ["contested"] });
+	} finally {
+		a.close();
+		b.close();
+		f.cleanup();
+	}
+});
+
+test("a cancelled claim wait propagates the cancellation instead of reporting a peer", async () => {
+	const f = fixture();
+	const a = new Claims(f.root);
+	const b = new Claims(f.root);
+	try {
+		const releaseA = await a.acquire(["video:contested"]);
+		const cancellation = new AbortController();
+		const waited = waitForClaim(b, ["contested"], {
+			signal: cancellation.signal,
+			onWait: () => cancellation.abort(new Error("cancelled while waiting"))
+		});
+		await expect(waited).rejects.toThrow("cancelled while waiting");
+		releaseA();
+	} finally {
+		a.close();
+		b.close();
+		f.cleanup();
+	}
+});
+
+test("an ownership-store failure keeps its own cause and releases what the wait took", async () => {
+	const f = fixture();
+	const peer = new Claims(f.root);
+	const mine = new Claims(f.root);
+	const db = new Database(join(f.root, "claims.sqlite"));
+	try {
+		const releasePeer = await peer.acquire(["video:contested"]);
+		const failure = new Error("SQLITE_IOERR: disk I/O error");
+		// The free identity really is taken before the store fails: a failed wait must not report
+		// ownership conflict for what it did not get, nor leave behind what it did.
+		const broken = {
+			tryAcquire: (keys: string[]) => mine.tryAcquire(keys),
+			acquire: async () => {
+				throw failure;
+			}
+		};
+		const error = await waitForClaim(broken, ["contested", "free"], { timeoutMs: 5_000 }).catch(
+			(problem: unknown) => problem
+		);
+		expect(error).toBe(failure);
+		expect(db.query("SELECT key FROM claims ORDER BY key").all()).toEqual([
+			{ key: "video:contested" }
+		]);
+		releasePeer();
+	} finally {
+		peer.close();
+		mine.close();
+		db.close();
 		f.cleanup();
 	}
 });

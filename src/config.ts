@@ -51,6 +51,14 @@ export interface ConcurrencySettings {
 	discoveryBatch: number;
 	/** Age at which an abandoned work claim may be reclaimed by anyone. */
 	leaseMs: number;
+	/**
+	 * How long a session waits for another live session to release the videos it just discovered.
+	 *
+	 * Waiting reuses the peer's finished extraction instead of paying for it twice, but it is
+	 * bounded: two sessions each holding something the other wants must fail visibly rather than
+	 * wait on each other forever.
+	 */
+	peerWaitMs: number;
 }
 
 /**
@@ -67,7 +75,8 @@ export const CONCURRENCY: ConcurrencySettings = {
 	progressThreshold: 10,
 	progressIntervalMs: 2000,
 	discoveryBatch: 500,
-	leaseMs: 60_000
+	leaseMs: 60_000,
+	peerWaitMs: 60_000
 };
 
 /**

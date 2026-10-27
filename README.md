@@ -187,11 +187,31 @@ a clean review. Reruns preserve recorded decisions through interruptions and par
 already published notes are never rewritten.
 
 Separate Mac terminal windows can run `ytd` concurrently. Disjoint sources/videos fetch and
-extract in parallel. Overlapping commands wait for the source and its complete video set, then
+extract in parallel. Fetching and extraction are one pipelined stage over the durable queue:
+extraction of a source begins as soon as its transcript is ready rather than after the whole channel
+has been fetched, and extraction workers stay up while fetches — or a retry still backing off — can
+produce more work. Overlapping commands wait for the source and its complete video set, then
 reuse shared caches and completed-video evidence without repeating model calls. Progress,
 checkpoints, creator metadata, and profile replacement remain scoped to each source/run. Saved unfinished videos
-remain included even when a later listing changes. Aggregate service usage can increase across
-sessions; pacing remains enabled within each session.
+remain included even when a later listing changes.
+
+Concurrency, pacing and their ceilings are shared across sessions in one local SQLite database, so
+two sessions cannot jointly exceed the aggregate request budget, and sessions that ask for
+different ceilings resolve to the most conservative one. Slots are leased with a lifetime, so a
+killed session releases its share without manual cleanup, and a throttle or transient failure
+narrows admission of new requests rather than killing work already running.
+
+The concurrency settings are not interchangeable. `--fetch-concurrency` is the number of
+concurrent YouTube **requests**: one slot is held for as long as one `yt-dlp` process runs,
+whether that process is listing a tab or fetching a video, and local-transcription audio
+downloads share it. A listing takes one slot per tab. `--fetch-pacing-ms` spaces request
+**starts** across every session, and `--extract-concurrency` bounds provider calls separately.
+The consequence is deliberate and predictable: with `--fetch-concurrency 1` there is one YouTube
+conversation at a time, so discovery and fetching serialize — the run says so in its output —
+and fetching starts when the listing releases the slot instead of waiting for the whole channel.
+With two or more, at least one slot stays available for fetching during a listing. Waiting
+requests are served in arrival order, so a long listing cannot starve an eligible fetch (or the
+reverse), and no configuration quietly exceeds the ceiling you selected.
 
 Palace synthesis and publication use a separate queue, covering recovery, canonical notes,
 deduplication, and every room transaction for a creator. Other sessions keep fetching/extracting
@@ -208,11 +228,18 @@ are reported separately from empty tabs. Fetches stay paced and retry failures. 
 and pinned-comment context remains useful when captions are unavailable or malformed.
 
 A listing is read as a stream and staged as it arrives, so a channel larger than a single capture
-buffer does not fail and a long run does not wait for the whole tab before starting work. Rows are
+buffer does not fail and a long run does not wait for the whole tab before starting work. Rows
+already discovered are handed to the run within a second instead of only when a staging batch fills,
+so even a small channel starts fetching and extraction while its listing is still open. Rows are
 appended to `<slug>.list.partial` and the file is only renamed to `<slug>.list.jsonl` once every
 tab finished. A listing that did not finish stays staged, is reported as partial rather than as a
 complete inventory, and its saved videos remain included: the staged rows are the record of what
-was seen, and a later listing never silently drops them.
+was seen, and a later listing never silently drops them. A channel that genuinely lists nothing
+commits an empty inventory and is reported once, as an empty channel — not as a failed commit —
+while a tab that failed is still reported as a listing failure.
+Large inventories are registered in bounded batches that yield to the event loop, so progress,
+cancellation, lease heartbeats and the fetch/extract workers keep running while a 10,000+ video
+listing is still being registered.
 
 Palace publication requires the approved `scripts/mind-palace-sync` with
 `--require-unchanged-base`. It operates in isolated transactions, preserves foreign dirty/staged

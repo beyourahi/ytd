@@ -8,10 +8,12 @@ import { DATA_DIR } from "./config.ts";
  * Cross-process resource limits.
  *
  * Two `ytd` sessions started from different terminals must not jointly exceed the aggregate
- * request budget, so concurrency leases and pacing cursors live in SQLite (one file, shared by
- * every session on this machine) rather than in each process's memory. Leases expire, so a
- * killed session releases its share without manual cleanup. Nothing here evades a provider's
- * limits: it only makes ytd's own traffic more conservative and predictable.
+ * request budget, so concurrency leases, the ceilings those leases are measured against, and
+ * pacing cursors all live in SQLite (one file, shared by every session on this machine) rather
+ * than in each process's memory. Sessions that ask for different ceilings resolve to the
+ * smallest live request, so a conservative setting is never overridden by a greedy one. Leases
+ * expire, so a killed session releases its share without manual cleanup. Nothing here evades a
+ * provider's limits: it only makes ytd's own traffic more conservative and predictable.
  *
  * This database is deliberately separate from the library manifest so limiter traffic never
  * contends with run/candidate transactions.
@@ -30,10 +32,21 @@ export interface LimiterState {
 	key: string;
 	active: number;
 	nextAllowedAt: number | null;
+	/** The conservative ceiling currently in force, shared across live sessions. */
+	ceiling: number | null;
+	/** Sessions currently queued for this key, including this one. */
+	waiting: number;
 }
 
 const DEFAULT_TTL_MS = 120_000;
 const DEFAULT_HEARTBEAT_MS = 20_000;
+/**
+ * How long a queued request keeps its place in line.
+ *
+ * Every poll refreshes this, so a live waiter never loses its turn; a process that dies stops
+ * refreshing and is out of the queue moments later, instead of blocking the slot it reserved.
+ */
+const WAITER_TTL_MS = 5_000;
 
 /** Exponential backoff with jitter, clamped. `random` is injectable so tests stay deterministic. */
 export function backoffDelay(
@@ -83,10 +96,12 @@ export class GlobalLimiter {
 	 */
 	private open(): Database {
 		if (this.db) return this.db;
+		// The directory comes first: opening a database inside a path that does not exist yet
+		// fails outright, which would make the limiter unusable before the library is created.
+		mkdirSync(this.root, { recursive: true });
 		const db = new Database(join(this.root, "limits.sqlite"));
 		this.db = db;
 		try {
-			mkdirSync(this.root, { recursive: true });
 			db.run("PRAGMA busy_timeout=5000");
 			try {
 				db.run("PRAGMA journal_mode=WAL");
@@ -99,6 +114,19 @@ export class GlobalLimiter {
 			db.run(
 				"CREATE TABLE IF NOT EXISTS pacing (key TEXT PRIMARY KEY, next_allowed INTEGER NOT NULL)"
 			);
+			// Each session declares the ceiling it wants for a key. The ceiling actually enforced is
+			// the smallest live declaration, so two sessions started with different settings cannot
+			// jointly exceed the more conservative one.
+			db.run(
+				"CREATE TABLE IF NOT EXISTS shares (key TEXT NOT NULL, token TEXT NOT NULL, ceiling INTEGER NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(key,token))"
+			);
+			// Arrival order, so a freed slot goes to whoever has been waiting longest instead of to
+			// whoever polls next. Without it a long listing can re-take the slot it just released
+			// while a fetch that is finally eligible keeps losing the race.
+			db.run(
+				"CREATE TABLE IF NOT EXISTS waiters (key TEXT NOT NULL, token TEXT NOT NULL, seq INTEGER PRIMARY KEY AUTOINCREMENT, expires INTEGER NOT NULL)"
+			);
+			db.run("CREATE UNIQUE INDEX IF NOT EXISTS waiters_key_token ON waiters(key,token)");
 		} catch (error) {
 			this.db = null;
 			db.close();
@@ -122,51 +150,101 @@ export class GlobalLimiter {
 		);
 		const token = `${this.token}:${randomUUID()}`;
 		let announced = false;
-		for (;;) {
-			options.signal?.throwIfAborted();
-			const acquired = db
-				.transaction(() => {
-					const now = this.clock();
-					db.run("DELETE FROM leases WHERE key=? AND expires<=?", [key, now]);
-					const row = db.query("SELECT COUNT(*) AS active FROM leases WHERE key=?").get(key) as {
-						active: number;
+		/** Leave the queue; safe to call after a grant, an abort or a closed database. */
+		const leaveQueue = (): void => {
+			if (this.closed) return;
+			try {
+				db.run("DELETE FROM waiters WHERE key=? AND token=?", [key, token]);
+			} catch {
+				/* already closed */
+			}
+		};
+		try {
+			for (;;) {
+				options.signal?.throwIfAborted();
+				const acquired = db
+					.transaction(() => {
+						const now = this.clock();
+						db.run("DELETE FROM leases WHERE key=? AND expires<=?", [key, now]);
+						// A session that is gone stops narrowing the shared ceiling once its declaration
+						// expires, which is the conservative direction: nobody is held down by a dead peer.
+						db.run("DELETE FROM shares WHERE key=? AND expires<=?", [key, now]);
+						db.run("DELETE FROM waiters WHERE key=? AND expires<=?", [key, now]);
+						db.run(
+							"INSERT INTO shares(key,token,ceiling,expires) VALUES (?,?,?,?) ON CONFLICT(key,token) DO UPDATE SET ceiling=excluded.ceiling, expires=excluded.expires",
+							[key, this.token, width, now + ttl]
+						);
+						const shared = db
+							.query("SELECT MIN(ceiling) AS ceiling FROM shares WHERE key=?")
+							.get(key) as { ceiling: number | null };
+						const ceiling = Math.max(1, Math.min(width, Math.floor(shared.ceiling ?? width)));
+						// Taking a place in line is what makes waiting fair. The row is refreshed on every
+						// poll and expires quickly, so a dead session never holds a reservation for long.
+						db.run(
+							"INSERT INTO waiters(key,token,expires) VALUES (?,?,?) ON CONFLICT(key,token) DO UPDATE SET expires=excluded.expires",
+							[key, token, now + WAITER_TTL_MS]
+						);
+						const mine = db
+							.query("SELECT seq FROM waiters WHERE key=? AND token=?")
+							.get(key, token) as { seq: number };
+						// Older waiters each reserve one slot, so capacity is never left idle waiting for
+						// them to poll while a newer request is still allowed to jump the queue.
+						const older = db
+							.query("SELECT COUNT(*) AS n FROM waiters WHERE key=? AND seq<? AND expires>?")
+							.get(key, mine.seq, now) as { n: number };
+						const row = db.query("SELECT COUNT(*) AS active FROM leases WHERE key=?").get(key) as {
+							active: number;
+						};
+						if (row.active + older.n >= ceiling) return false;
+						db.run("INSERT INTO leases(key,token,expires) VALUES (?,?,?)", [key, token, now + ttl]);
+						db.run("DELETE FROM waiters WHERE key=? AND token=?", [key, token]);
+						return true;
+					})
+					.immediate();
+				if (acquired) {
+					const renew = setInterval(() => {
+						try {
+							const now = this.clock();
+							db.run("UPDATE leases SET expires=? WHERE key=? AND token=?", [
+								now + ttl,
+								key,
+								token
+							]);
+							// Holding a slot keeps this session's declaration alive, so a long operation
+							// cannot let the shared ceiling widen underneath it.
+							db.run("UPDATE shares SET expires=? WHERE key=? AND token=?", [
+								now + ttl,
+								key,
+								this.token
+							]);
+						} catch {
+							/* a closing database must not crash a running operation */
+						}
+					}, heartbeat);
+					renew.unref?.();
+					let released = false;
+					return () => {
+						if (released) return;
+						released = true;
+						clearInterval(renew);
+						if (this.closed) return;
+						try {
+							db.run("DELETE FROM leases WHERE key=? AND token=?", [key, token]);
+						} catch {
+							/* already closed */
+						}
 					};
-					if (row.active >= width) return false;
-					db.run("INSERT INTO leases(key,token,expires) VALUES (?,?,?)", [key, token, now + ttl]);
-					return true;
-				})
-				.immediate();
-			if (acquired) {
-				const renew = setInterval(() => {
-					try {
-						db.run("UPDATE leases SET expires=? WHERE key=? AND token=?", [
-							this.clock() + ttl,
-							key,
-							token
-						]);
-					} catch {
-						/* a closing database must not crash a running operation */
-					}
-				}, heartbeat);
-				renew.unref?.();
-				let released = false;
-				return () => {
-					if (released) return;
-					released = true;
-					clearInterval(renew);
-					if (this.closed) return;
-					try {
-						db.run("DELETE FROM leases WHERE key=? AND token=?", [key, token]);
-					} catch {
-						/* already closed */
-					}
-				};
+				}
+				if (!announced) {
+					options.onWait?.();
+					announced = true;
+				}
+				await delay(25 + Math.floor(Math.random() * 50), options.signal);
 			}
-			if (!announced) {
-				options.onWait?.();
-				announced = true;
-			}
-			await delay(25 + Math.floor(Math.random() * 50), options.signal);
+		} finally {
+			// Abort, cancellation or a failed grant all leave the queue immediately rather than
+			// lingering as a reservation somebody else has to wait out.
+			leaveQueue();
 		}
 	}
 
@@ -198,7 +276,7 @@ export class GlobalLimiter {
 
 	/** Observable limiter state, for diagnostics only. */
 	state(key: string): LimiterState {
-		if (!this.db) return { key, active: 0, nextAllowedAt: null };
+		if (!this.db) return { key, active: 0, nextAllowedAt: null, ceiling: null, waiting: 0 };
 		const now = this.clock();
 		const active = (
 			this.db
@@ -208,7 +286,21 @@ export class GlobalLimiter {
 		const pacing = this.db.query("SELECT next_allowed FROM pacing WHERE key=?").get(key) as {
 			next_allowed: number;
 		} | null;
-		return { key, active, nextAllowedAt: pacing?.next_allowed ?? null };
+		const shared = this.db
+			.query("SELECT MIN(ceiling) AS ceiling FROM shares WHERE key=? AND expires>?")
+			.get(key, now) as { ceiling: number | null } | null;
+		const waiting = (
+			this.db
+				.query("SELECT COUNT(*) AS n FROM waiters WHERE key=? AND expires>?")
+				.get(key, now) as { n: number }
+		).n;
+		return {
+			key,
+			active,
+			nextAllowedAt: pacing?.next_allowed ?? null,
+			ceiling: shared?.ceiling ?? null,
+			waiting
+		};
 	}
 
 	/** Release every lease this process still holds; safe after a partial failure. */
@@ -220,6 +312,9 @@ export class GlobalLimiter {
 		if (!db) return;
 		try {
 			db.run("DELETE FROM leases WHERE token LIKE ?", [`${this.token}:%`]);
+			// This session's declarations go with it, so a finished job never holds a peer down.
+			db.run("DELETE FROM shares WHERE token=?", [this.token]);
+			db.run("DELETE FROM waiters WHERE token LIKE ?", [`${this.token}:%`]);
 			db.close();
 		} catch {
 			/* closing a closed database is not an error worth surfacing */

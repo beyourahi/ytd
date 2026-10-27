@@ -58,6 +58,10 @@ export interface JobStats {
 const DEFAULT_LEASE_MS = 15 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_CLAIM_LIMIT = 1;
+/** The recorded reason for work whose attempt budget was already spent when it was reclaimed. */
+export const ATTEMPTS_EXHAUSTED = "attempts_exhausted";
+/** Ids per registration batch: two statements per chunk, well under SQLite's parameter ceiling. */
+const REGISTER_CHUNK = 200;
 
 export class JobScheduler {
 	constructor(
@@ -129,6 +133,42 @@ export class JobScheduler {
 	}
 
 	/**
+	 * Register a batch of units in a bounded number of statements.
+	 *
+	 * Discovery registers thousands of videos while the pipeline is already running, and one
+	 * `INSERT OR IGNORE` per video made that path dominate the event loop. Batching keeps the hot
+	 * path at two statements per `CHUNK` ids regardless of inventory size, and each chunk is its
+	 * own transaction so a large registration never holds a write lock across the whole batch.
+	 */
+	ensureMany(stage: JobStage, ids: Iterable<string>, now = Date.now()): void {
+		const runId = this.runId();
+		const all = [...ids];
+		for (let offset = 0; offset < all.length; offset += REGISTER_CHUNK) {
+			const chunk = all.slice(offset, offset + REGISTER_CHUNK);
+			if (!chunk.length) continue;
+			this.db.transaction(() => {
+				const placeholders = chunk.map(() => "?").join(",");
+				const known = new Set(
+					(
+						this.db
+							.query(`SELECT id FROM jobs WHERE run_id=? AND stage=? AND id IN (${placeholders})`)
+							.all(runId, stage, ...chunk) as { id: string }[]
+					).map((row) => row.id)
+				);
+				const add = chunk.filter((id) => !known.has(id));
+				if (!add.length) return;
+				const rows = add.map(() => "(?,?,?,'pending',0,?,NULL,0,NULL,?)").join(",");
+				const params: (string | number)[] = [];
+				for (const id of add) params.push(runId, id, stage, now, now);
+				this.db.run(
+					`INSERT OR IGNORE INTO jobs(run_id,id,stage,state,attempts,available_at,lease_token,lease_expires,reason,updated) VALUES ${rows}`,
+					params
+				);
+			})();
+		}
+	}
+
+	/**
 	 * Reclaim work whose owner is gone. A killed process proves ownership only through its PID:
 	 * ESRCH means the owner cannot still be running, so waiting out a lease would delay recovery
 	 * for no safety benefit. Unknown or unreadable ownership keeps the lease until it expires.
@@ -168,6 +208,50 @@ export class JobScheduler {
 	}
 
 	/**
+	 * Block pending work that has already spent its attempt budget.
+	 *
+	 * Reclaiming a killed worker returns its unit to the queue without refunding the attempt it
+	 * consumed, so a unit that died on its final attempt would be pending yet unclaimable: it can
+	 * never be taken again, while still counting as queue depth. A pipeline that waits for queue
+	 * depth to reach zero would then wait forever for work nobody is allowed to do. Blocking it
+	 * records what the budget already decided, with a reason the completion report can name.
+	 *
+	 * Stage-scoped when a stage is given, so recovering one stage never concludes anything about
+	 * the other. Only pending rows are touched, and only those at or past the budget: a unit with
+	 * attempts left is never blocked, and a blocked unit is never restarted here.
+	 */
+	blockExhausted(
+		maxAttempts: number,
+		stage?: JobStage,
+		now = Date.now()
+	): { id: string; stage: JobStage }[] {
+		const budget = Math.max(
+			1,
+			Math.floor(Number.isFinite(maxAttempts) ? maxAttempts : DEFAULT_MAX_ATTEMPTS)
+		);
+		const rows = this.db
+			.query(
+				`SELECT id, stage FROM jobs
+				 WHERE run_id=? AND state='pending' AND attempts>=?${stage ? " AND stage=?" : ""}`
+			)
+			.all(...(stage ? [this.runId(), budget, stage] : [this.runId(), budget])) as {
+			id: string;
+			stage: JobStage;
+		}[];
+		if (!rows.length) return [];
+		const runId = this.runId();
+		this.db.transaction(() => {
+			const update = this.db.prepare(
+				`UPDATE jobs SET state='blocked', available_at=?, lease_token=NULL, lease_expires=0, reason=?, updated=?
+				 WHERE run_id=? AND id=? AND stage=? AND state='pending' AND attempts>=?`
+			);
+			for (const row of rows)
+				update.run(now, ATTEMPTS_EXHAUSTED, now, runId, row.id, row.stage, budget);
+		})();
+		return rows;
+	}
+
+	/**
 	 * Atomically claim up to `limit` eligible jobs. An attempt is consumed at claim time, so a
 	 * process that dies mid-attempt cannot retry the same work forever.
 	 */
@@ -191,6 +275,10 @@ export class JobScheduler {
 				// Orphaned claims from a killed session are released in the same transaction, so a
 				// crashed run never delays its own recovery for a full lease lifetime.
 				this.reclaimAbandoned(stage, now);
+				// A reclaim puts the unit back in the queue without refunding its attempt, so one that
+				// died on its last attempt has to become terminal here. Leaving it pending would keep
+				// the queue non-empty forever while no claim could ever take it.
+				this.blockExhausted(maxAttempts, stage, now);
 				const eligible = this.db
 					.query(
 						`SELECT id, attempts FROM jobs

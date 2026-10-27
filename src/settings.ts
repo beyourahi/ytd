@@ -447,7 +447,11 @@ async function chooseProfile(
 			"No installed agents found. Configure one separately or add a trusted wrapper with ytd agents add."
 		);
 	const saved = ready.find((choice) => choice.value === config.selected?.agent);
-	const agent = await ui.select("Agent", agents, (saved ?? ready[0]).value, true);
+	// A configuration with no saved agent starts on OpenCode when it is installed, without
+	// overriding a saved preference, connecting anything, or choosing a model on the user's
+	// behalf: every other installed adapter stays one keystroke away.
+	const preferred = ready.find((choice) => choice.value === "opencode") ?? ready[0];
+	const agent = await ui.select("Agent", agents, (saved ?? preferred).value, true);
 	if (!ready.some((choice) => choice.value === agent))
 		throw new Error(
 			agent ? `${agent} is not installed; no agent was selected` : "No installed agent was selected"

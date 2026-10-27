@@ -472,10 +472,11 @@ test("membership changes preserve a partial plan and keep vanished videos claime
 			complete: false,
 			receipts: [{ room: "content" }]
 		});
-		const release = await a.acquireSource("a", ["new"]);
+		const claimA = await a.beginSourceClaim("a");
+		const claimB = await b.beginSourceClaim("third");
 		const cancellation = new AbortController();
 		let waited = false;
-		const blocked = b.acquireSource("third", ["old"], {
+		const blocked = claimB.waitFor(["old"], {
 			signal: cancellation.signal,
 			onWait: () => {
 				waited = true;
@@ -484,9 +485,9 @@ test("membership changes preserve a partial plan and keep vanished videos claime
 		});
 		await expect(blocked).rejects.toThrow("test cancelled");
 		expect(waited).toBe(true);
-		release();
-		const releaseB = await b.acquireSource("third", ["old"]);
-		releaseB();
+		claimA.release();
+		expect(await claimB.waitFor(["old"])).toEqual({ claimed: ["old"], held: [] });
+		claimB.release();
 		a.completeRun();
 		const next = a.beginRun({ profile, source: "a", videoIds: ["old", "new"] });
 		expect(next.id).not.toBe(run.id);

@@ -3,7 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, constants } from "no
 import { join, resolve } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { DATA_DIR } from "./config.ts";
-import { Claims, acquireLegacyLock, type WaitOptions } from "./claims.ts";
+import { Claims, ClaimWaitTimeout, acquireLegacyLock, type WaitOptions } from "./claims.ts";
 import { validSourceReview, type Candidate, type SourceHalalNote } from "./distill.ts";
 import { JobScheduler } from "./scheduler.ts";
 
@@ -64,6 +64,73 @@ function legacyCandidates(path: string): Candidate[] {
 			}
 			return value as Candidate;
 		});
+}
+
+/**
+ * An extended claim over one source: the source key plus the videos made durable with it.
+ *
+ * `claim` never waits, so streaming discovery cannot deadlock against a peer session.
+ */
+export interface SourceClaim {
+	claim(ids: string[]): { claimed: string[]; held: string[] };
+	/**
+	 * Claim what is free, waiting a bounded time for a live peer to release the rest.
+	 *
+	 * Used once, for what discovery found first: an overlapping session then says it is waiting and
+	 * reuses the peer's completed work instead of repeating paid extraction. The wait is bounded so
+	 * it can never become a deadlock, and nothing waits for a peer after this — a session that owns
+	 * work of its own must never block on one more video.
+	 */
+	waitFor(ids: string[], options?: WaitOptions): Promise<{ claimed: string[]; held: string[] }>;
+	release(): void;
+}
+
+/** Videos per registration chunk: bounded SQL statements and parameters for a growing run. */
+const REGISTER_CHUNK = 200;
+
+/** The `video:` claim key's own vocabulary, stripped for callers that speak in video identities. */
+function videoIds(keys: string[]): string[] {
+	return keys.map((key) => key.slice("video:".length));
+}
+
+/**
+ * Claim what is free, waiting a bounded time for what a live peer holds.
+ *
+ * Ownership is decided by the error, not by the attempt failing: only an elapsed bounded wait
+ * means a peer still owns the rest. A cancellation or a broken claim store keeps its own cause,
+ * because reporting either as "held by a peer" would disguise a real fault as ordinary
+ * contention — and a cancelled run as a session that merely lost a race.
+ *
+ * What was taken is released before anything is propagated, so a failure never strands claims
+ * this session can no longer be trusted to have a use for.
+ */
+export async function waitForClaim(
+	claims: Pick<Claims, "tryAcquire" | "acquire">,
+	ids: string[],
+	options: WaitOptions = {}
+): Promise<{ release: () => void; claimed: string[]; held: string[] }> {
+	const wanted = [...new Set(ids)];
+	if (!wanted.length) return { release: () => {}, claimed: [], held: [] };
+	const first = claims.tryAcquire(wanted.map((id) => `video:${id}`));
+	const releases = [first.release];
+	const release = (): void => {
+		for (const release of releases) release();
+	};
+	if (!first.held.length) return { release, claimed: wanted, held: [] };
+	// Only the contested identities are waited for, so a single peer-held video never holds up
+	// the rest of the batch.
+	try {
+		releases.push(await claims.acquire(first.held, options));
+		return { release, claimed: wanted, held: [] };
+	} catch (error) {
+		if (!(error instanceof ClaimWaitTimeout)) {
+			release();
+			throw error;
+		}
+		// A cancellation racing the deadline is still a cancellation.
+		options.signal?.throwIfAborted();
+		return { release, claimed: videoIds(first.claimed), held: videoIds(first.held) };
+	}
 }
 
 /** Candidates and stage checkpoints commit in the same SQLite transaction. Old runs remain recoverable. */
@@ -214,22 +281,54 @@ export class Manifest {
 		}
 	}
 
-	async acquireSource(
-		source: string,
-		ids: string[],
-		options: WaitOptions = {}
-	): Promise<() => void> {
-		return this.claims.acquire(() => {
-			const saved = this.db
+	/** Ids still owned by an active run of `source`, so a re-listing keeps them claimed. */
+	private savedSourceIds(source: string): string[] {
+		return (
+			this.db
 				.query(
 					"SELECT rv.id FROM run_videos rv JOIN runs r ON r.id=rv.run_id WHERE r.source=? AND r.status='active'"
 				)
-				.all(source) as { id: string }[];
-			return [
-				`source:${source}`,
-				...[...ids, ...saved.map((row) => row.id)].map((id) => `video:${id}`)
-			];
-		}, options);
+				.all(source) as { id: string }[]
+		).map((row) => row.id);
+	}
+
+	/**
+	 * Claim one source, then extend that claim as discovery finds more of its videos.
+	 *
+	 * The initial set — the source key plus every video an active run of this source still owns —
+	 * is taken atomically and by waiting, exactly as before, so two sessions listing the same
+	 * source still serialize and a video this source already claimed is never released.
+	 *
+	 * Videos discovered afterwards are added without waiting. A session that already holds its
+	 * source must not block on a single video: two sessions each waiting for a video the other
+	 * holds would never finish. A video a live peer holds is reported instead, so the caller can
+	 * retry it later and, failing that, report it as owned elsewhere rather than move it out of
+	 * somebody else's hands.
+	 */
+	async beginSourceClaim(source: string, options: WaitOptions = {}): Promise<SourceClaim> {
+		const initial = [`source:${source}`, ...this.savedSourceIds(source).map((id) => `video:${id}`)];
+		const releaseInitial = await this.claims.acquire(initial, options);
+		const releases: (() => void)[] = [releaseInitial];
+		let released = false;
+		return {
+			claim: (ids: string[]) => {
+				const wanted = [...new Set(ids)];
+				if (!wanted.length) return { claimed: [], held: [] };
+				const taken = this.claims.tryAcquire(wanted.map((id) => `video:${id}`));
+				releases.push(taken.release);
+				return { claimed: videoIds(taken.claimed), held: videoIds(taken.held) };
+			},
+			waitFor: async (ids: string[], waitOptions: WaitOptions = {}) => {
+				const result = await waitForClaim(this.claims, ids, waitOptions);
+				releases.push(result.release);
+				return { claimed: result.claimed, held: result.held };
+			},
+			release: () => {
+				if (released) return;
+				released = true;
+				for (const release of releases) release();
+			}
+		};
 	}
 
 	async acquirePublication(options: WaitOptions = {}): Promise<() => void> {
@@ -358,23 +457,39 @@ export class Manifest {
 			.immediate();
 	}
 
+	/**
+	 * Record discovered identities, in bounded batches rather than one statement per video.
+	 *
+	 * Discovery calls this while the listing is still running and the pipeline is already working,
+	 * so the cost of registering a batch is part of the run's responsiveness. Each chunk is three
+	 * statements regardless of how many videos it carries, and the whole call stays in one
+	 * transaction so a partially registered batch is never observable.
+	 */
 	addVideos(videos: { id: string; title: string; channel?: string; channelUrl?: string }[]): void {
-		const stmt = this.db.prepare(
-			`INSERT INTO videos (id,title,status,channel,channelUrl) VALUES (?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET title=COALESCE(NULLIF(excluded.title,''),videos.title), channel=COALESCE(NULLIF(excluded.channel,''),videos.channel), channelUrl=COALESCE(NULLIF(excluded.channelUrl,''),videos.channelUrl)`
-		);
+		if (!videos.length) return;
 		this.db.transaction(() => {
-			for (const v of videos) {
-				stmt.run(v.id, v.title || null, v.channel ?? null, v.channelUrl ?? null);
-				if (this.runId) {
-					this.db.run(
-						"INSERT OR IGNORE INTO run_videos(run_id,id,status,reason,title,channel,channelUrl) SELECT ?,id,status,reason,title,channel,channelUrl FROM videos WHERE id=?",
-						[this.runId, v.id]
-					);
-					this.db.run(
-						"UPDATE run_videos SET title=COALESCE(NULLIF(?,''),title),channel=COALESCE(NULLIF(?,''),channel),channelUrl=COALESCE(NULLIF(?,''),channelUrl) WHERE run_id=? AND id=?",
-						[v.title || null, v.channel ?? null, v.channelUrl ?? null, this.runId, v.id]
-					);
-				}
+			for (let offset = 0; offset < videos.length; offset += REGISTER_CHUNK) {
+				const chunk = videos.slice(offset, offset + REGISTER_CHUNK);
+				const values = chunk.map(() => "(?,?,'pending',?,?)").join(",");
+				const params: (string | null)[] = [];
+				for (const v of chunk)
+					params.push(v.id, v.title || null, v.channel ?? null, v.channelUrl ?? null);
+				this.db.run(
+					`INSERT INTO videos (id,title,status,channel,channelUrl) VALUES ${values} ON CONFLICT(id) DO UPDATE SET title=COALESCE(NULLIF(excluded.title,''),videos.title), channel=COALESCE(NULLIF(excluded.channel,''),videos.channel), channelUrl=COALESCE(NULLIF(excluded.channelUrl,''),videos.channelUrl)`,
+					params
+				);
+				if (!this.runId) continue;
+				const placeholders = chunk.map(() => "?").join(",");
+				const ids = chunk.map((v) => v.id);
+				this.db.run(
+					`INSERT OR IGNORE INTO run_videos(run_id,id,status,reason,title,channel,channelUrl) SELECT ?,id,status,reason,title,channel,channelUrl FROM videos WHERE id IN (${placeholders})`,
+					[this.runId, ...ids]
+				);
+				// Membership is new, but an id this run already had keeps the fields it already showed.
+				this.db.run(
+					`UPDATE run_videos SET title=COALESCE(NULLIF(videos.title,''),run_videos.title), channel=COALESCE(NULLIF(videos.channel,''),run_videos.channel), channelUrl=COALESCE(NULLIF(videos.channelUrl,''),run_videos.channelUrl) FROM videos WHERE run_videos.run_id=? AND run_videos.id=videos.id AND videos.id IN (${placeholders})`,
+					[this.runId, ...ids]
+				);
 			}
 		})();
 	}
@@ -414,8 +529,56 @@ export class Manifest {
 	byStatus(...statuses: Status[]): VideoRow[] {
 		return this.all().filter((row) => statuses.includes(row.status));
 	}
+	/**
+	 * How many videos this run currently holds.
+	 *
+	 * Discovery registers videos while the pipeline runs, so progress has to count the run rather
+	 * than a snapshot taken before processing started; `all()` would materialise every row on each
+	 * progress tick, which is exactly what a large channel cannot afford.
+	 */
+	total(): number {
+		this.requireRun();
+		return (
+			this.db.query("SELECT COUNT(*) AS n FROM run_videos WHERE run_id=?").get(this.runId) as {
+				n: number;
+			}
+		).n;
+	}
 	private globalVideos(): VideoRow[] {
 		return this.db.query("SELECT * FROM videos ORDER BY rowid").all() as VideoRow[];
+	}
+	/** One video's row in the active run: what work a newly discovered identity still needs. */
+	row(id: string): VideoRow | undefined {
+		this.requireRun();
+		return this.db
+			.query(
+				"SELECT id,title,status,reason,channel,channelUrl FROM run_videos WHERE run_id=? AND id=?"
+			)
+			.get(this.runId, id) as VideoRow | undefined;
+	}
+	/**
+	 * The rows for a batch of ids, in one statement per bounded chunk.
+	 *
+	 * Streaming registration asks about every video it just claimed, while the listing is still
+	 * producing; a query per video there is exactly the per-video cost that made large discovery
+	 * block the event loop.
+	 */
+	rows(ids: Iterable<string>): VideoRow[] {
+		this.requireRun();
+		const wanted = [...new Set(ids)];
+		const found: VideoRow[] = [];
+		for (let offset = 0; offset < wanted.length; offset += 500) {
+			const chunk = wanted.slice(offset, offset + 500);
+			const placeholders = chunk.map(() => "?").join(",");
+			found.push(
+				...(this.db
+					.query(
+						`SELECT id,title,status,reason,channel,channelUrl FROM run_videos WHERE run_id=? AND id IN (${placeholders})`
+					)
+					.all(this.runId, ...chunk) as VideoRow[])
+			);
+		}
+		return found;
 	}
 	all(): VideoRow[] {
 		if (!this.runId) return this.globalVideos();
@@ -570,6 +733,29 @@ export class Manifest {
 	}
 
 	/** Import once without removing source files. Unknown old model work is archived, never mixed into the selected model. */
+	/**
+	 * Import legacy files for identities that only became known after the run had started.
+	 *
+	 * Streaming discovery knows the source's own identity immediately and its creators' identities
+	 * as batches arrive, so a legacy manifest filed under a creator can be discovered later than
+	 * the initial import. Running it here, under the legacy lock and with the per-alias guard the
+	 * initial import already uses, keeps the old coverage without re-reading anything twice: an
+	 * alias already imported is skipped, and one that is not yet imported is backed up and
+	 * imported exactly as it would have been at startup.
+	 */
+	async importLateAliases(
+		aliases: string[],
+		sourceDir = this.dataDir,
+		options: WaitOptions = {}
+	): Promise<void> {
+		const release = await acquireLegacyLock(sourceDir, options);
+		try {
+			this.importLegacy(aliases, sourceDir);
+		} finally {
+			release();
+		}
+	}
+
 	importLegacy(aliases: string[], sourceDir = this.dataDir): void {
 		for (const alias of new Set(aliases)) {
 			if (

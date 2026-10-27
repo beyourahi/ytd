@@ -7,7 +7,7 @@ import { createPalaceFixture, fixtureGit, hasPalacePrerequisite } from "./palace
 import { runCommand } from "../src/process.ts";
 
 const fake = `#!/usr/bin/env bun
-import { appendFileSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 if (process.argv[1].endsWith("yt-dlp")) {
@@ -25,7 +25,33 @@ if (process.argv[1].endsWith("yt-dlp")) {
    await Bun.sleep(10);
   }
  }
- if (args.includes("--dump-json") && process.env.YTD_FIXTURE_MULTI) {
+ // A listing that deliberately stalls between rows, so downstream work can be observed while the
+ // producer is still paused. Only the long-form tab lists in this mode; the Shorts tab is empty.
+ if (process.env.YTD_FIXTURE_LISTING_BARRIER && args.includes("--flat-playlist")) {
+  const barrier=process.env.YTD_FIXTURE_LISTING_BARRIER;
+  if (url.endsWith("/videos")) {
+   const count=Number(process.env.YTD_FIXTURE_LISTING_COUNT || 3);
+   const pauseAt=process.env.YTD_FIXTURE_LISTING_PAUSE || "1";
+   const pause=async (marker)=>{
+    writeFileSync(join(barrier,marker),"paused");
+    const deadline=Date.now()+120000;
+    while(!existsSync(join(barrier,"listing-release"))) {
+     if(Date.now()>deadline) throw new Error("Fixture listing barrier timed out");
+     await Bun.sleep(10);
+    }
+    writeFileSync(join(barrier,"listing-resumed"),"resumed");
+   };
+   for (let i=0;i<count;i++) {
+    if(pauseAt!=="end" && i===Number(pauseAt)) await pause("listing-paused");
+    console.log(JSON.stringify(item("v"+String(i).padStart(10,"0"))));
+   }
+   // "end" pauses after the last row but before the process exits: the listing has produced a
+   // full batch, yet the tab has not finished, so the channel is still undiscovered.
+   if(pauseAt==="end") await pause("listing-paused");
+   writeFileSync(join(barrier,"listing-done"),"done");
+  }
+ }
+ else if (args.includes("--dump-json") && process.env.YTD_FIXTURE_MULTI) {
   const listed=url.includes("/playlist?") ? ids : url.endsWith("/shorts") ? [ids[2],ids[0]] : ids.slice(0,2);
   for(const video of listed) console.log(JSON.stringify(item(video)));
  }
@@ -44,10 +70,21 @@ if (process.argv[1].endsWith("yt-dlp")) {
   }
   writeFileSync(process.env.YTD_FIXTURE_RACE_MARKER,"advanced");
  }
+ // A provider that rejects the account on extraction: every later call would fail the same way,
+ // so the run must stop rather than record a per-video failure for the whole channel.
+ if(process.env.YTD_FIXTURE_AUTH_FAIL && prompt.startsWith("Distill")){
+  const seen=(existsSync(process.env.YTD_FIXTURE_CALLS)&&readFileSync(process.env.YTD_FIXTURE_CALLS,"utf8").match(/^Distill/gm)?.length)||0;
+  if(seen>=Number(process.env.YTD_FIXTURE_AUTH_AFTER||1)){
+   console.error("Error: 401 Unauthorized: invalid API key provided");
+   process.exit(1);
+  }
+ }
  const candidates=prompt.startsWith("Merge") ? JSON.parse(prompt.split("CANDIDATES:\\n")[1]) : [];
- const sourceId=prompt.match(/videoId: ([A-Za-z0-9_-]{11})/)?.[1] || candidates[0]?.sourceId || "dQw4w9WgXcQ";
- const stage=prompt.startsWith("Distill") ? "extract" : prompt.startsWith("Carefully") ? "glean" : prompt.startsWith("Merge") ? "synthesize" : "";
- const barrier=process.env.YTD_FIXTURE_BARRIER;
+ const sourceId=prompt.match(/videoId: ([A-Za-z0-9_-]{11})/)?.[1] || candidates[0]?.sourceId || "dQw4w9WgXcQ";	const stage=prompt.startsWith("Distill") ? "extract" : prompt.startsWith("Carefully") ? "glean" : prompt.startsWith("Merge") ? "synthesize" : "";
+	// A non-blocking marker: the discovery/ingestion overlap test releases a paused listing only
+	// after a source has genuinely been extracted, so the marker has to exist before the release.
+	if(stage==="extract" && process.env.YTD_FIXTURE_LISTING_BARRIER) writeFileSync(join(process.env.YTD_FIXTURE_LISTING_BARRIER,"extract-"+sourceId+".entered"),"extracted");
+	const barrier=process.env.YTD_FIXTURE_BARRIER;
  if(stage && barrier && (!process.env.YTD_FIXTURE_BARRIER_STAGE || process.env.YTD_FIXTURE_BARRIER_STAGE === stage)) {
   writeFileSync(join(barrier,stage+"-"+sourceId+".entered"),JSON.stringify({pid:process.pid,model:args[0]}));
   const deadline=Date.now()+30000;
@@ -517,6 +554,183 @@ test.skipIf(!hasPalacePrerequisite)(
 		}
 	},
 	180_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"a rejected account stops the run, preserves completed extraction and publishes nothing",
+	async () => {
+		const f = createCliFixture();
+		const channel = "https://www.youtube.com/@fixture";
+		const command = [process.execPath, f.cli, channel, "--extract-concurrency", "1"];
+		try {
+			const failed = await runCommand(command, {
+				env: {
+					...f.env,
+					YTD_FIXTURE_MULTI: "1",
+					YTD_FIXTURE_AUTH_FAIL: "1",
+					YTD_FIXTURE_AUTH_AFTER: "2"
+				},
+				timeoutMs: 180_000
+			});
+			expect(failed.code).toBe(1);
+			// The failure is reported as what it is, with the action that fixes it.
+			expect(failed.stderr).toContain("invalid API key");
+			expect(failed.stderr).toContain("Re-authenticate");
+			// One extraction succeeded, the next was refused, and no further paid call was made.
+			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(2);
+			// Nothing incomplete was published and the Palace was not touched.
+			expect(publicationReceipts(f)).toHaveLength(0);
+			expect(fixtureGit(f.remote, "log", "--oneline")).not.toContain("ingest");
+			const db = new Database(join(f.configDir, "data", "library", "manifest.sqlite"), {
+				readonly: true
+			});
+			try {
+				// The completed extraction is a durable checkpoint, not work that has to be paid for again.
+				expect(
+					db.query("SELECT COUNT(*) AS n FROM run_videos WHERE status='distilled'").get()
+				).toEqual({ n: 1 });
+				expect(db.query("SELECT id FROM runs WHERE status='active'").get()).toBeTruthy();
+				// The unit that hit the wall was handed back, never blocked: fixing the account resumes it.
+				expect(
+					db.query("SELECT state FROM jobs WHERE stage='extract' AND state='blocked'").all()
+				).toEqual([]);
+			} finally {
+				db.close();
+			}
+			// Corrected account: the same run resumes, reuses the finished extraction and publishes.
+			const resumed = await runCommand(command, {
+				env: { ...f.env, YTD_FIXTURE_MULTI: "1" },
+				timeoutMs: 240_000
+			});
+			expect(resumed.stderr).toBe("");
+			expect(resumed.code).toBe(0);
+			// Two more extractions, and no repeat of the one that had already completed.
+			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(4);
+			expect(publicationReceipts(f).length).toBeGreaterThanOrEqual(2);
+			for (const room of ["content", "craft"]) {
+				const notes = fixtureGit(f.remote, "show", `main:${room}/field-notes.md`);
+				expect(notes).toContain("\u26a0\ufe0f Halal gate");
+			}
+		} finally {
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	600_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"one shared YouTube slot serializes listing and fetching, two leave room for both",
+	async () => {
+		const channel = "https://www.youtube.com/@fixture";
+		const serial = createCliFixture();
+		const serialBarrier = join(serial.root, "serial-barrier");
+		mkdirSync(serialBarrier);
+		const serialEnv = {
+			YTD_FIXTURE_LISTING_BARRIER: serialBarrier,
+			YTD_FIXTURE_LISTING_COUNT: "2",
+			YTD_FIXTURE_LISTING_PAUSE: "1"
+		};
+		const serialRun = startCli(serial, channel, serialEnv, ["--fetch-concurrency", "1"]);
+		try {
+			await waitFor(
+				() => existsSync(join(serialBarrier, "listing-paused")),
+				() => serialRun.stdout + serialRun.stderr
+			);
+			// The trade-off is stated, not hidden: one slot means the listing owns it while it runs.
+			expect(serialRun.stdout).toContain("YouTube concurrency 1");
+			await Bun.sleep(800);
+			// Nothing downstream can run while the only slot is held by the paused listing.
+			expect(existsSync(join(serialBarrier, "extract-v0000000000.entered"))).toBe(false);
+			writeFileSync(join(serialBarrier, "listing-release"), "released");
+			const serialResult = await serialRun.result;
+			expect(serialResult.stderr).toBe("");
+			expect(serialResult.code).toBe(0);
+			// Serialized is not stuck: the waiting fetch is served once the listing releases the slot.
+			expect(fixtureCalls(serial).filter((call) => call.startsWith("Distill"))).toHaveLength(2);
+			expect(publicationReceipts(serial)).toHaveLength(2);
+		} finally {
+			writeFileSync(join(serialBarrier, "listing-release"), "released");
+			await serialRun.stop();
+			rmSync(serial.root, { recursive: true, force: true });
+		}
+
+		const parallel = createCliFixture();
+		const parallelBarrier = join(parallel.root, "parallel-barrier");
+		mkdirSync(parallelBarrier);
+		const parallelRun = startCli(
+			parallel,
+			channel,
+			{
+				YTD_FIXTURE_LISTING_BARRIER: parallelBarrier,
+				YTD_FIXTURE_LISTING_COUNT: "2",
+				YTD_FIXTURE_LISTING_PAUSE: "1"
+			},
+			["--fetch-concurrency", "2"]
+		);
+		try {
+			// Two slots: the listing holds one, so a fetch can genuinely proceed beside it.
+			await waitFor(
+				() => existsSync(join(parallelBarrier, "extract-v0000000000.entered")),
+				() => parallelRun.stdout + parallelRun.stderr
+			);
+			expect(existsSync(join(parallelBarrier, "listing-paused"))).toBe(true);
+			expect(existsSync(join(parallelBarrier, "listing-done"))).toBe(false);
+			writeFileSync(join(parallelBarrier, "listing-release"), "released");
+			const parallelResult = await parallelRun.result;
+			expect(parallelResult.stderr).toBe("");
+			expect(parallelResult.code).toBe(0);
+			expect(fixtureCalls(parallel).filter((call) => call.startsWith("Distill"))).toHaveLength(2);
+			expect(publicationReceipts(parallel)).toHaveLength(2);
+		} finally {
+			writeFileSync(join(parallelBarrier, "listing-release"), "released");
+			await parallelRun.stop();
+			rmSync(parallel.root, { recursive: true, force: true });
+		}
+	},
+	600_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"a channel's first video is fetched and extracted while the listing is still paused",
+	async () => {
+		const f = createCliFixture();
+		const barrier = join(f.root, "listing-barrier");
+		mkdirSync(barrier);
+		// Two videos are listed by a tab that then stalls before it finishes.
+		const count = 2;
+		const run = startCli(f, "https://www.youtube.com/@fixture", {
+			YTD_FIXTURE_LISTING_BARRIER: barrier,
+			YTD_FIXTURE_LISTING_COUNT: String(count),
+			YTD_FIXTURE_LISTING_PAUSE: "end"
+		});
+		try {
+			// The listing cannot finish on its own: only this test releases it. Anything downstream
+			// observed now therefore happened while the channel inventory was still incomplete.
+			await waitFor(
+				() => existsSync(join(barrier, "extract-v0000000000.entered")),
+				() => run.stdout + run.stderr
+			);
+			expect(existsSync(join(barrier, "listing-paused"))).toBe(true);
+			expect(existsSync(join(barrier, "listing-done"))).toBe(false);
+			expect(run.child.exitCode).toBeNull();
+			// The first video was not merely registered: it was fetched and extracted.
+			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(1);
+			writeFileSync(join(barrier, "listing-release"), "released");
+			const result = await run.result;
+			expect(result.stderr).toBe("");
+			expect(result.code).toBe(0);
+			expect(existsSync(join(barrier, "listing-resumed"))).toBe(true);
+			// Every discovered video was processed and published, not only the first one.
+			expect(fixtureCalls(f).filter((call) => call.startsWith("Distill"))).toHaveLength(count);
+			expect(publicationReceipts(f)).toHaveLength(2);
+			expect(result.stdout).toContain("2 room/creator publications remotely verified");
+		} finally {
+			writeFileSync(join(barrier, "listing-release"), "released");
+			await run.stop();
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	600_000
 );
 
 test.skipIf(!hasPalacePrerequisite)(

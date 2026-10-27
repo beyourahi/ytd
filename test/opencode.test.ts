@@ -76,10 +76,19 @@ test("connected, disconnected and malformed provider states are distinguished", 
 		"null",
 		JSON.stringify([{ name: "no id", connections: [] }]),
 		JSON.stringify([{ id: "x", connections: "yes" }]),
+		// `connections` must be a list of connections. An object, a number or null is malformed
+		// metadata, not "no providers": treating it as disconnected would silently hide a broken
+		// credential store, and treating it as connected would invent an account.
+		JSON.stringify([{ id: "x", connections: { type: "credential" } }]),
+		JSON.stringify([{ id: "x", connections: null }]),
+		JSON.stringify([{ id: "x", connections: 3 }]),
 		JSON.stringify([null]),
 		"not json"
 	])
 		expect(() => parseOpencodeAuth(malformed)).toThrow();
+	expect(() => parseOpencodeAuth(JSON.stringify([{ id: "x", connections: {} }]))).toThrow(
+		"OpenCode provider connections are malformed"
+	);
 });
 
 test("inspection rejects an OpenCode 1 install and reports unavailable auth safely", async () => {
@@ -106,6 +115,12 @@ test("inspection rejects an OpenCode 1 install and reports unavailable auth safe
 		expect(await inspectOpencode(fake.path)).toMatchObject({
 			standalone: true,
 			error: "OpenCode provider list is malformed"
+		});
+		// Malformed connection metadata fails closed and is reported, never read as "connected".
+		process.env.FAKE_AUTH_STATE = JSON.stringify([{ id: "opencode", connections: "yes" }]);
+		expect(await inspectOpencode(fake.path)).toEqual({
+			standalone: true,
+			error: "OpenCode provider connections are malformed"
 		});
 	} finally {
 		for (const key of ["FAKE_HELP", "FAKE_AUTH_FAIL", "FAKE_AUTH_STATE"]) delete process.env[key];

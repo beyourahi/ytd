@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { AdaptiveLimiter, PipelineQueue, runPool } from "../src/concurrency.ts";
+import { AdaptiveLimiter, PipelineQueue, Signaler, runPool } from "../src/concurrency.ts";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -183,6 +183,35 @@ test("quota exhaustion freezes the limiter at the floor until work resumes", () 
 	limiter.quotaExhausted();
 	expect(limiter.limit).toBe(1);
 	expect(limiter.state().reason).toBe("provider quota exhausted");
+});
+
+test("signaler waiters detach when they time out, so an idle stage does not accumulate them", async () => {
+	const signaler = new Signaler();
+	for (let cycle = 0; cycle < 20; cycle++) {
+		const waits = Array.from({ length: 50 }, () => signaler.wait(1));
+		expect(signaler.pendingWaiters).toBe(50);
+		await Promise.all(waits);
+		// A timed-out waiter is gone: it is not kept until somebody happens to notify.
+		expect(signaler.pendingWaiters).toBe(0);
+	}
+});
+
+test("a notification wakes only live waiters and an abort leaves nothing behind", async () => {
+	const signaler = new Signaler();
+	const controller = new AbortController();
+	let woken = 0;
+	await signaler.wait(1).then(() => woken++);
+	const live = [signaler.wait(5_000).then(() => woken++), signaler.wait(5_000).then(() => woken++)];
+	const cancelled = signaler.wait(5_000, controller.signal).then(() => woken++);
+	controller.abort(new Error("cancelled"));
+	await cancelled;
+	expect(woken).toBe(2);
+	// The aborted waiter is detached immediately; the two live ones remain.
+	expect(signaler.pendingWaiters).toBe(2);
+	signaler.notify();
+	await Promise.all(live);
+	expect(woken).toBe(4);
+	expect(signaler.pendingWaiters).toBe(0);
 });
 
 test("adaptive options are validated rather than silently clamped", () => {

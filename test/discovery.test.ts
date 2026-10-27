@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscoveryLog, discoveryPaths } from "../src/discovery.ts";
 import { runCommand } from "../src/process.ts";
-import type { VideoItem } from "../src/enumerate.ts";
+import {
+	channelSlug,
+	collectAliases,
+	legacyChannelSlug,
+	sourceAliases,
+	type VideoItem
+} from "../src/enumerate.ts";
 
 const channel = "https://www.youtube.com/@fixture";
 const source = join(import.meta.dir, "../src/enumerate.ts");
@@ -144,6 +150,96 @@ test("discovery stages batches, commits only a complete listing and reads them b
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+test("an empty listing commits an empty inventory instead of a missing-file error", () => {
+	const root = mkdtempSync(join(tmpdir(), "ytd-discovery-empty-"));
+	try {
+		const log = new DiscoveryLog("empty", root);
+		log.begin();
+		// A channel that genuinely lists nothing stages no rows at all, so no partial file exists.
+		expect(existsSync(discoveryPaths("empty", root).partialPath)).toBe(false);
+		const committed = log.commit();
+		expect(committed).toMatchObject({ slug: "empty", complete: true, items: 0 });
+		expect(existsSync(discoveryPaths("empty", root).path)).toBe(true);
+		expect(readFileSync(discoveryPaths("empty", root).path, "utf8")).toBe("");
+		// One clear outcome: an empty, complete inventory that reads back as nothing.
+		expect([...log.read()]).toEqual([]);
+		expect(log.hasPrevious).toBe(false);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a recovered partial listing contributes its creators' aliases like live discovery", () => {
+	const root = mkdtempSync(join(tmpdir(), "ytd-discovery-alias-"));
+	try {
+		const log = new DiscoveryLog("slug", root);
+		log.begin();
+		log.append([
+			{
+				id: "00000000001",
+				title: "Old video",
+				creator: "Gone Creator",
+				creatorUrl: "https://www.youtube.com/@gonecreator"
+			}
+		]);
+		// The next listing never reaches that creator: deleted, unlisted or simply not listed.
+		log.begin();
+		const aliases = sourceAliases(channel);
+		const seen = new Set(aliases);
+		expect(aliases).not.toContain(channelSlug("https://www.youtube.com/@gonecreator"));
+		for (const batch of log.previous()) collectAliases(aliases, seen, batch);
+		// The recovered creator is named exactly as a live batch would have named it, so its legacy
+		// manifest and transcript cache can still be found.
+		expect(aliases).toContain(channelSlug("https://www.youtube.com/@gonecreator"));
+		expect(aliases).toContain(legacyChannelSlug("https://www.youtube.com/@gonecreator"));
+		// Aliases stay unique even when the same creator arrives in a later batch.
+		const before = aliases.length;
+		collectAliases(aliases, seen, [...log.previous()].flat());
+		expect(aliases.length).toBe(before);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("listing requests take the shared request slot and reserve pacing", async () => {
+	const root = mkdtempSync(join(tmpdir(), "ytd-discovery-pace-"));
+	try {
+		stub(root, 4);
+		const limits = join(root, "limits");
+		const result = await runCommand(
+			[
+				process.execPath,
+				"-e",
+				`import {discoverStream} from ${JSON.stringify(source)};
+import {GlobalLimiter} from ${JSON.stringify(join(import.meta.dir, "../src/limits.ts"))};
+const limiter=new GlobalLimiter(${JSON.stringify(limits)});
+const held=[];
+const discovered=await discoverStream(process.argv[1],["videos","shorts"],undefined,()=>{},{batchSize:100,beginRequest:async()=>{
+ const release=await limiter.acquire("youtube-list",1,{});
+ await limiter.pace("youtube",25,{});
+ held.push(limiter.state("youtube-list").active);
+ return release;
+}});
+console.log(JSON.stringify({discovered:discovered.discovered,held,after:limiter.state("youtube-list").active,paced:limiter.state("youtube").nextAllowedAt!==null}));
+limiter.close();`,
+				channel
+			],
+			{ env: { ...process.env, PATH: `${root}:${process.env.PATH}` }, timeoutMs: 120_000 }
+		);
+		expect(result.stderr).toBe("");
+		expect(result.code).toBe(0);
+		const out = JSON.parse(result.stdout);
+		expect(out.discovered).toBe(4);
+		// One slot per tab, held for the request and released after it, never leaked.
+		expect(out.held).toEqual([1, 1]);
+		expect(out.after).toBe(0);
+		// Listing reserved time on the same pacing cursor every other request shares.
+		expect(out.paced).toBe(true);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 120_000);
 
 test("a staged listing is durable after every batch, not on exit", () => {
 	const root = mkdtempSync(join(tmpdir(), "ytd-discovery-durable-"));

@@ -319,6 +319,152 @@ test("a lease held by a live unknown owner is left alone until it expires", () =
 	}
 });
 
+test("work that crashed on its last attempt is blocked instead of left unclaimable", () => {
+	const f = fixture();
+	try {
+		const manifest = withRun(f.dir, ["a"]);
+		const base = Date.now();
+		manifest.jobs.sync("fetch", new Set(["a"]), base);
+		// Two crashes: each claim is abandoned mid-attempt (no succeed, no release, no reset),
+		// and the second one spends the final attempt of a two-attempt budget.
+		expect(
+			manifest.jobs.claim("fetch", { limit: 1, maxAttempts: 2, leaseMs: 1_000, now: base })
+		).toHaveLength(1);
+		expect(
+			manifest.jobs.claim("fetch", {
+				limit: 1,
+				maxAttempts: 2,
+				leaseMs: 1_000,
+				now: base + 2_000
+			})
+		).toHaveLength(1);
+		// Reclaiming the second crash used to return it to pending with its budget spent: it was
+		// then unclaimable forever while still counting as queue depth, so the run waited for work
+		// no claim could ever take.
+		expect(
+			manifest.jobs.claim("fetch", {
+				limit: 1,
+				maxAttempts: 2,
+				leaseMs: 1_000,
+				now: base + 4_000
+			})
+		).toEqual([]);
+		expect(manifest.jobs.depth("fetch")).toBe(0);
+		expect(manifest.jobs.blockedReasons("fetch")).toEqual([
+			{ id: "a", reason: "attempts_exhausted" }
+		]);
+		expect(manifest.jobs.stats("fetch")).toMatchObject({ pending: 0, running: 0, blocked: 1 });
+		// Terminal: a later, wider budget does not silently restart it.
+		expect(
+			manifest.jobs.claim("fetch", { limit: 1, maxAttempts: 10, now: base + 10_000_000 })
+		).toEqual([]);
+		expect(manifest.jobs.blockedReasons("fetch")).toEqual([
+			{ id: "a", reason: "attempts_exhausted" }
+		]);
+		manifest.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("the retry budget blocks only the unit that spent it", () => {
+	const f = fixture();
+	try {
+		const manifest = withRun(f.dir, ["spent", "spare"]);
+		const base = Date.now();
+		manifest.jobs.sync("fetch", new Set(["spent", "spare"]), base);
+		// Both units are abandoned mid-attempt with expired leases; they differ only in how much
+		// of the same budget they already used.
+		const raw = new Database(join(f.dir, "library.sqlite"));
+		try {
+			for (const [id, attempts] of [
+				["spent", 2],
+				["spare", 1]
+			] as const)
+				raw.run(
+					"UPDATE jobs SET state='running', lease_token='dead', lease_expires=?, attempts=? WHERE id=? AND stage='fetch'",
+					[base + 1_000, attempts, id]
+				);
+		} finally {
+			raw.close();
+		}
+		const claimed = manifest.jobs.claim("fetch", {
+			limit: 5,
+			maxAttempts: 2,
+			leaseMs: 1_000,
+			now: base + 2_000
+		});
+		// The unit at the boundary is blocked; the one with an attempt left is still work.
+		expect(claimed.map((job) => job.id)).toEqual(["spare"]);
+		expect(claimed[0]!.attempts).toBe(2);
+		expect(manifest.jobs.blockedReasons("fetch")).toEqual([
+			{ id: "spent", reason: "attempts_exhausted" }
+		]);
+		expect(manifest.jobs.depth("fetch")).toBe(1);
+		manifest.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("a resumed session terminates a crashed queue and restarts only through a new run", () => {
+	const f = fixture();
+	try {
+		const manifest = withRun(f.dir, ["a", "b"]);
+		const base = Date.now();
+		manifest.jobs.sync("fetch", new Set(["a", "b"]), base);
+		// What a killed session leaves: a lease past its lifetime, and with it the attempt it
+		// consumed. "a" died on its third and final attempt, "b" still has budget.
+		const raw = new Database(join(f.dir, "library.sqlite"));
+		try {
+			for (const [id, attempts, expires] of [
+				["a", 3, base + 1_000],
+				["b", 1, base + 1_000]
+			] as const)
+				raw.run(
+					"UPDATE jobs SET state='running', lease_token='dead', owner_pid=NULL, lease_expires=?, attempts=? WHERE id=? AND stage='fetch'",
+					[expires, attempts, id]
+				);
+		} finally {
+			raw.close();
+		}
+		// Exactly what a resuming session does before it reads the queue.
+		expect(manifest.jobs.resetExpired(base + 2_000)).toBe(2);
+		expect(manifest.jobs.blockExhausted(3)).toEqual([{ id: "a", stage: "fetch" }]);
+		expect(manifest.jobs.depth("fetch")).toBe(1);
+		expect(manifest.jobs.blockedReasons("fetch")).toEqual([
+			{ id: "a", reason: "attempts_exhausted" }
+		]);
+		expect(
+			manifest.jobs
+				.claim("fetch", { limit: 5, maxAttempts: 3, now: base + 2_000 })
+				.map((job) => job.id)
+		).toEqual(["b"]);
+		// A new run is the explicit recovery, and it starts with its own budget. The exhausted
+		// unit's record is preserved as what the previous run already decided.
+		manifest.beginRun({ profile, source: "new-source", videoIds: ["a", "b"] });
+		manifest.jobs.sync("fetch", new Set(["a", "b"]));
+		expect(manifest.jobs.claim("fetch", { limit: 5, maxAttempts: 3 }).map((job) => job.id)).toEqual(
+			["a", "b"]
+		);
+		const db = new Database(join(f.dir, "library.sqlite"));
+		try {
+			expect(
+				db
+					.query(
+						"SELECT state, reason FROM jobs WHERE id='a' AND stage='fetch' AND state='blocked'"
+					)
+					.all()
+			).toEqual([{ state: "blocked", reason: "attempts_exhausted" }]);
+		} finally {
+			db.close();
+		}
+		manifest.close();
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("scheduling memory is scoped to its own run", () => {
 	const f = fixture();
 	try {

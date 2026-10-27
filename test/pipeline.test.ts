@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { classifyExtractionError, classifyFetchFailure, workFor } from "../src/pipeline.ts";
+import {
+	classifyExtractionError,
+	classifyFetchFailure,
+	classifyProviderError,
+	workFor
+} from "../src/pipeline.ts";
 import { formatProgress, shouldAggregate, summarise } from "../src/progress.ts";
 import type { PipelineProgress } from "../src/pipeline.ts";
 
@@ -58,9 +63,67 @@ test("only genuinely global faults stop the run", () => {
 	expect(
 		classifyExtractionError("Complete extract prompt exceeds the selected context budget")
 	).toBe("permanent");
+	// An expired or missing account is global too: every remaining call would fail the same way.
+	expect(classifyExtractionError("401 unauthorized: invalid API key")).toBe("fatal");
+	expect(classifyExtractionError("Not logged in; run the agent's login")).toBe("fatal");
 	// Anything else is worth another attempt.
 	expect(classifyExtractionError("Invalid extract response after 3 attempts")).toBe("retryable");
 	expect(classifyExtractionError("socket hang up")).toBe("retryable");
+});
+
+test("provider errors are classified by evidence, not by a bare status code", () => {
+	// An explicit throttle is retryable and must narrow the pool, even when it arrives as a 403.
+	expect(classifyProviderError("403 rate limit exceeded")).toEqual({
+		disposition: "retryable",
+		rateLimited: true
+	});
+	expect(classifyProviderError("429 Too Many Requests")).toEqual({
+		disposition: "retryable",
+		rateLimited: true
+	});
+	// Credentials that are actually rejected stop the run: every remaining call would fail.
+	expect(classifyProviderError("401 invalid API key")).toEqual({
+		disposition: "fatal",
+		fatal: "auth"
+	});
+	expect(classifyProviderError("Incorrect API key provided")).toEqual({
+		disposition: "fatal",
+		fatal: "auth"
+	});
+	// Quota is its own fatal kind: it must not be reported as an authentication problem.
+	expect(classifyProviderError("usage limit reached")).toEqual({
+		disposition: "fatal",
+		fatal: "quota"
+	});
+	expect(classifyProviderError("You have exhausted your quota")).toEqual({
+		disposition: "fatal",
+		fatal: "quota"
+	});
+	// A model this account cannot use fails identically every time; ytd never substitutes one.
+	expect(classifyProviderError("model unavailable for this account")).toEqual({
+		disposition: "fatal",
+		fatal: "routing"
+	});
+	expect(classifyProviderError("This model is not available in your region")).toEqual({
+		disposition: "fatal",
+		fatal: "routing"
+	});
+	// A missing grant is not something a retry can change.
+	expect(classifyProviderError("403 insufficient permissions")).toEqual({
+		disposition: "fatal",
+		fatal: "configuration"
+	});
+	// Transport faults are retryable but are not throttling evidence.
+	expect(classifyProviderError("request timed out")).toEqual({
+		disposition: "retryable",
+		rateLimited: false
+	});
+	expect(classifyProviderError("malformed JSON response")).toEqual({
+		disposition: "retryable",
+		rateLimited: false
+	});
+	// A bare 403 proves nothing: it is neither a throttle nor expired credentials.
+	expect(classifyProviderError("provider returned 403")).toEqual({ disposition: "permanent" });
 });
 
 const progress = (over: Partial<PipelineProgress> = {}): PipelineProgress => ({

@@ -145,15 +145,31 @@ export interface ListingStreamResult {
  *
  * A listing that did not finish is reported as partial instead of being presented as a
  * complete inventory of the source.
+ *
+ * Listing is a YouTube request path like any other, so it can be made to take the shared request
+ * slot through `beginRequest`. Without that hook a listing would be the one uncounted conversation
+ * with YouTube, and a channel could be listed while every other request is being throttled.
  */
 export async function enumerateChannelStream(
 	value: string,
 	tabs: readonly string[],
 	signal: AbortSignal | undefined,
 	onBatch: (items: VideoItem[], progress: ListingProgress) => void,
-	options: { batchSize?: number; onProgress?: (progress: ListingProgress) => void } = {}
+	options: {
+		batchSize?: number;
+		onProgress?: (progress: ListingProgress) => void;
+		/** Take the shared request slot; the returned release must always be called. */
+		beginRequest?: (signal: AbortSignal | undefined) => Promise<() => void>;
+		/** How long a partial batch may wait before it is delivered. */
+		flushIntervalMs?: number;
+	} = {}
 ): Promise<ListingStreamResult> {
 	const batchSize = Math.max(1, Math.floor(options.batchSize ?? 200));
+	// Rows already discovered are handed on within a second, not only once a full batch fills.
+	// Without this, a channel smaller than one batch could not start any downstream work until its
+	// listing had finished — exactly the "complete inventory first" behaviour streaming discovery
+	// exists to remove — and a slow tab would hold back videos it had already produced.
+	const flushIntervalMs = Math.max(50, Math.floor(options.flushIntervalMs ?? 1_000));
 	const seen = new Set<string>();
 	const perTab: Record<string, number> = {};
 	const listingFailures: string[] = [];
@@ -174,44 +190,53 @@ export async function enumerateChannelStream(
 				perTab: { ...perTab, [tab]: count }
 			});
 		};
-		const result = await streamCommand(
-			["yt-dlp", ...jsRuntimeArgs(), "--flat-playlist", "--dump-json", url],
-			{ signal, timeoutMs: 15 * 60_000 },
-			(line) => {
-				if (!line.trim()) return;
-				let item: VideoItem | null;
-				try {
-					item = metadataItem(JSON.parse(line));
-				} catch {
-					item = null;
-				}
-				if (!item) {
-					malformed++;
-					listingFailures.push(`${tab}: malformed listing row`);
-					return;
-				}
-				count++;
-				if (seen.has(item.id)) {
+		const request = await options.beginRequest?.(signal);
+		const flusher = setInterval(flush, flushIntervalMs);
+		flusher.unref?.();
+		let result;
+		try {
+			result = await streamCommand(
+				["yt-dlp", ...jsRuntimeArgs(), "--flat-playlist", "--dump-json", url],
+				{ signal, timeoutMs: 15 * 60_000 },
+				(line) => {
+					if (!line.trim()) return;
+					let item: VideoItem | null;
+					try {
+						item = metadataItem(JSON.parse(line));
+					} catch {
+						item = null;
+					}
+					if (!item) {
+						malformed++;
+						listingFailures.push(`${tab}: malformed listing row`);
+						return;
+					}
+					count++;
+					if (seen.has(item.id)) {
+						options.onProgress?.({
+							tab,
+							tabCount: count,
+							discovered,
+							perTab: { ...perTab, [tab]: count }
+						});
+						return;
+					}
+					seen.add(item.id);
+					discovered++;
+					batch.push(item);
 					options.onProgress?.({
 						tab,
 						tabCount: count,
 						discovered,
 						perTab: { ...perTab, [tab]: count }
 					});
-					return;
+					if (batch.length >= batchSize) flush();
 				}
-				seen.add(item.id);
-				discovered++;
-				batch.push(item);
-				options.onProgress?.({
-					tab,
-					tabCount: count,
-					discovered,
-					perTab: { ...perTab, [tab]: count }
-				});
-				if (batch.length >= batchSize) flush();
-			}
-		);
+			);
+		} finally {
+			clearInterval(flusher);
+			request?.();
+		}
 		if (result.cancelled) throw new Error("Listing cancelled.");
 		const errors = result.stderr.split(/\r?\n/).filter((line) => line.startsWith("ERROR:"));
 		const absentTab =
@@ -263,6 +288,47 @@ export interface DiscoveryResult extends ListingStreamResult {
 }
 
 /**
+ * The alias identities a source is known by before any of its videos has been seen.
+ *
+ * A caller that starts consuming a listing while it is still being produced needs these from the
+ * first moment: only the source itself is known then, and the per-video creator aliases arrive
+ * with the batches that carry them.
+ */
+export function sourceAliases(value: string): string[] {
+	const source = canonicalSource(value);
+	return [...new Set([channelSlug(source), legacyChannelSlug(value), legacyChannelSlug(source)])];
+}
+
+/** The alias identities one discovered video contributes, from its creator identity. */
+export function itemAliases(item: VideoItem): string[] {
+	if (!item.creatorUrl) return [item.id];
+	return [...new Set([channelSlug(item.creatorUrl), legacyChannelSlug(item.creatorUrl)])];
+}
+
+/**
+ * Add one batch's creator aliases to a running alias set, in first-seen order.
+ *
+ * Streaming discovery collects aliases as batches arrive, and a recovered partial listing is a
+ * batch like any other: its creators may be absent from the live listing entirely (deleted,
+ * unlisted, or simply not reached), and their legacy manifest and transcript cache entries are
+ * filed under exactly these identities. `seen` is the caller's set of what `target` already
+ * holds, so a 50,000-video listing never rescans the array it is appending to.
+ */
+export function collectAliases(
+	target: string[],
+	seen: Set<string>,
+	batch: Iterable<VideoItem>
+): void {
+	for (const item of batch) {
+		for (const alias of itemAliases(item)) {
+			if (seen.has(alias)) continue;
+			seen.add(alias);
+			target.push(alias);
+		}
+	}
+}
+
+/**
  * Discover one source, streaming every batch to the caller as it is found.
  *
  * Single videos take the metadata path — they have no tab listing to stream and their channel
@@ -275,34 +341,39 @@ export async function discoverStream(
 	tabs: readonly string[],
 	signal: AbortSignal | undefined,
 	onBatch: (items: VideoItem[], progress: ListingProgress) => void,
-	options: { batchSize?: number; onProgress?: (progress: ListingProgress) => void } = {}
+	options: {
+		batchSize?: number;
+		onProgress?: (progress: ListingProgress) => void;
+		/** Applied to every listing and metadata request this discovery makes. */
+		beginRequest?: (signal: AbortSignal | undefined) => Promise<() => void>;
+	} = {}
 ): Promise<DiscoveryResult> {
 	const source = canonicalSource(value);
 	const slug = storageIdentity(source);
 	const id = parseVideoId(source);
-	const aliases = new Set<string>([
-		channelSlug(source),
-		legacyChannelSlug(value),
-		legacyChannelSlug(source)
-	]);
+	const aliases = new Set<string>(sourceAliases(value));
 	const aliasFor = (item: VideoItem): void => {
-		if (item.creatorUrl) {
-			aliases.add(channelSlug(item.creatorUrl));
-			aliases.add(legacyChannelSlug(item.creatorUrl));
-		} else aliases.add(item.id);
+		for (const alias of itemAliases(item)) aliases.add(alias);
 	};
 	if (id) {
-		const result = await runCommand(
-			[
-				"yt-dlp",
-				...jsRuntimeArgs(),
-				"--skip-download",
-				"--no-playlist",
-				"--dump-single-json",
-				source
-			],
-			{ signal, timeoutMs: 15 * 60_000 }
-		);
+		// A single video's metadata is its own YouTube request and takes the same shared slot.
+		const request = await options.beginRequest?.(signal);
+		let result;
+		try {
+			result = await runCommand(
+				[
+					"yt-dlp",
+					...jsRuntimeArgs(),
+					"--skip-download",
+					"--no-playlist",
+					"--dump-single-json",
+					source
+				],
+				{ signal, timeoutMs: 15 * 60_000 }
+			);
+		} finally {
+			request?.();
+		}
 		if (result.cancelled) throw new Error("Listing cancelled.");
 		let item: VideoItem | null = null;
 		try {
@@ -343,7 +414,8 @@ export async function discoverStream(
 
 export async function enumerate(
 	value: string,
-	signal?: AbortSignal
+	signal?: AbortSignal,
+	options: { beginRequest?: (signal: AbortSignal | undefined) => Promise<() => void> } = {}
 ): Promise<{
 	slug: string;
 	channel: string;
@@ -353,9 +425,15 @@ export async function enumerate(
 	aliases: string[];
 }> {
 	const items: VideoItem[] = [];
-	const result = await discoverStream(value, DEFAULTS.tabs, signal, (batch) => {
-		for (const item of batch) items.push(item);
-	});
+	const result = await discoverStream(
+		value,
+		DEFAULTS.tabs,
+		signal,
+		(batch) => {
+			for (const item of batch) items.push(item);
+		},
+		options
+	);
 	return {
 		slug: result.slug,
 		channel: result.channel,

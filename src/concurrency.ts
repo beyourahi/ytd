@@ -147,9 +147,67 @@ export class PipelineQueue<T> {
 	}
 }
 
+/**
+ * A wake-up for waiters that must react the moment durable work appears.
+ *
+ * The pipeline uses it so an extraction worker starts as soon as a fetch commits extraction
+ * work, instead of meeting that row on its next poll, and a finished stage can end idle workers
+ * promptly. `wait` is always bounded, so a missed notification degrades to a bounded poll rather
+ * than a hang, and an abort releases every waiter.
+ *
+ * The timer is deliberately not unref'd. A waiter here is live work — a worker that still owes
+ * the run an answer — and an unref'd timer is not enough to keep the process alive, so a run
+ * whose last remaining waiter was on this timer would exit silently in the middle of its own
+ * work, reporting success it never earned. A pending waiter must hold the process open.
+ */
+export class Signaler {
+	/**
+	 * Live waiters, removed by whichever settles them first.
+	 *
+	 * A timed-out waiter is not kept for a later notification: an idle stage polls here, so
+	 * retaining every expired callback would grow without bound for as long as no work arrives.
+	 */
+	private readonly waiters = new Set<() => void>();
+
+	/** How many waiters are still waiting; diagnostics and regression coverage only. */
+	get pendingWaiters(): number {
+		return this.waiters.size;
+	}
+
+	notify(): void {
+		const waiting = [...this.waiters];
+		this.waiters.clear();
+		for (const resolve of waiting) resolve();
+	}
+
+	wait(ms: number, signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) return Promise.resolve();
+		const waiters = this.waiters;
+		return new Promise<void>((resolve) => {
+			const timer = setTimeout(done, Math.max(1, ms));
+			// Timeout, notification and abort all settle the same way, and all of them detach the
+			// waiter, so no path can leave a stale callback behind.
+			function done(): void {
+				waiters.delete(done);
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", done);
+				resolve();
+			}
+			signal?.addEventListener("abort", done, { once: true });
+			waiters.add(done);
+		});
+	}
+}
+
 export interface AdaptiveOptions {
 	min: number;
 	max: number;
+	/**
+	 * Where the limit starts. Defaults to `min`, which is right for a controller whose only job is
+	 * to widen. A pipeline wants the opposite: begin at the configured ceiling — that is the
+	 * ceiling's whole purpose — and narrow only on evidence of throttling.
+	 */
+	start?: number;
 	/** Consecutive successes required before widening; damps oscillation. */
 	successStreak?: number;
 	/** Multiplicative decrease factors for different failure severities. */
@@ -185,26 +243,27 @@ export class AdaptiveLimiter {
 	private cooldownUntil = 0;
 	private decisions: Record<string, number> = {};
 	private lastReason = "initial";
-	private readonly options: Required<AdaptiveOptions>;
+	private readonly options: Required<Omit<AdaptiveOptions, "start">>;
 
 	constructor(
 		options: AdaptiveOptions,
 		private readonly clock = () => Date.now()
 	) {
+		const { start, ...rest } = options;
 		this.options = {
 			successStreak: 8,
 			transientFactor: 0.7,
 			rateLimitFactor: 0.5,
 			cooldownMs: 30_000,
 			changeIntervalMs: 2_000,
-			...options
+			...rest
 		};
 		if (this.options.min < 1) throw new Error("Adaptive minimum concurrency must be at least 1");
 		if (this.options.max < this.options.min)
 			throw new Error("Adaptive maximum concurrency cannot be below its minimum");
 		this.current = Math.min(
 			this.options.max,
-			Math.max(this.options.min, Math.floor(options.min) || 1)
+			Math.max(this.options.min, Math.floor(start ?? this.options.min))
 		);
 	}
 

@@ -303,6 +303,71 @@ test("searchable installed-agent/model picker offers exact entry and persists ef
 	});
 });
 
+test("a fresh configuration starts on installed OpenCode without touching a saved preference", async () => {
+	const path = configPath();
+	const initials: string[] = [];
+	await resolveCli(["settings"], {
+		path,
+		interactive: true,
+		installed: (name) => ["claude", "opencode"].includes(name),
+		onboarding: onboarding(connectedConsole),
+		models: async () => [{ id: "opencode/free" }],
+		ui: {
+			select: async (message, _choices, initial) => {
+				if (message !== "Agent") return message === "Model" ? "opencode/free" : "__default__";
+				initials.push(initial ?? "");
+				return "opencode";
+			},
+			text: async () => ""
+		}
+	});
+	expect(initials).toEqual(["opencode"]);
+	expect(loadSettings(path).selected).toEqual({ agent: "opencode", model: "opencode/free" });
+
+	// A saved agent still wins, and the picker starts where the user left off.
+	const saved = configPath();
+	saveSettings(
+		{ version: 1, selected: { agent: "claude", model: "opus" }, recent: [], adapters: {} },
+		saved
+	);
+	const savedInitials: string[] = [];
+	await resolveCli(["settings"], {
+		path: saved,
+		interactive: true,
+		installed: (name) => ["claude", "opencode"].includes(name),
+		onboarding: onboarding(connectedConsole),
+		models: async () => [{ id: "opus" }],
+		ui: {
+			select: async (message, _choices, initial) => {
+				if (message !== "Agent") return message === "Model" ? "opus" : "__default__";
+				savedInitials.push(initial ?? "");
+				return "claude";
+			},
+			text: async () => ""
+		}
+	});
+	expect(savedInitials).toEqual(["claude"]);
+
+	// Without OpenCode the same fresh configuration falls back to the installed agent.
+	const plain = configPath();
+	const plainInitials: string[] = [];
+	await resolveCli(["settings"], {
+		path: plain,
+		interactive: true,
+		installed: (name) => name === "pi",
+		models: async () => [{ id: "provider/free" }],
+		ui: {
+			select: async (message, _choices, initial) => {
+				if (message !== "Agent") return message === "Model" ? "provider/free" : "__default__";
+				plainInitials.push(initial ?? "");
+				return "pi";
+			},
+			text: async () => ""
+		}
+	});
+	expect(plainInitials).toEqual(["pi"]);
+});
+
 test("cancellation preserves remembered configuration", async () => {
 	const path = configPath();
 	saveSettings(
