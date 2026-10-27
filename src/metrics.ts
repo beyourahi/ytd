@@ -300,6 +300,16 @@ export function formatReport(snapshot: MetricsSnapshot): string[] {
 				.join(" ")}`
 		);
 	}
+	const counters = Object.entries(snapshot.counters).sort(([a], [b]) => a.localeCompare(b));
+	if (counters.length) {
+		// Counters are what make avoided work visible: model calls issued, calls reused, and the
+		// duplicates resolved without one.
+		lines.push(
+			`  counters: ${counters
+				.map(([key, value]) => `${key.replace("counter:", "")}=${value}`)
+				.join(" ")}`
+		);
+	}
 	lines.push(
 		`  peak RSS ${round(snapshot.peakRssMb)}MB · cpu ${round(snapshot.cpuUtilisation, 2)}x wall` +
 			` · ${snapshot.resourceSamples} resource samples`

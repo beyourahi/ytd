@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Metrics } from "../src/metrics.ts";
 import {
 	agentJson,
 	mapBatch,
@@ -412,6 +413,115 @@ test("reduction compares every note shard, caches calls and unions accepted cita
 			result.out
 		);
 		expect(calls).toBe(initialCalls);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("exact duplicates are resolved without a comparison call, wording changes are not", async () => {
+	const f = fixture();
+	try {
+		const candidates = [candidate, { ...candidate, sourceId: "other" }];
+		const notes = [
+			{ path: "craft/field-notes.md", text: "- **Reliability** — Keep checkpoints [M4]\n" }
+		];
+		const compared: string[] = [];
+		const options: DistillOptions = {
+			profile,
+			manifest: f.manifest,
+			call: async (prompt) => {
+				if (prompt.startsWith("Merge useful"))
+					return answer({
+						rooms: [
+							{
+								room: "craft",
+								principles: [
+									{ theme: "Reliability", principle: "Keep checkpoints", ids: ["video"] },
+									// Identical wording already published: resolved locally, never compared.
+									{ theme: "Reliability", principle: "Keep  checkpoints!", ids: ["other"] },
+									// Same idea, different words: still the model's call, and it says no.
+									{
+										theme: "Reliability",
+										principle: "Persist progress before calling out",
+										ids: ["other"]
+									}
+								],
+								halalNotes: []
+							}
+						]
+					});
+				if (prompt.startsWith("Is this")) {
+					compared.push(
+						JSON.parse(prompt.split("NEW PRINCIPLE:\n")[1].split("\nEXISTING")[0]).principle
+					);
+					return answer({ duplicate: false });
+				}
+				return answer({ match: null });
+			}
+		};
+		const metrics = new Metrics();
+		const result = await reduce(candidates, "Creator", notes, undefined, { ...options, metrics });
+		expect(result.error).toBeUndefined();
+		// The notes duplicate and the reworded candidate never reached a comparison; only the
+		// genuinely new wording was compared, and the model's verdict is what decided it.
+		expect(compared).toEqual(["Persist progress before calling out"]);
+		expect(result.out?.rooms[0].principles).toEqual([
+			{
+				theme: "Reliability",
+				principle: "Persist progress before calling out",
+				ids: ["other"]
+			}
+		]);
+		// Two identical repeats resolved locally; the reworded candidate cost exactly one call.
+		expect(metrics.counterValue("dedup-exact")).toBe(2);
+		expect(metrics.counterValue("dedup-model")).toBe(1);
+		// One synthesis and one notes comparison. Each repeat would otherwise have needed its own
+		// note comparison, so the exact matches are what disappears from the bill.
+		expect(metrics.counterValue("ai-calls")).toBe(2);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("an exact repeat of an accepted principle unions citations without a call", async () => {
+	const f = fixture();
+	try {
+		// Oversized details force one synthesis group per candidate, so the repeat can only be
+		// caught in-run rather than inside a single synthesis response.
+		const candidates = [
+			{ ...candidate, detail: "a".repeat(3000) },
+			{ ...candidate, sourceId: "other", detail: "b".repeat(3000) }
+		];
+		let synthesis = 0;
+		const options: DistillOptions = {
+			profile,
+			manifest: f.manifest,
+			call: async (prompt) => {
+				if (prompt.startsWith("Merge useful")) {
+					// Two groups, so the second group's repeat can only be caught in-run.
+					synthesis++;
+					const ids = synthesis === 1 ? ["video"] : ["other"];
+					return answer({
+						rooms: [
+							{
+								room: "craft",
+								principles: [{ theme: "Reliability", principle: "Keep checkpoints", ids }],
+								halalNotes: []
+							}
+						]
+					});
+				}
+				if (prompt.startsWith("Is this")) return answer({ duplicate: false });
+				return answer({ match: null });
+			}
+		};
+		const metrics = new Metrics();
+		const result = await reduce(candidates, "Creator", [], undefined, { ...options, metrics });
+		expect(result.error).toBeUndefined();
+		expect(result.out?.rooms[0].principles).toEqual([
+			{ theme: "Reliability", principle: "Keep checkpoints", ids: ["video", "other"] }
+		]);
+		expect(metrics.counterValue("dedup-exact")).toBe(1);
 	} finally {
 		f.cleanup();
 	}

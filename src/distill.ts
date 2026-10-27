@@ -161,6 +161,57 @@ export function extractJson<T>(input: string): T | null {
 }
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
+
+/**
+ * Exact-duplicate recognition.
+ *
+ * Comparison against the palace is the expensive part of a large run, and a candidate that is
+ * already present verbatim does not need a model to say so. Only an exact normalised match
+ * short-circuits; any wording difference — however small — still goes to the model, so nothing
+ * is inferred from string similarity and the semantic decision is never decided locally.
+ */
+function normalisePrinciple(value: string): string {
+	return value
+		.normalize("NFKC")
+		.toLowerCase()
+		.replace(/[^\p{L}\p{N}]+/gu, " ")
+		.trim();
+}
+
+/**
+ * A bare theme word or list marker is not a claim, so fragments below this length are not
+ * indexed — otherwise a new principle could be suppressed by matching a heading.
+ */
+const MIN_INDEXED_FRAGMENT = 16;
+
+/**
+ * Index the words already written down, from the published note text itself.
+ *
+ * Lines carry list markers, emphasis and `[Mn]` citations, and a published entry reads as
+ * `Theme — principle`, so each line is indexed whole and the principle is indexed on its own.
+ * A principle that arrives unformatted from a transcript is then recognised against the entry
+ * it was published as, without weakening the rule: only an exact normalised match resolves.
+ */
+function noteIndex(shards: { path: string; text: string }[]): Set<string> {
+	const index = new Set<string>();
+	for (const shard of shards) {
+		for (const raw of shard.text.split(/\r?\n/)) {
+			const line = raw.trim();
+			if (!line) continue;
+			const stripped = line
+				.replace(/^[\s>*-]*/, "")
+				.replace(/\[M\d+\]/g, " ")
+				.replace(/[*_`#]+/g, " ");
+			const whole = normalisePrinciple(stripped);
+			if (whole) index.add(whole);
+			for (const segment of stripped.split(/[\u2014\u2013]|\s[-:|]\s/)) {
+				const key = normalisePrinciple(segment);
+				if (key.length >= MIN_INDEXED_FRAGMENT) index.add(key);
+			}
+		}
+	}
+	return index;
+}
 /** UTF-8 bytes upper-bound input tokens; reserve output plus protocol overhead for unknown tokenizers. */
 export function promptBudget(profile: AgentProfile): number {
 	const context = profile.contextTokens ?? 8192;
@@ -195,6 +246,7 @@ export async function agentJson<T>(
 	};
 	const cached = options.manifest?.getCheckpoint<{ obj: unknown; reportedModel?: string }>(key);
 	if (cached && valid(cached.obj)) {
+		options.metrics?.counter("ai-calls-reused");
 		const error = pinIdentity(cached.reportedModel);
 		return error ? { error } : { obj: cached.obj };
 	}
@@ -472,6 +524,9 @@ export async function reduce(
 	if (group.length) groups.push(group);
 	const rooms = new Map<string, ReducedRoom>();
 	const accepted: ReducedPrinciple[] = [];
+	// Locally resolved duplicates: what the palace already says, and what this run just accepted.
+	const written = noteIndex(notes);
+	const acceptedByKey = new Map<string, ReducedPrinciple>();
 	for (let i = 0; i < groups.length; i++) {
 		onPass?.(i + 1, groups.length);
 		const ids = new Set(groups[i].map((c) => c.sourceId));
@@ -496,6 +551,19 @@ export async function reduce(
 			room.halalNotes = [...new Set([...room.halalNotes, ...input.halalNotes])];
 			for (const p of input.principles) {
 				let duplicate = false;
+				const key = normalisePrinciple(p.principle);
+				const alreadyAccepted = key ? acceptedByKey.get(key) : undefined;
+				if (alreadyAccepted) {
+					// Identical wording is already covered; no model call can add anything here.
+					options.metrics?.counter("dedup-exact");
+					alreadyAccepted.ids = [...new Set([...alreadyAccepted.ids, ...p.ids])];
+					if (!room.principles.includes(alreadyAccepted)) room.principles.push(alreadyAccepted);
+					continue;
+				}
+				if (key && written.has(key)) {
+					options.metrics?.counter("dedup-exact");
+					continue;
+				}
 				for (const note of notes) {
 					if (!note.text) continue;
 					const available = budget - bytes(notesPrompt(p, { path: note.path, text: "" }));
@@ -551,6 +619,7 @@ export async function reduce(
 						const match = prior[comparison.obj.match];
 						match.ids = [...new Set([...match.ids, ...p.ids])];
 						if (!room.principles.includes(match)) room.principles.push(match);
+						if (key) acceptedByKey.set(key, match);
 						duplicate = true;
 						break;
 					}
@@ -558,7 +627,9 @@ export async function reduce(
 				if (!duplicate) {
 					room.principles.push(p);
 					accepted.push(p);
-				}
+					if (key) acceptedByKey.set(key, p);
+					options.metrics?.counter("dedup-model");
+				} else options.metrics?.counter("dedup-merged");
 			}
 		}
 		options.manifest?.checkpoint(
