@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DEFAULTS, jsRuntimeArgs } from "./config.ts";
-import { runCommand } from "./process.ts";
+import { runCommand, streamCommand } from "./process.ts";
 
 export interface VideoItem {
 	id: string;
@@ -115,19 +115,102 @@ export function metadataItem(value: unknown): VideoItem | null {
 	};
 }
 
-export async function enumerateChannel(
+export interface ListingProgress {
+	tab: string;
+	/** Rows seen in this tab so far, including repeats of a video already discovered. */
+	tabCount: number;
+	/** Distinct video identities discovered so far. */
+	discovered: number;
+	perTab: Record<string, number>;
+}
+
+export interface ListingStreamResult {
+	perTab: Record<string, number>;
+	listingFailures: string[];
+	/** Distinct video identities discovered. */
+	discovered: number;
+	/** Listing rows that could not supply a usable identity. */
+	malformed: number;
+	/** True when some tab never finished, so the result is a partial listing. */
+	partial: boolean;
+}
+
+/**
+ * Enumerate a channel, playlist or video without ever holding the whole listing.
+ *
+ * A large channel produces tens of megabytes of JSON and thousands of identities, so rows are
+ * parsed, deduplicated and handed to `onBatch` as they arrive. Discovery memory therefore
+ * stays proportional to the batch, not to the channel, and a batch can be committed durably
+ * before the next one exists.
+ *
+ * A listing that did not finish is reported as partial instead of being presented as a
+ * complete inventory of the source.
+ */
+export async function enumerateChannelStream(
 	value: string,
-	tabs: readonly string[] = DEFAULTS.tabs,
-	signal?: AbortSignal
-): Promise<{ items: VideoItem[]; perTab: Record<string, number>; listingFailures: string[] }> {
+	tabs: readonly string[],
+	signal: AbortSignal | undefined,
+	onBatch: (items: VideoItem[], progress: ListingProgress) => void,
+	options: { batchSize?: number; onProgress?: (progress: ListingProgress) => void } = {}
+): Promise<ListingStreamResult> {
+	const batchSize = Math.max(1, Math.floor(options.batchSize ?? 200));
 	const seen = new Set<string>();
-	const items: VideoItem[] = [];
 	const perTab: Record<string, number> = {};
 	const listingFailures: string[] = [];
+	let malformed = 0;
+	let discovered = 0;
+	let partial = false;
 	for (const { tab, url } of tabUrls(value, tabs)) {
-		const result = await runCommand(
+		let batch: VideoItem[] = [];
+		let count = 0;
+		const flush = () => {
+			if (!batch.length) return;
+			const current = batch;
+			batch = [];
+			onBatch(current, {
+				tab,
+				tabCount: count,
+				discovered,
+				perTab: { ...perTab, [tab]: count }
+			});
+		};
+		const result = await streamCommand(
 			["yt-dlp", ...jsRuntimeArgs(), "--flat-playlist", "--dump-json", url],
-			{ signal, timeoutMs: 15 * 60_000 }
+			{ signal, timeoutMs: 15 * 60_000 },
+			(line) => {
+				if (!line.trim()) return;
+				let item: VideoItem | null;
+				try {
+					item = metadataItem(JSON.parse(line));
+				} catch {
+					item = null;
+				}
+				if (!item) {
+					malformed++;
+					listingFailures.push(`${tab}: malformed listing row`);
+					return;
+				}
+				count++;
+				if (seen.has(item.id)) {
+					options.onProgress?.({
+						tab,
+						tabCount: count,
+						discovered,
+						perTab: { ...perTab, [tab]: count }
+					});
+					return;
+				}
+				seen.add(item.id);
+				discovered++;
+				batch.push(item);
+				options.onProgress?.({
+					tab,
+					tabCount: count,
+					discovered,
+					perTab: { ...perTab, [tab]: count }
+				});
+				if (batch.length >= batchSize) flush();
+			}
 		);
 		if (result.cancelled) throw new Error("Listing cancelled.");
 		const errors = result.stderr.split(/\r?\n/).filter((line) => line.startsWith("ERROR:"));
@@ -136,34 +219,31 @@ export async function enumerateChannel(
 			result.code === 1 &&
 			!result.timedOut &&
 			!result.overflow &&
-			!result.stdout.trim() &&
+			result.lines === 0 &&
 			errors.length === 1 &&
 			errors[0].match(
 				/^ERROR: \[youtube:tab\] [^:\r\n]+: This channel does not have a (videos|shorts) tab$/
 			)?.[1] === tab;
-		if (!absentTab && (result.code !== 0 || result.timedOut || result.overflow))
+		if (!absentTab && (result.code !== 0 || result.timedOut || result.overflow)) {
 			listingFailures.push(`${tab}: listing failed${result.timedOut ? " (timeout)" : ""}`);
-		let count = 0;
-		for (const line of result.stdout.split("\n").filter(Boolean)) {
-			let item: VideoItem | null;
-			try {
-				item = metadataItem(JSON.parse(line));
-			} catch {
-				item = null;
-			}
-			if (!item) {
-				listingFailures.push(`${tab}: malformed listing row`);
-				continue;
-			}
-			count++;
-			if (!seen.has(item.id)) {
-				seen.add(item.id);
-				items.push(item);
-			}
+			partial = true;
 		}
+		flush();
 		perTab[tab] = count;
 	}
-	return { items, perTab, listingFailures };
+	return { perTab, listingFailures, discovered, malformed, partial };
+}
+
+export async function enumerateChannel(
+	value: string,
+	tabs: readonly string[] = DEFAULTS.tabs,
+	signal?: AbortSignal
+): Promise<{ items: VideoItem[]; perTab: Record<string, number>; listingFailures: string[] }> {
+	const items: VideoItem[] = [];
+	const result = await enumerateChannelStream(value, tabs, signal, (batch) => {
+		for (const item of batch) items.push(item);
+	});
+	return { items, perTab: result.perTab, listingFailures: result.listingFailures };
 }
 
 export function resolveSingleMeta(
@@ -175,6 +255,90 @@ export function resolveSingleMeta(
 	const title = tab >= 0 ? text(out.slice(tab + 1)) : "";
 	const handle = uploaderUrl ? channelSlug(uploaderUrl) : "";
 	return { slug: handle || id, channel: handle || "unknown", title };
+}
+export interface DiscoveryResult extends ListingStreamResult {
+	slug: string;
+	channel: string;
+	aliases: string[];
+}
+
+/**
+ * Discover one source, streaming every batch to the caller as it is found.
+ *
+ * Single videos take the metadata path — they have no tab listing to stream and their channel
+ * name is only known from their own metadata — while channels and playlists stream tab by tab.
+ * Aliases are collected here, from the identities actually discovered, so the legacy import and
+ * transcript cache reuse see the same alias set they always have.
+ */
+export async function discoverStream(
+	value: string,
+	tabs: readonly string[],
+	signal: AbortSignal | undefined,
+	onBatch: (items: VideoItem[], progress: ListingProgress) => void,
+	options: { batchSize?: number; onProgress?: (progress: ListingProgress) => void } = {}
+): Promise<DiscoveryResult> {
+	const source = canonicalSource(value);
+	const slug = storageIdentity(source);
+	const id = parseVideoId(source);
+	const aliases = new Set<string>([
+		channelSlug(source),
+		legacyChannelSlug(value),
+		legacyChannelSlug(source)
+	]);
+	const aliasFor = (item: VideoItem): void => {
+		if (item.creatorUrl) {
+			aliases.add(channelSlug(item.creatorUrl));
+			aliases.add(legacyChannelSlug(item.creatorUrl));
+		} else aliases.add(item.id);
+	};
+	if (id) {
+		const result = await runCommand(
+			[
+				"yt-dlp",
+				...jsRuntimeArgs(),
+				"--skip-download",
+				"--no-playlist",
+				"--dump-single-json",
+				source
+			],
+			{ signal, timeoutMs: 15 * 60_000 }
+		);
+		if (result.cancelled) throw new Error("Listing cancelled.");
+		let item: VideoItem | null = null;
+		try {
+			item = metadataItem(JSON.parse(result.stdout));
+			if (item?.id !== id) item = null;
+		} catch {
+			/* fetch still retries this identity */
+		}
+		const resolved = item ?? { id, title: "", creator: "unknown" };
+		aliasFor(resolved);
+		aliases.add(id);
+		const progress = { tab: "single", tabCount: 1, discovered: 1, perTab: { single: 1 } };
+		onBatch([resolved], progress);
+		options.onProgress?.(progress);
+		return {
+			slug,
+			channel: item?.creator || "unknown",
+			perTab: { single: 1 },
+			listingFailures: result.code === 0 && item ? [] : ["single: metadata unavailable"],
+			discovered: 1,
+			malformed: 0,
+			partial: !(result.code === 0 && item),
+			aliases: [...aliases]
+		};
+	}
+	const streamed = await enumerateChannelStream(
+		source,
+		tabs,
+		signal,
+		(items, progress) => {
+			for (const item of items) aliasFor(item);
+			onBatch(items, progress);
+		},
+		options
+	);
+	return { slug, channel: channelSlug(source), ...streamed, aliases: [...aliases] };
 }
 
 export async function enumerate(
@@ -188,55 +352,16 @@ export async function enumerate(
 	listingFailures: string[];
 	aliases: string[];
 }> {
-	const source = canonicalSource(value);
-	const slug = storageIdentity(source);
-	const id = parseVideoId(source);
-	if (!id) {
-		const listing = await enumerateChannel(source, DEFAULTS.tabs, signal);
-		return {
-			slug,
-			channel: channelSlug(source),
-			...listing,
-			aliases: [
-				...new Set([
-					channelSlug(source),
-					legacyChannelSlug(value),
-					legacyChannelSlug(source),
-					...listing.items.flatMap((v) =>
-						v.creatorUrl ? [channelSlug(v.creatorUrl), legacyChannelSlug(v.creatorUrl)] : [v.id]
-					)
-				])
-			]
-		};
-	}
-	const result = await runCommand(
-		[
-			"yt-dlp",
-			...jsRuntimeArgs(),
-			"--skip-download",
-			"--no-playlist",
-			"--dump-single-json",
-			source
-		],
-		{ signal, timeoutMs: 15 * 60_000 }
-	);
-	if (result.cancelled) throw new Error("Listing cancelled.");
-	let item: VideoItem | null = null;
-	try {
-		item = metadataItem(JSON.parse(result.stdout));
-		if (item?.id !== id) item = null;
-	} catch {
-		/* fetch still retries this identity */
-	}
-	const alias = item?.creatorUrl ? channelSlug(item.creatorUrl) : id;
+	const items: VideoItem[] = [];
+	const result = await discoverStream(value, DEFAULTS.tabs, signal, (batch) => {
+		for (const item of batch) items.push(item);
+	});
 	return {
-		slug,
-		channel: item?.creator || "unknown",
-		items: [item ?? { id, title: "", creator: "unknown" }],
-		perTab: { single: 1 },
-		listingFailures: result.code === 0 && item ? [] : ["single: metadata unavailable"],
-		aliases: [
-			...new Set([alias, id, ...(item?.creatorUrl ? [legacyChannelSlug(item.creatorUrl)] : [])])
-		]
+		slug: result.slug,
+		channel: result.channel,
+		items,
+		perTab: result.perTab,
+		listingFailures: result.listingFailures,
+		aliases: result.aliases
 	};
 }

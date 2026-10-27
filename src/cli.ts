@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
-import { CONCURRENCY, DATA_DIR, type ConcurrencySettings, type Room } from "./config.ts";
+import { CONCURRENCY, DATA_DIR, DEFAULTS, type ConcurrencySettings, type Room } from "./config.ts";
 import { Manifest, stableHash, type VideoRow } from "./manifest.ts";
-import { canonicalSource, enumerate, type VideoItem } from "./enumerate.ts";
+import { canonicalSource, discoverStream, storageIdentity, type VideoItem } from "./enumerate.ts";
+import { DiscoveryLog } from "./discovery.ts";
 import { reduce, type ReduceOutput, type SourceHalalNote } from "./distill.ts";
 import { Metrics, formatReport } from "./metrics.ts";
 import { GlobalLimiter } from "./limits.ts";
@@ -309,9 +310,30 @@ export async function ingest(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
 	);
 	console.log("Enumerating…");
-	const listing = await enumerate(source, signal);
+	// Discovery streams tab by tab and stages every batch as it arrives: a 50,000-video channel
+	// therefore costs memory proportional to one batch instead of the whole listing, and a
+	// listing that never finished is reported as partial instead of posing as the full inventory.
+	const discovery = new DiscoveryLog(storageIdentity(source));
+	discovery.begin();
+	const listedIds = new Set<string>();
+	const listing = await discoverStream(
+		source,
+		DEFAULTS.tabs,
+		signal,
+		(batch, progress) => {
+			discovery.append(batch);
+			for (const item of batch) listedIds.add(item.id);
+			if (progress.discovered % 1000 === 0 && progress.discovered > 0)
+				console.log(`Listing ${progress.tab}: ${progress.discovered} videos discovered…`);
+		},
+		{ batchSize: CONCURRENCY.discoveryBatch }
+	);
 	for (const failure of listing.listingFailures) console.warn(`Listing warning: ${failure}`);
-	if (!listing.items.length)
+	if (listing.partial) {
+		const state = discovery.abandon();
+		console.warn(`Partial listing staged at ${state.partialPath}; it is not a complete inventory.`);
+	}
+	if (!listedIds.size)
 		throw new Error(
 			listing.listingFailures.length
 				? "Listings failed; no videos were confirmed."
@@ -329,11 +351,11 @@ export async function ingest(
 			sourceDir: DATA_DIR,
 			onWait: () => console.log("Waiting for library initialization or legacy ingestion…")
 		});
-		const listedIds = new Set(listing.items.map((item) => item.id));
 		release = await manifest.acquireSource(source, [...listedIds], {
 			signal,
 			onWait: () => console.log("Waiting for overlapping source or videos…")
 		});
+		if (!listing.partial) discovery.commit();
 		let requestedIds = [...listedIds];
 		const receipts: PublicationReceipt[] = [];
 		for (;;) {
@@ -347,17 +369,20 @@ export async function ingest(
 			const publishing = manifest.hasPublicationPlans();
 			// A saved plan owns its original candidates, creator identity and room receipts.
 			// Recover that phase before changing metadata or extracting additional sources.
+			// Metadata is imported from the staged listing in batches, so this process never holds
+			// more than one batch of discovered rows at a time.
 			if (!publishing)
-				manifest.addVideos(
-					listing.items
-						.filter((item) => ids.has(item.id))
-						.map((item: VideoItem) => ({
-							id: item.id,
-							title: item.title,
-							channel: item.creator !== "unknown" ? item.creator : undefined,
-							channelUrl: item.creatorUrl
-						}))
-				);
+				for (const batch of discovery.read())
+					manifest.addVideos(
+						batch
+							.filter((item) => ids.has(item.id))
+							.map((item: VideoItem) => ({
+								id: item.id,
+								title: item.title,
+								channel: item.creator !== "unknown" ? item.creator : undefined,
+								channelUrl: item.creatorUrl
+							}))
+					);
 			if (run.replaced)
 				console.log(
 					"Created a replacement run; prior checkpoints and verified receipts are preserved."

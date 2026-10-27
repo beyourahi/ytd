@@ -47,6 +47,8 @@ export interface ConcurrencySettings {
 	progressThreshold: number;
 	/** How often aggregate progress may be rendered. */
 	progressIntervalMs: number;
+	/** Discovered rows staged per durable batch while a listing streams. */
+	discoveryBatch: number;
 	/** Age at which an abandoned work claim may be reclaimed by anyone. */
 	leaseMs: number;
 }
@@ -64,6 +66,7 @@ export const CONCURRENCY: ConcurrencySettings = {
 	retryDelayMs: DEFAULTS.retryDelayMs,
 	progressThreshold: 10,
 	progressIntervalMs: 2000,
+	discoveryBatch: 500,
 	leaseMs: 60_000
 };
 
