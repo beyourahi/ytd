@@ -20,6 +20,7 @@ import {
 	type ModelSuggestion
 } from "./agents.ts";
 import type { ConcurrencySettings } from "./config.ts";
+import type { TranscriptionRequest } from "./transcribe.ts";
 import {
 	opencodeOnboarding,
 	providerGroups,
@@ -151,6 +152,9 @@ export interface CliArgs {
 	maxAttempts?: number;
 	perf?: boolean;
 	verbose?: boolean;
+	transcribe?: boolean;
+	whisperCommand?: string;
+	whisperModel?: string;
 }
 
 /** Operational controls for one run. Defaults come from CONCURRENCY and stay conservative. */
@@ -161,6 +165,8 @@ export interface RunSettings {
 	perf: boolean;
 	/** Narrate every video instead of aggregating progress on large runs. */
 	verbose: boolean;
+	/** Local speech-to-text for captionless videos. Off unless explicitly requested. */
+	transcription?: TranscriptionRequest;
 }
 export function parseArgs(argv: string[]): CliArgs {
 	const out: CliArgs = { command: "run" };
@@ -180,9 +186,10 @@ export function parseArgs(argv: string[]): CliArgs {
 		}
 		if (arg.startsWith("--")) {
 			const [flag, inline] = arg.split(/=(.*)/s);
-			const booleans: Record<string, "perf" | "verbose"> = {
+			const booleans: Record<string, "perf" | "verbose" | "transcribe"> = {
 				"--perf": "perf",
-				"--verbose": "verbose"
+				"--verbose": "verbose",
+				"--transcribe": "transcribe"
 			};
 			const boolKey = booleans[flag];
 			if (boolKey) {
@@ -208,10 +215,15 @@ export function parseArgs(argv: string[]): CliArgs {
 				"--fetch-pacing-ms": "fetchPacingMs",
 				"--max-attempts": "maxAttempts"
 			};
-			const textual: Record<string, "agent" | "model" | "effort"> = {
+			const textual: Record<
+				string,
+				"agent" | "model" | "effort" | "whisperCommand" | "whisperModel"
+			> = {
 				"--agent": "agent",
 				"--model": "model",
-				"--effort": "effort"
+				"--effort": "effort",
+				"--whisper-command": "whisperCommand",
+				"--whisper-model": "whisperModel"
 			};
 			const ranges: Record<string, [number, number]> = {
 				contextTokens: [4096, Number.MAX_SAFE_INTEGER],
@@ -581,7 +593,7 @@ async function chooseProfile(
 }
 
 export const USAGE =
-	"Usage: ytd [youtube-url] [--agent NAME --model ID] [--effort LEVEL]\n       ytd settings | ytd agents add\nAdvanced: --context-tokens N --timeout-ms N --fetch-concurrency N --extract-concurrency N\n          --fetch-pacing-ms N --max-attempts N --perf --verbose\nNon-interactive runs require a URL and a saved or explicit agent/model.";
+	"Usage: ytd [youtube-url] [--agent NAME --model ID] [--effort LEVEL]\n       ytd settings | ytd agents add\nAdvanced: --context-tokens N --timeout-ms N --fetch-concurrency N --extract-concurrency N\n          --fetch-pacing-ms N --max-attempts N --perf --verbose\nOptional local transcription (off by default): --transcribe --whisper-command PATH --whisper-model PATH\nNon-interactive runs require a URL and a saved or explicit agent/model.";
 
 export async function resolveCli(
 	argv = process.argv.slice(2),
@@ -715,7 +727,14 @@ export async function resolveCli(
 				...(args.maxAttempts !== undefined ? { maxAttempts: args.maxAttempts } : {})
 			},
 			perf: args.perf ?? false,
-			verbose: args.verbose ?? false
+			verbose: args.verbose ?? false,
+			transcription: args.transcribe
+				? {
+						enabled: true,
+						...(args.whisperCommand !== undefined ? { command: args.whisperCommand } : {}),
+						...(args.whisperModel !== undefined ? { model: args.whisperModel } : {})
+					}
+				: undefined
 		}
 	};
 }

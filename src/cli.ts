@@ -9,6 +9,7 @@ import { Metrics, formatReport } from "./metrics.ts";
 import { GlobalLimiter } from "./limits.ts";
 import { runIngestPipeline } from "./pipeline.ts";
 import { formatProgress, shouldAggregate } from "./progress.ts";
+import { localTranscript, resolveEngine, transcribeVideo } from "./transcribe.ts";
 import {
 	loadPalaceSnapshot,
 	publishBatch,
@@ -303,6 +304,11 @@ export async function ingest(
 	const settings: ConcurrencySettings = { ...CONCURRENCY, ...run.concurrency };
 	const metrics = new Metrics();
 	const limiter = new GlobalLimiter();
+	// Local transcription stays off unless asked for, and refuses before any download when the
+	// operator has not provided an engine and model.
+	const transcription = run.transcription?.enabled ? resolveEngine(run.transcription) : undefined;
+	if (transcription && !transcription.ok) throw new Error(transcription.reason);
+	if (transcription?.ok) console.log("Local transcription: enabled for videos without captions.");
 	const verbose = run.verbose;
 	let replaceRouting = run.replaceRouting;
 	const selected = await preflight(profile);
@@ -406,6 +412,26 @@ export async function ingest(
 					metrics,
 					limiter,
 					concurrency: settings,
+					recheckNoCaptions: !!transcription?.ok,
+					transcribe: transcription?.ok
+						? async (id, signal) => {
+								// A cached local transcription is reused; otherwise the download and the inference
+								// are bounded by the same cross-session limiter as every other heavy step.
+								const cached = localTranscript(id);
+								if (cached) return cached;
+								const release = await limiter.acquire("transcribe", settings.transcribe, {
+									signal
+								});
+								try {
+									const outcome = await transcribeVideo(id, transcription.engine, { signal });
+									if (outcome.reason)
+										console.log(`No local transcript for ${id}: ${outcome.reason}`);
+									return outcome.text ?? null;
+								} finally {
+									release();
+								}
+							}
+						: undefined,
 					titles: new Map(scoped().map((row) => [row.id, row.title || row.id])),
 					onProgress: aggregate ? (progress) => console.log(formatProgress(progress)) : undefined,
 					log: aggregate && !verbose ? null : (line) => console.log(line)

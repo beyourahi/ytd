@@ -108,6 +108,11 @@ export interface IngestPipelineOptions {
 	 * operator enabled it. Returning null leaves the source as `no_captions`.
 	 */
 	transcribe?: (id: string, signal: AbortSignal) => Promise<string | null>;
+	/**
+	 * With local transcription on, a source previously recorded as captionless is worth
+	 * revisiting: its spoken content may now be recoverable where it was not before.
+	 */
+	recheckNoCaptions?: boolean;
 }
 
 export interface IngestPipelineResult {
@@ -137,6 +142,24 @@ function linkSignals(signals: AbortSignal[]): AbortSignal {
 function backoffWait(stats: { nextAvailableAt: number | null }): number {
 	if (!stats.nextAvailableAt) return 50;
 	return Math.max(25, Math.min(stats.nextAvailableAt - Date.now(), 250));
+}
+
+/**
+ * What a source still needs, if anything.
+ *
+ * Completion lives in `run_videos.status`, so this decides only which stage re-owns a row:
+ * unfinished and failed rows need fetching again, a legacy `fetched` row needs its transcript
+ * restored only when the cached text is actually gone, and a captionless row is revisited only
+ * when local transcription is on — otherwise it would be re-fetched on every run forever.
+ */
+export function workFor(
+	row: Pick<VideoRow, "status">,
+	options: { recheckNoCaptions?: boolean; hasTranscript: boolean }
+): "fetch" | "extract" | null {
+	if (row.status === "pending" || row.status === "failed") return "fetch";
+	if (row.status === "fetched") return options.hasTranscript ? "extract" : "fetch";
+	if (row.status === "no_captions" && options.recheckNoCaptions) return "fetch";
+	return null;
 }
 
 export async function runIngestPipeline(
@@ -180,13 +203,12 @@ export async function runIngestPipeline(
 	const blockedExtract = new Set(jobs.blockedReasons("extract").map((row) => row.id));
 	for (const row of rows) {
 		if (blockedFetch.has(row.id) || blockedExtract.has(row.id)) continue;
-		// A `failed` row is unfinished work from an earlier session, so it is queued again.
-		if (row.status === "pending" || row.status === "failed") needsFetch.add(row.id);
-		else if (row.status === "fetched") {
-			// A legacy fetched row without a cached transcript needs its text restored first.
-			if (existsSync(transcriptPath(row.id))) needsExtract.add(row.id);
-			else needsFetch.add(row.id);
-		}
+		const work = workFor(row, {
+			recheckNoCaptions: options.recheckNoCaptions,
+			hasTranscript: existsSync(transcriptPath(row.id))
+		});
+		if (work === "fetch") needsFetch.add(row.id);
+		else if (work === "extract") needsExtract.add(row.id);
 	}
 	jobs.resetExpired();
 	jobs.sync("fetch", needsFetch);
@@ -281,13 +303,15 @@ export async function runIngestPipeline(
 		const classification = classifyFetchFailure(result.reason);
 		if (classification.terminal) {
 			// No usable captions. Optional local transcription may still recover the knowledge.
-			const text = options.transcribe
-				? await options.transcribe(id, signal).catch(() => null)
-				: null;
-			if (text && text.trim()) {
-				atomicCache(transcriptPath(id), text.trim());
-				acceptFetched();
-				return;
+			if (options.transcribe) {
+				const started = metrics.now();
+				const text = await options.transcribe(id, signal).catch(() => null);
+				metrics.record("transcribe", metrics.now() - started, { ok: !!(text && text.trim()) });
+				if (text && text.trim()) {
+					atomicCache(transcriptPath(id), text.trim());
+					acceptFetched();
+					return;
+				}
 			}
 			manifest.setStatus(id, "no_captions", result.reason ?? "no_captions");
 			jobs.succeed(claim);
