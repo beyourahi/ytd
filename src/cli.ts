@@ -24,8 +24,26 @@ import {
 import { Metrics, formatReport, formatTotalRuntime } from "./metrics.ts";
 import { GlobalLimiter } from "./limits.ts";
 import { FatalIngestError, runIngestPipeline, workFor, type FatalKind } from "./pipeline.ts";
-import { groupCount, progressSegments, shouldAggregate } from "./progress.ts";
-import { Presenter, createPresenter, oneLine } from "./ui.ts";
+import {
+	accumulateWork,
+	classifyOutcome,
+	formatOutcome,
+	formatSessionOutcome,
+	groupCount,
+	progressSegments,
+	runCounts,
+	shouldAggregate,
+	type InvocationWork,
+	type RunCounts
+} from "./progress.ts";
+import { Presenter, detectCapabilities, oneLine, type UiStreams } from "./ui.ts";
+import {
+	dashboardStatus,
+	sessionStreams,
+	type DashboardEnvironment,
+	type DashboardStage,
+	type StageState
+} from "./dashboard.ts";
 import { localTranscript, resolveEngine, transcribeVideo } from "./transcribe.ts";
 import {
 	loadPalaceSnapshot,
@@ -62,6 +80,84 @@ export function withoutPublishedBlocks(text: string, receipts: PublicationReceip
 
 function scopeRows(manifest: Manifest, ids: Set<string>): VideoRow[] {
 	return manifest.all().filter((row) => ids.has(row.id));
+}
+
+/**
+ * The presentation surface for one session.
+ *
+ * The live region is built here rather than inside `createPresenter` because a region needs the
+ * session's own clock: the elapsed time a status area shows has to be the run's measurement, not
+ * a second clock that could quietly disagree with the runtime line printed at the end. Both come
+ * from the same `Metrics`, so they cannot.
+ */
+export function sessionPresenter(
+	metrics: Metrics,
+	streams: UiStreams = {},
+	environment: Partial<DashboardEnvironment> = {}
+): Presenter {
+	const caps = detectCapabilities();
+	const live = sessionStreams(
+		caps,
+		{
+			elapsedMs: () => metrics.elapsedMs(),
+			color: caps.color,
+			unicode: caps.unicode,
+			...environment
+		},
+		streams
+	);
+	return new Presenter(caps, live);
+}
+
+/**
+ * What the run is reading, for the status area's SOURCE line.
+ *
+ * Derived from the canonical source rather than from the text that was typed, so a `youtu.be`
+ * link, a `shorts` path and a full `watch` URL all describe themselves identically — the source
+ * ytd actually works with is the only one worth naming.
+ */
+export function describeSource(canonical: string): string {
+	const url = new URL(canonical);
+	if (url.pathname === "/watch") {
+		const id = url.searchParams.get("v");
+		return id ? `YouTube \u00b7 Video ${id}` : "YouTube \u00b7 Video";
+	}
+	if (url.pathname === "/playlist") {
+		const list = url.searchParams.get("list");
+		return list ? `YouTube \u00b7 Playlist ${list}` : "YouTube \u00b7 Playlist";
+	}
+	const name = decodeURIComponent(url.pathname).replace(/^\/+/, "");
+	return name ? `YouTube \u00b7 Channel ${name}` : "YouTube \u00b7 Channel";
+}
+
+/**
+ * The live region's stage checklist, kept as plain mutable rows.
+ *
+ * It exists for every run and is simply never drawn without a region, so there is one description
+ * of where the run is rather than one per output mode. The rows are measured text: counts that
+ * were observed, never a percentage of work whose total nobody knows.
+ */
+interface StageBoard {
+	readonly rows: DashboardStage[];
+	set(label: string, state: StageState, detail: string): void;
+}
+
+function stageBoard(): StageBoard {
+	const rows: DashboardStage[] = [
+		{ label: "Discovery", state: "active", detail: "listing" },
+		{ label: "Fetching", state: "pending", detail: "pending" },
+		{ label: "Extraction", state: "pending", detail: "pending" },
+		{ label: "Publication", state: "pending", detail: "pending" }
+	];
+	return {
+		rows,
+		set(label, state, detail) {
+			const row = rows.find((item) => item.label === label);
+			if (!row) return;
+			row.state = state;
+			row.detail = detail;
+		}
+	};
 }
 
 /**
@@ -215,6 +311,11 @@ export function mergeSourceReviews(
 	return { rooms };
 }
 
+/** The detailed measured report, printed as lines of the session's own output. */
+function reportPerf(metrics: Metrics): void {
+	for (const line of formatReport(metrics.snapshot())) console.log(line);
+}
+
 export function reportAuditEvidence(
 	manifest: Manifest,
 	rows: VideoRow[],
@@ -276,10 +377,7 @@ async function publishCreator(
 						`Palace kept moving after ${attempt} publication attempts; progress preserved. Re-run the same command. ${error.message}`,
 						{ cause: error }
 					);
-				present.stage(
-					"run",
-					"Palace changed; refreshing affected deduplication and retrying publication…"
-				);
+				present.narrate("Palace changed; refreshing and retrying publication");
 			}
 		}
 	} finally {
@@ -342,12 +440,12 @@ async function publishCreatorAttempt(
 		manifest.checkpoint(checkpointKey, plan);
 	}
 	if (!plan || plan.notesHash !== notesHash) {
-		present.stage("run", `Reduce ${candidates.length} candidates from ${channel}…`);
+		present.narrate(`Reducing ${candidates.length} candidates from ${channel}`);
 		const result = await reduce(
 			candidates,
 			channel,
 			notes,
-			(pass, total) => present.stage("run", `Reduce ${pass}/${total}…`),
+			(pass, total) => present.narrate(`Reducing ${pass}/${total}`),
 			{ profile, manifest, signal }
 		);
 		if (result.limited)
@@ -400,6 +498,8 @@ async function publishCreatorAttempt(
 		plan.base = receipt.verifiedHead;
 		manifest.recordReceipt(`${receipt.runId}:${receipt.room}`, receipt);
 		manifest.checkpoint(checkpointKey, plan);
+		// A real event, so it stays a line in every mode; the region's Publication row is the live
+		// echo of the same count, not a second claim about it.
 		present.stage(
 			"ok",
 			`Published and remotely verified ${receipt.path} (${receipt.commit.slice(0, 12)}).`
@@ -437,14 +537,23 @@ export async function ingest(
 	if (!Bun.which("yt-dlp", { PATH: process.env.PATH }))
 		throw new Error("yt-dlp not found. Install separately with: uv tool install yt-dlp");
 	const settings: ConcurrencySettings = { ...CONCURRENCY, ...run.concurrency };
-	const present = runtime.present ?? createPresenter();
+	// The session's clock, not a second one: a stage total, the live region's elapsed time and the
+	// end-to-end runtime must never be able to disagree about how long the run took.
+	const metrics = runtime.metrics ?? new Metrics();
+	const present = runtime.present ?? sessionPresenter(metrics);
+	const board = stageBoard();
+	// The identity is stated from the selection, before preflight verifies anything: a preflight
+	// that fails must still leave what was selected on the run's own record and, on a terminal,
+	// on the region. It is refreshed below with what preflight resolved.
+	present.status({
+		source: describeSource(source),
+		model: identityLabel(profile),
+		stages: board.rows
+	});
 	if (settings.fetch <= 1)
 		present.line(
 			"YouTube concurrency 1: listing and fetching share the one request slot, so fetching starts when the listing releases it."
 		);
-	// The session's clock, not a second one: a stage total and the end-to-end runtime must never
-	// be able to disagree about how long the run took.
-	const metrics = runtime.metrics ?? new Metrics();
 	const limiter = new GlobalLimiter();
 	// Local transcription stays off unless asked for, and refuses before any download when the
 	// operator has not provided an engine and model.
@@ -456,6 +565,7 @@ export async function ingest(
 	// Preflight runs inside the measured session: verifying the selected provider/model is
 	// automatic work that follows selection, not part of it.
 	const selected = await preflight(profile);
+	present.status({ model: identityLabel(selected) }, true);
 	present.line(
 		`Agent: ${selected.agent}; requested model: ${selected.model}${selected.effort ? `; effort: ${selected.effort}` : ""}. Effective provider settings: unverified.`
 	);
@@ -493,7 +603,10 @@ export async function ingest(
 		}
 		return release;
 	};
-	present.stage("run", "Enumerating…");
+	// Narration, not a log line: with a region drawing this is the activity row, and a listing that
+	// reported every batch as its own line would be the append-only stream this replaces.
+	present.narrate("Enumerating sources");
+	board.set("Discovery", "active", "listing");
 	// Discovery and ingestion run at the same time. The listing appends every batch it finds to its
 	// durable staging file; a registrar reads that file as it grows, claims each new identity and
 	// schedules its work, while the pipeline is already draining those jobs. The first video's
@@ -550,13 +663,16 @@ export async function ingest(
 			(batch, progress) => {
 				collectAliases(aliases, aliasSeen, batch);
 				stage(batch);
-				// One line per thousand videos, from counts the listing already produced: never a
-				// render per video, and never a query or a filesystem scan to fill the line in.
-				if (progress.discovered % 1000 === 0 && progress.discovered > 0)
-					present.stage(
-						"run",
+				// One report per thousand videos, from counts the listing already produced: never a
+				// render per video, and never a query or a filesystem scan to fill the line in. On a
+				// terminal it lands in the Discovery row; in a log it stays the line it has always
+				// been, so a redirected run loses nothing to the live path.
+				if (progress.discovered % 1000 === 0 && progress.discovered > 0) {
+					board.set("Discovery", "active", `${groupCount(progress.discovered)} found`);
+					present.narrate(
 						`Listing ${progress.tab} \u00b7 ${groupCount(progress.discovered)} discovered`
 					);
+				}
 			},
 			{ batchSize: CONCURRENCY.discoveryBatch, beginRequest }
 		);
@@ -652,11 +768,14 @@ export async function ingest(
 			legacyRoot: DATA_DIR,
 			aliases,
 			sourceDir: DATA_DIR,
-			onWait: () => console.log("Waiting for library initialization or legacy ingestion…")
+			// A waiting message is output like any other, so it is printed through the presenter: with a
+			// region drawing, a direct write would land where its erase arithmetic does not expect it
+			// and be wiped by the next frame.
+			onWait: () => present.line("Waiting for library initialization or legacy ingestion…")
 		});
 		sourceClaim = await manifest.beginSourceClaim(source, {
 			signal,
-			onWait: () => console.log("Waiting for overlapping source or videos…")
+			onWait: () => present.line("Waiting for overlapping source or videos…")
 		});
 		release = sourceClaim.release;
 		const listing = startListing();
@@ -683,12 +802,18 @@ export async function ingest(
 		const first = await sourceClaim.waitFor([...listedIds], {
 			signal,
 			timeoutMs: settings.peerWaitMs,
-			onWait: () => console.log("Waiting for overlapping source or videos…")
+			onWait: () => present.line("Waiting for overlapping source or videos…")
 		});
 		for (const id of first.held) held.add(id);
 		let requestedIds: string[] = first.claimed;
 		let registering = false;
 		const receipts: PublicationReceipt[] = [];
+		// What this invocation itself has done, across every automatic recovery cycle.
+		//
+		// Declared outside the loop because the loop is one run, not several: a cycle that hands the
+		// remaining work to a continuation has already extracted what it extracted, and counting
+		// only the last cycle would report this invocation's own work as knowledge it found saved.
+		const invocation: InvocationWork = { distilled: 0, fetched: 0 };
 		for (;;) {
 			completed = false;
 			// Carried out of the work block so the run's own summary can report it.
@@ -700,19 +825,24 @@ export async function ingest(
 			replaceRouting = false;
 			ids = new Set(manifest.all().map((row) => row.id));
 			const publishing = manifest.hasPublicationPlans();
+			// Internal notices, written through the presenter so the live region is out of the way when
+			// they are printed: a direct write would be underneath the region's own erase arithmetic.
 			if (run.replaced)
-				console.log(
+				present.line(
 					"Created a replacement run; prior checkpoints and verified receipts are preserved."
 				);
 			if (run.routingChanged)
-				console.log(
+				present.line(
 					"Resumed with explicitly selected routing; saved work and prior model identity evidence are preserved."
 				);
 			const scoped = () => manifest!.all();
 			if (!publishing) {
 				if (!announcedPipeline) {
 					announcedPipeline = true;
-					present.stage("run", "Fetching and extracting");
+					board.set("Fetching", "active", "starting");
+					board.set("Extraction", "active", "starting");
+					present.status({ stages: board.rows }, true);
+					present.narrate("Fetching and extracting");
 				}
 				if (!streaming) {
 					// Registration runs alongside the pipeline and keeps adding discovered videos to this
@@ -787,22 +917,43 @@ export async function ingest(
 					// activity first, then what is happening beside it. Enumeration, fetching and
 					// extraction overlap, so the secondary counts are shown rather than a stage queue.
 					onProgress: aggregate
-						? (progress) =>
-								present.progress(
-									progressSegments(progress, {
-										discovering: listingOpen,
-										discovered: listedIds.size,
-										// A growing inventory has no final denominator.
-										totalKnown: !listingOpen && listingResolved && !listingPartial
-									})
-								)
+						? (progress) => {
+								const view = {
+									discovering: listingOpen,
+									discovered: listedIds.size,
+									// A growing inventory has no final denominator, so the live frame shows counts
+									// instead of a fraction and the estimate is withheld.
+									totalKnown: !listingOpen && listingResolved && !listingPartial
+								};
+								// The same measurements, arranged for whichever surface exists. A live terminal gets
+								// the region; a log gets the one line it has always had. Neither is the other's
+								// rendering, and a redirected run therefore gains nothing it did not already print.
+								if (present.live) {
+									board.set("Fetching", "active", `${groupCount(progress.fetched)} fetched`);
+									board.set("Extraction", "active", `${groupCount(progress.distilled)} extracted`);
+									present.status({ ...dashboardStatus(progress, view), stages: board.rows });
+								} else present.progress(progressSegments(progress, view));
+							}
 						: undefined,
 					log: aggregate && !verbose ? null : (line) => present.line(line)
 				});
+				accumulateWork(invocation, result);
+				board.set("Fetching", "done", `${groupCount(invocation.fetched)} fetched this run`);
+				board.set("Extraction", "done", `${groupCount(invocation.distilled)} extracted this run`);
+				board.set("Publication", "active", "reducing");
+				present.status({ stages: board.rows }, true);
 				// Discovery has stopped producing: the staged listing is committed as this source's
 				// inventory, or preserved as a partial one instead of posing as a complete listing.
 				await listing;
 				settleInventory();
+				// Discovery is over, so the stage stops claiming to be running. A partial listing or a
+				// failed one is a warning rather than a completion: the row says so instead of showing
+				// a tick over an inventory that is not one.
+				board.set(
+					"Discovery",
+					listingPartial || listingFailures.length ? "warn" : "done",
+					`${groupCount(listedIds.size)} found`
+				);
 				// Later batches can name creators the first one did not (a playlist can mix them), and a
 				// legacy manifest is filed under its creator's identity: import what the finished listing
 				// revealed, under the same lock and with the same per-alias idempotence as the first pass.
@@ -823,6 +974,7 @@ export async function ingest(
 					);
 			}
 			const groups = creatorGroups(scoped().filter((row) => row.status === "distilled"));
+			present.status({ stages: board.rows }, true);
 			for (const [key, group] of groups) {
 				receipts.push(
 					...(await publishCreator(manifest, selected, key, group, source, signal, present))
@@ -836,33 +988,46 @@ export async function ingest(
 				[...listedIds].some((id) => !ids.has(id) && !held.has(id)) ||
 				(publishing && unfinished.length)
 			) {
-				reportAuditEvidence(manifest, scoped(), true);
+				// Evidence assembled outside the presenter, printed through it: the region is erased
+				// first and repainted beneath, so the evidence cannot be covered by a frame — and the
+				// frame's own erase cannot land on the evidence.
+				const audit = manifest;
+				present.suspend(() => reportAuditEvidence(audit, scoped(), true));
 				// Persist the next run before retiring saved membership, including vanished sources.
 				// The source/video claim already covers this union.
 				requestedIds = [...new Set([...listedIds, ...ids])].sort();
 				manifest.completeRun({ profile: selected, source, videoIds: requestedIds });
 				ids = new Set(manifest.all().map((row) => row.id));
-				present.stage("run", "Saved run recovered; processing remaining videos…");
+				present.narrate("Saved run recovered; processing remaining videos");
 				continue;
 			}
+			board.set("Publication", "done", `${groupCount(receipts.length)} verified`);
+			present.status({ stages: board.rows }, true);
 			manifest.completeRun();
 			completed = true;
 			const rows = scoped();
 			const failed = rows.filter((row) => row.status === "failed");
-			const distilled = rows.filter(
+			const withKnowledge = rows.filter(
 				(row) => row.status === "distilled" || row.status === "done"
 			).length;
 			const captionless = rows.filter((row) => row.status === "no_captions").length;
-			// A run that left something behind says so in its own summary line instead of posing as
-			// a clean success: the marker is the only difference, the counts are the same either way.
-			const partial = Boolean(
-				failed.length || listingFailures.length || blockedEntries || held.size
-			);
+			// One classification, from the counts, so the label and the exit code can never disagree
+			// about whether this run finished: a run that left a source failed, a listing partial or
+			// a source held by a live peer classifies as partial and labels itself so.
+			const counts: RunCounts = runCounts({
+				publications: receipts.length,
+				// The invocation's own extraction, not just the last cycle's.
+				distilled: invocation.distilled,
+				withKnowledge,
+				captionless,
+				blocked: blockedEntries,
+				held: held.size,
+				failures: failed.length,
+				warnings: listingFailures.length
+			});
+			const outcome = classifyOutcome(counts);
 			present.line();
-			present.stage(
-				partial ? "warn" : "ok",
-				`Complete: ${receipts.length} room/creator publications remotely verified; ${distilled} source${distilled === 1 ? "" : "s"} distilled; ${captionless} videos without captions or description context; ${failed.length} fetch failures; ${listingFailures.length} listing warnings.`
-			);
+			present.stage(outcome === "partial" ? "warn" : "ok", formatOutcome(outcome, counts));
 			for (const row of failed) present.line(`${row.id}: ${row.reason ?? "unknown fetch failure"}`);
 			if (failed.length || listingFailures.length) process.exitCode = 1;
 			break;
@@ -895,7 +1060,9 @@ export async function ingest(
 			sourceClaim?.release();
 		} finally {
 			try {
-				if (manifest?.runId) reportAuditEvidence(manifest, scopeRows(manifest, ids), completed);
+				const audit = manifest;
+				if (audit?.runId)
+					present.suspend(() => reportAuditEvidence(audit, scopeRows(audit, ids), completed));
 			} finally {
 				try {
 					release?.();
@@ -904,7 +1071,9 @@ export async function ingest(
 						limiter.close();
 					} finally {
 						manifest?.close();
-						if (run.perf) for (const line of formatReport(metrics.snapshot())) console.log(line);
+						// The measured report is output too: under the region's ownership, so its lines are
+						// not erased by a frame or by the region's cleanup.
+						if (run.perf) present.suspend(() => reportPerf(metrics));
 					}
 				}
 			}
@@ -922,6 +1091,18 @@ export interface SessionOptions {
 	controller?: AbortController;
 }
 
+/**
+ * The context window in force, stated as what it is.
+ *
+ * A reported window is a fact; anything else is the conservative default, which the summary says
+ * rather than passing it off as the model's own.
+ */
+function contextLabel(profile: AgentProfile): string {
+	return profile.contextTokens
+		? `${Math.round(profile.contextTokens / 1000)}k reported`
+		: `${Math.round(DEFAULT_CONTEXT_TOKENS / 1000)}k default`;
+}
+
 /** The compact selected-configuration summary, printed once the last input has been accepted. */
 function selectedConfiguration(profile: AgentProfile): [string, string][] {
 	const rows: [string, string][] = [
@@ -929,14 +1110,15 @@ function selectedConfiguration(profile: AgentProfile): [string, string][] {
 		["model", profile.model]
 	];
 	if (profile.effort) rows.push(["effort", profile.effort]);
-	rows.push([
-		"context",
-		// A reported window is a fact; anything else is the conservative default in force.
-		profile.contextTokens
-			? `${Math.round(profile.contextTokens / 1000)}k reported`
-			: `${Math.round(DEFAULT_CONTEXT_TOKENS / 1000)}k default`
-	]);
+	rows.push(["context", contextLabel(profile)]);
 	return rows;
+}
+
+/** The same identity on one line, which is how the live region states it. */
+function identityLabel(profile: AgentProfile): string {
+	return [profile.agent, profile.model, profile.effort, contextLabel(profile)]
+		.filter((part): part is string => Boolean(part))
+		.join(" \u00b7 ");
 }
 
 /**
@@ -958,14 +1140,17 @@ export async function runSession(
 	selection: { url: string; profile: AgentProfile; run: RunSettings },
 	options: SessionOptions = {}
 ): Promise<void> {
-	const present = options.present ?? createPresenter();
 	const metrics = new Metrics(options.now);
+	const present = options.present ?? sessionPresenter(metrics);
 	const controller = options.controller ?? new AbortController();
 	const cancel = () => controller.abort(new Error("Cancelled; progress preserved."));
 	process.on("SIGINT", cancel);
 	process.on("SIGTERM", cancel);
 	try {
-		present.entries("Selected", selectedConfiguration(selection.profile));
+		// The summary is the log's record of the selection. A terminal drawing the region is already
+		// showing that identity, live and refreshed by preflight, so printing it there as well would
+		// be the same facts twice on one screen — the region is the summary it has instead.
+		if (!present.live) present.entries("Selected", selectedConfiguration(selection.profile));
 		await (options.ingest ?? ingest)(
 			selection.url,
 			selection.profile,
@@ -981,10 +1166,18 @@ export async function runSession(
 		// added after it, never instead of it, and never as a success.
 		present.fail(`Error: ${error instanceof Error ? error.message : String(error)}`);
 		if (error instanceof FatalIngestError) present.fail(RECOVERY_HINT[error.kind]);
+		// The session says which of the two it was. An interrupted run and a failed one both exit
+		// 1, and only this line tells an operator whether there is a fault to fix or work to
+		// continue — the reason the abort was requested is not something a message can carry.
+		present.fail(formatSessionOutcome(controller.signal.aborted ? "cancelled" : "failed"));
 		process.exitCode = 1;
 	} finally {
 		process.off("SIGINT", cancel);
 		process.off("SIGTERM", cancel);
+		// The region is taken down before the runtime line, so the one line that closes a session is
+		// the last thing in the terminal rather than the last thing above a status box — and so no
+		// render timer outlives the run, on any path out of it including cancellation.
+		present.close();
 		present.runtime(formatTotalRuntime(metrics.elapsedMs()));
 	}
 }

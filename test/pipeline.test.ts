@@ -5,7 +5,17 @@ import {
 	classifyProviderError,
 	workFor
 } from "../src/pipeline.ts";
-import { formatProgress, shouldAggregate, summarise } from "../src/progress.ts";
+import {
+	accumulateWork,
+	classifyOutcome,
+	formatOutcome,
+	formatProgress,
+	formatSessionOutcome,
+	runCounts,
+	shouldAggregate,
+	summarise,
+	type RunCounts
+} from "../src/progress.ts";
 import type { PipelineProgress } from "../src/pipeline.ts";
 
 test("a row is re-queued for exactly the work it still needs", () => {
@@ -201,4 +211,132 @@ test("a run with nothing completed yet makes no claim about throughput accuracy"
 	expect(line).toContain("0/10 extracted");
 	expect(line).not.toContain("(est.)");
 	expect(line).toContain("0/min measured");
+});
+
+/** A finished run, with only the field under test changed. */
+const counts = (over: Partial<RunCounts> = {}): RunCounts => ({
+	publications: 1,
+	distilled: 2,
+	reused: 0,
+	captionless: 0,
+	failures: 0,
+	warnings: 0,
+	...over
+});
+
+test("a run that left nothing behind is the only run allowed to call itself complete", () => {
+	expect(classifyOutcome(counts())).toBe("complete");
+	// Every kind of outstanding work makes the run partial, and the label says which: a failed
+	// source, a failed listing, a source that exhausted its attempts, or a source a live peer
+	// owns are four different reasons for the same honest conclusion.
+	for (const over of [
+		{ failures: 1 },
+		{ warnings: 1 },
+		{ blocked: 1 },
+		{ held: 1 }
+	] as Partial<RunCounts>[])
+		expect(classifyOutcome(counts(over))).toBe("partial");
+	expect(formatOutcome("partial", counts({ failures: 1, warnings: 2, blocked: 1 }))).toContain(
+		"Partial:"
+	);
+	// Zero is a fact, and the fields that carry it stay present so the line reads mechanically.
+	expect(formatOutcome("complete", counts())).toContain("0 fetch failures");
+	expect(formatOutcome("complete", counts())).toContain("0 listing warnings");
+	// Fields that only exist when they happened are omitted rather than printed as a zero.
+	expect(formatOutcome("complete", counts())).not.toContain("blocked");
+	expect(formatOutcome("partial", counts({ held: 1 }))).toContain(
+		"1 source held by another session"
+	);
+});
+
+test("reused saved knowledge is its own successful outcome, never a failure or new work", () => {
+	// A run that found every source already distilled extracted nothing and must not claim it did.
+	expect(classifyOutcome(counts({ distilled: 0, reused: 4 }))).toBe("reused");
+	const line = formatOutcome("reused", counts({ distilled: 0, reused: 4 }));
+	expect(line).toContain("Complete (reused):");
+	expect(line).toContain("0 sources distilled");
+	expect(line).toContain("4 sources reused from saved knowledge");
+	// A run that did both reports both, and stays a plain completion.
+	const mixed = formatOutcome(
+		classifyOutcome(counts({ distilled: 2, reused: 3 })),
+		counts({ reused: 3 })
+	);
+	expect(mixed).toContain("Complete:");
+	expect(mixed).toContain("2 sources distilled");
+	expect(mixed).toContain("3 sources reused from saved knowledge");
+	// Outstanding work still outranks reuse: partial is decided before the reuse case.
+	expect(classifyOutcome(counts({ distilled: 0, reused: 4, failures: 1 }))).toBe("partial");
+});
+
+test("work finished before a recovery continuation is still this invocation's own", () => {
+	// An automatic recovery cycle is a continuation of one invocation, not a second invocation: a
+	// cycle that hands the remaining work on has already extracted what it extracted, and counting
+	// only the last cycle reported that work as knowledge the invocation had found already saved.
+	const invocation = { distilled: 0, fetched: 0 };
+	accumulateWork(invocation, { distilled: 3, fetched: 4 });
+	// The continuation cycle, after the saved run's membership was rewritten.
+	accumulateWork(invocation, { distilled: 2, fetched: 1 });
+	expect(invocation).toEqual({ distilled: 5, fetched: 5 });
+
+	const counts = runCounts({
+		publications: 1,
+		distilled: invocation.distilled,
+		withKnowledge: 8,
+		captionless: 0,
+		failures: 0,
+		warnings: 0
+	});
+	// Five were extracted by this invocation, three were already saved before it, and the two
+	// numbers add up to what is in scope: nothing is counted twice and nothing is lost.
+	expect(counts.distilled).toBe(5);
+	expect(counts.reused).toBe(3);
+	expect(counts.distilled + counts.reused).toBe(8);
+	// A run that extracted is a plain completion, never a reuse.
+	expect(classifyOutcome(counts)).toBe("complete");
+
+	// Only work saved before the invocation is reuse: a cycle's own extraction is never re-labelled
+	// by the cycle that follows it.
+	const resumed = { distilled: 0, fetched: 0 };
+	accumulateWork(resumed, { distilled: 3, fetched: 4 });
+	expect(
+		runCounts({
+			publications: 0,
+			distilled: resumed.distilled,
+			withKnowledge: 3,
+			captionless: 0,
+			failures: 0,
+			warnings: 0
+		}).reused
+	).toBe(0);
+	// A second invocation over the same cache reports that cache as reuse, because it extracted
+	// nothing of its own.
+	const fresh = { distilled: 0, fetched: 0 };
+	expect(
+		runCounts({
+			publications: 0,
+			distilled: fresh.distilled,
+			withKnowledge: 3,
+			captionless: 0,
+			failures: 0,
+			warnings: 0
+		}).reused
+	).toBe(3);
+});
+
+test("a run with no sources at all reports zeroes rather than inventing work", () => {
+	const line = formatOutcome("complete", counts({ distilled: 0, reused: 0, publications: 0 }));
+	expect(line).toContain("0 room/creator publications remotely verified");
+	expect(formatOutcome("complete", counts({ publications: 1 }))).toContain(
+		"1 room/creator publications remotely verified"
+	);
+	expect(line).toContain("0 sources distilled");
+	expect(line).toContain("0 sources reused from saved knowledge");
+});
+
+test("an interrupted run and a failed run say which one they were", () => {
+	// Both exit 1, so the label is the only thing an operator can act on.
+	expect(formatSessionOutcome("cancelled")).toStartWith("Cancelled: ingestion was interrupted.");
+	expect(formatSessionOutcome("cancelled")).toContain("preserved");
+	expect(formatSessionOutcome("failed")).toStartWith("Failed:");
+	expect(formatSessionOutcome("failed")).toContain("did not meet its processing requirements");
 });

@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { DEFAULTS, jsRuntimeArgs } from "./config.ts";
-import { runCommand, streamCommand } from "./process.ts";
+import { runCommand, streamCommand, type CommandResult } from "./process.ts";
+// The sanitiser, not the presenter: this module reports what a provider said, and must not depend
+// on the layer that draws a terminal.
+import { oneLine } from "./text.ts";
 
 export interface VideoItem {
 	id: string;
@@ -113,6 +117,109 @@ export function metadataItem(value: unknown): VideoItem | null {
 		creator: text(row.channel) || text(row.uploader) || "unknown",
 		creatorUrl: text(row.channel_url) || text(row.uploader_url)
 	};
+}
+
+/** How long a single-video metadata lookup may take before it is abandoned. */
+export const METADATA_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * Credential-shaped text is never worth printing, and a provider's stderr can carry it.
+ *
+ * The pattern is deliberately narrow: it redacts the value that follows a credential name and
+ * leaves everything else — a challenge, a removed video, a missing JavaScript runtime — readable,
+ * because that is the part an operator has to act on.
+ */
+const CREDENTIAL =
+	/(--cookies[a-z-]*|cookies?-file|authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]?\s+\S+/gi;
+
+/** The operator's own home, which is never needed in full to act on a failure. */
+const HOME = homedir();
+
+/**
+ * The one line of a provider's stderr that explains a failure.
+ *
+ * `yt-dlp` writes warnings, progress and its own diagnostics to the same stream, so a recognised
+ * error line is preferred over the whole capture, and the capture's first line is the fallback
+ * because a spawn failure reports itself there and nowhere else. The result is one sanitised,
+ * bounded, credential-redacted line: this text ends up inside a warning a person reads, and an
+ * unbounded capture belongs in a log file, not in a terminal.
+ */
+export function metadataDetail(stderr: string): string {
+	const lines = stderr
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+	const notable =
+		lines.find((line) => /^(ERROR|FATAL):/i.test(line)) ??
+		lines.find((line) => /\berror\b/i.test(line)) ??
+		lines[0] ??
+		"";
+	if (!notable) return "";
+	const redacted = notable.replace(CREDENTIAL, (match, name: string) => `${name}=<redacted>`);
+	return oneLine(HOME ? redacted.split(HOME).join("~") : redacted, 200);
+}
+
+/** What a single-video metadata lookup produced. */
+export interface MetadataRead {
+	/** Usable metadata for the requested video, or null when the lookup could not supply it. */
+	item: VideoItem | null;
+	/** Null when the lookup succeeded, otherwise a diagnostic naming the actual failure. */
+	failure: string | null;
+}
+
+/**
+ * Read one single-video metadata lookup.
+ *
+ * A single-video run has no tab listing to fall back on, so its metadata request is the only
+ * place its creator, title and identity come from — and every way it can fail collapsed into one
+ * `metadata unavailable` line that told an operator nothing about what to do next. Each case is
+ * named here from what the command actually returned: a lookup that timed out, one that exited
+ * unsuccessfully (with its exit code and the provider's own first error line), one whose output
+ * was empty or not JSON, one whose JSON carried no usable identity, and one that answered for a
+ * different video than the one asked for.
+ *
+ * Recoverability is deliberately unchanged: every failure returns a null item so the caller falls
+ * back to the requested identity and fetching retries it. Only the explanation is new.
+ */
+export function readSingleMetadata(result: CommandResult, id: string): MetadataRead {
+	const detail = metadataDetail(result.stderr);
+	const explain = (reason: string): string => (detail ? `${reason}: ${detail}` : reason);
+	if (result.timedOut)
+		return {
+			item: null,
+			failure: explain(
+				`single: metadata lookup timed out after ${Math.round(METADATA_TIMEOUT_MS / 60_000)}m`
+			)
+		};
+	if (result.overflow)
+		return { item: null, failure: "single: metadata lookup output exceeded the capture limit" };
+	if (result.code !== 0)
+		return {
+			item: null,
+			failure: explain(`single: metadata lookup exited unsuccessfully (exit ${result.code})`)
+		};
+	if (!result.stdout.trim())
+		return { item: null, failure: explain("single: metadata lookup returned no output") };
+	let parsed: VideoItem | null = null;
+	let invalid: string | null = null;
+	try {
+		parsed = metadataItem(JSON.parse(result.stdout));
+	} catch (error) {
+		invalid = error instanceof Error ? error.message : "unreadable";
+	}
+	if (invalid)
+		return {
+			item: null,
+			failure: explain(`single: metadata lookup returned invalid JSON (${invalid})`)
+		};
+	if (!parsed)
+		return { item: null, failure: "single: metadata lookup returned no usable metadata" };
+	if (parsed.id !== id)
+		return {
+			item: null,
+			failure: `single: metadata video ID did not match the requested source (requested ${id}, received ${parsed.id})`
+		};
+	return { item: parsed, failure: null };
 }
 
 export interface ListingProgress {
@@ -369,20 +476,16 @@ export async function discoverStream(
 					"--dump-single-json",
 					source
 				],
-				{ signal, timeoutMs: 15 * 60_000 }
+				{ signal, timeoutMs: METADATA_TIMEOUT_MS }
 			);
 		} finally {
 			request?.();
 		}
 		if (result.cancelled) throw new Error("Listing cancelled.");
-		let item: VideoItem | null = null;
-		try {
-			item = metadataItem(JSON.parse(result.stdout));
-			if (item?.id !== id) item = null;
-		} catch {
-			/* fetch still retries this identity */
-		}
-		const resolved = item ?? { id, title: "", creator: "unknown" };
+		// A lookup that could not supply metadata still yields the requested identity, so fetching
+		// retries it; only the reason it could not is new.
+		const read = readSingleMetadata(result, id);
+		const resolved = read.item ?? { id, title: "", creator: "unknown" };
 		aliasFor(resolved);
 		aliases.add(id);
 		const progress = { tab: "single", tabCount: 1, discovered: 1, perTab: { single: 1 } };
@@ -390,12 +493,12 @@ export async function discoverStream(
 		options.onProgress?.(progress);
 		return {
 			slug,
-			channel: item?.creator || "unknown",
+			channel: read.item?.creator || "unknown",
 			perTab: { single: 1 },
-			listingFailures: result.code === 0 && item ? [] : ["single: metadata unavailable"],
+			listingFailures: read.failure ? [read.failure] : [],
 			discovered: 1,
 			malformed: 0,
-			partial: !(result.code === 0 && item),
+			partial: read.failure !== null,
 			aliases: [...aliases]
 		};
 	}

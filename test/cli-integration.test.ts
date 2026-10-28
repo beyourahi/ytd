@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createPalaceFixture, fixtureGit, hasPalacePrerequisite } from "./palace-fixture.ts";
+import { TerminalScreen } from "./terminal-screen.ts";
 import { runCommand } from "../src/process.ts";
 
 const fake = `#!/usr/bin/env bun
@@ -1419,9 +1420,9 @@ for (const change of ["unrelated", "notes"]) {
 				});
 				expect(result.stderr).toBe("");
 				expect(result.code).toBe(0);
-				expect(result.stdout).toContain("Palace changed; refreshing affected deduplication");
+				expect(result.stdout).toContain("Palace changed; refreshing and retrying publication");
 				expect(result.stdout).toContain("2 room/creator publications remotely verified");
-				expect(result.stdout.match(/Reduce 1 candidates/g)?.length).toBe(
+				expect(result.stdout.match(/Reducing 1 candidates/g)?.length).toBe(
 					change === "notes" ? 2 : 1
 				);
 				const calls = readFileSync(f.calls, "utf8").trim().split("\n");
@@ -1504,7 +1505,7 @@ process.exit(code);
 					expect(result.stdout).toContain("2 room/creator publications remotely verified");
 					expect(readFileSync(count, "utf8")).toBe(mode === "partial" ? "3" : "2");
 					if (mode === "postpublish")
-						expect(result.stdout.match(/Reduce 1 candidates/g)).toHaveLength(2);
+						expect(result.stdout.match(/Reducing 1 candidates/g)).toHaveLength(2);
 					for (const room of ["content", "craft"]) {
 						const content = fixtureGit(f.remote, "show", `main:${room}/field-notes.md`);
 						expect(content.match(/<!-- ytd:/g)).toHaveLength(1);
@@ -1529,6 +1530,291 @@ process.exit(code);
 		180_000
 	);
 }
+
+/**
+ * The fixture's environment with the variables that force a redirected log's plain output removed.
+ *
+ * Without this the run would be plain for the same reason a pipe is, and a live-terminal test that
+ * exercises the plain path proves nothing about the terminal path.
+ */
+function liveEnvFor(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const live: NodeJS.ProcessEnv = { ...env, TERM: "xterm-256color" };
+	for (const key of ["NO_COLOR", "CI", "FORCE_COLOR", "YTD_UI"]) delete live[key];
+	return live;
+}
+
+/**
+ * Run a command in a genuine pseudoterminal, as an operator's terminal does.
+ *
+ * Bun's `terminal` option allocates a real PTY, so the child sees `isTTY`, measures a real width
+ * and receives whatever the terminal would: colour, cursor movement, line discipline. What is
+ * asserted below is the byte stream a terminal actually got, which is the part injected streams
+ * cannot show.
+ */
+function startLive(command: string[], env: NodeJS.ProcessEnv, cols = 100, rows = 30) {
+	const chunks: string[] = [];
+	// Streaming, because a terminal delivers bytes and a frame is drawn in box-drawing characters:
+	// a three-byte glyph split across two reads would otherwise arrive as replacement characters.
+	const decoder = new TextDecoder();
+	const proc = Bun.spawn(command, {
+		env,
+		terminal: {
+			cols,
+			rows,
+			data: (_terminal, data) => void chunks.push(decoder.decode(data, { stream: true }))
+		}
+	});
+	const terminal = proc.terminal;
+	if (!terminal) throw new Error("the command was not given a terminal");
+	const text = (): string => chunks.join("");
+	return {
+		terminal,
+		text,
+		exited: proc.exited,
+		kill: () => proc.kill(),
+		async waitFor(needle: string, timeoutMs = 15_000) {
+			const deadline = Date.now() + timeoutMs;
+			while (Date.now() < deadline) {
+				if (text().includes(needle)) return;
+				await Bun.sleep(10);
+			}
+			throw new Error(
+				`timed out waiting for ${needle}; the terminal received ${JSON.stringify(text())}`
+			);
+		}
+	};
+}
+
+test.skipIf(!hasPalacePrerequisite)(
+	"a genuine pseudoterminal runs the live interface and publishes what a redirected run publishes",
+	async () => {
+		const onTerminal = createCliFixture();
+		const inPipe = createCliFixture();
+		const run = startLive(onTerminal.command, liveEnvFor(onTerminal.env));
+		try {
+			// A real terminal is asked what to do — the guided workflow prompts instead of assuming a
+			// default the way a redirected run does — so the live path is driven the way an operator
+			// drives it: confirm the selection that is already highlighted.
+			await run.waitFor("Change agent/model", 60_000);
+			run.terminal.write("\r");
+			await run.waitFor("Total runtime:", 180_000);
+			expect(await run.exited).toBe(0);
+			const output = run.text();
+			// A real terminal is styled, and drawn in place: the region's own separator and the
+			// cursor movement that redraws it are presentation a redirected log never receives. The
+			// run marker is not among them here — on a terminal the region replaces narration rather
+			// than being printed beside it, which is the whole point of having one.
+			expect(output).toContain("\u001b[");
+			expect(output).toContain("\u2500");
+			expect(movesCursor(output)).toBe(true);
+			// The region is the configuration summary a terminal gets. It names the whole selection —
+			// the agent, the model and the context window in force — and the log's own `Selected:`
+			// block is not printed beside it, because the same facts twice on one screen is noise.
+			const frames = output.split("\r\n").join("\n");
+			expect(frames).toContain("MODEL");
+			expect(frames).toContain("fixture \u00b7 fixture-model \u00b7 8k default");
+			expect(frames).not.toContain("Selected:");
+			// A terminal gets whole lines, and exactly one runtime line closes the session.
+			expect(output).toContain("\r\n");
+			const lines = output.split(/\r?\n/).filter((line) => line.length > 0);
+			const totals = lines.filter((line) => line.includes("Total runtime:"));
+			expect(totals).toHaveLength(1);
+			expect(lines.at(-1)).toBe(totals[0]!);
+		} finally {
+			if (run.terminal.closed === false) run.kill();
+			run.terminal.close();
+		}
+		try {
+			const redirected = await runCommand(inPipe.command, {
+				env: inPipe.env,
+				timeoutMs: 120_000
+			});
+			expect(redirected.code).toBe(0);
+			// The live interface changed nothing but the presentation: the same rooms, the same notes,
+			// the same global ids. Only the run's own identity marker can differ between invocations.
+			const withoutRunMarkers = (text: string): string =>
+				text.replace(/<!-- \/?ytd:ytd-[0-9a-f]+ -->/g, "");
+			for (const room of ["content", "craft"])
+				expect(
+					withoutRunMarkers(fixtureGit(onTerminal.remote, "show", `main:${room}/field-notes.md`))
+				).toBe(withoutRunMarkers(fixtureGit(inPipe.remote, "show", `main:${room}/field-notes.md`)));
+			expect(publicationReceipts(onTerminal)).toHaveLength(publicationReceipts(inPipe).length);
+		} finally {
+			rmSync(onTerminal.root, { recursive: true, force: true });
+			rmSync(inPipe.root, { recursive: true, force: true });
+		}
+	},
+	300_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"a warm cache completes with no extraction call and one true frame, and republishes nothing",
+	async () => {
+		const f = createCliFixture();
+		try {
+			// The cold run does the work; what this test is about is the run after it.
+			const coldStarted = Date.now();
+			const cold = await runCommand(f.command, { env: f.env, timeoutMs: 120_000 });
+			const coldMs = Date.now() - coldStarted;
+			expect(cold.code).toBe(0);
+			const published = fixtureGit(f.remote, "show", "main:content/field-notes.md");
+			expect(published).toContain("<!-- ytd:");
+			const before = fixtureCalls(f);
+
+			// Everything is already saved, so the model is not asked to do any of it again: a live
+			// interface that needed a call to have something to draw would be paying for the frame.
+			const warmStarted = Date.now();
+			const run = startLive(f.command, liveEnvFor(f.env));
+			try {
+				await run.waitFor("Change agent/model", 60_000);
+				run.terminal.write("\r");
+				await run.waitFor("Total runtime:", 120_000);
+				expect(await run.exited).toBe(0);
+				const warmMs = Date.now() - warmStarted;
+				const output = run.text();
+				// The region was drawn on a run this short: a real terminal gets a frame even when the
+				// run finishes in seconds, and it gets it without a delay being added to make it visible.
+				expect(movesCursor(output)).toBe(true);
+				expect(output.split("\r\n").join("\n")).toContain(
+					"fixture \u00b7 fixture-model \u00b7 8k default"
+				);
+				// No invented progress: no percentage, and the run calls itself reused rather than
+				// claiming to have distilled what it found already distilled.
+				expect(output).not.toContain("%");
+				expect(output).toContain("Complete (reused)");
+				// Zero extraction work: no new distill or glean prompt reached the provider.
+				const added = fixtureCalls(f).slice(before.length);
+				expect(added.filter((call) => /^(Distill|Carefully)/.test(call))).toEqual([]);
+				// The palace did not grow a second copy of the same notes.
+				expect(fixtureGit(f.remote, "show", "main:content/field-notes.md")).toBe(published);
+				// Exactly one runtime line, still the last thing printed after cleanup.
+				const lines = output.split(/\r?\n/).filter((line) => line.length > 0);
+				const totals = lines.filter((line) => line.includes("Total runtime:"));
+				expect(totals).toHaveLength(1);
+				expect(lines.at(-1)).toBe(totals[0]!);
+				// Reported as observations, not as a threshold: a warm run cannot be shown to be faster
+				// on a machine this noisy, only that nothing was added to it.
+				console.log(`warm cache: cold ${coldMs}ms, warm live ${warmMs}ms`);
+			} finally {
+				if (run.terminal.closed === false) run.kill();
+				run.terminal.close();
+			}
+
+			// The same warm cache, this time with no live interface at all: the run behaves the same
+			// and the palace receives the same bytes, so "the UI is on" is a presentation fact rather
+			// than a second behaviour to maintain.
+			const plainStarted = Date.now();
+			const redirected = await runCommand(f.command, { env: f.env, timeoutMs: 120_000 });
+			const plainMs = Date.now() - plainStarted;
+			expect(redirected.code).toBe(0);
+			expect(redirected.stderr).toBe("");
+			expect(redirected.stdout).not.toContain("\u001b");
+			expect(fixtureGit(f.remote, "show", "main:content/field-notes.md")).toBe(published);
+			expect(
+				fixtureCalls(f)
+					.slice(before.length)
+					.filter((call) => /^(Distill|Carefully)/.test(call))
+			).toEqual([]);
+			console.log(`warm cache: redirected ${plainMs}ms`);
+		} finally {
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	300_000
+);
+
+/**
+ * True when the terminal received a cursor-movement or erase sequence rather than only colour.
+ *
+ * Scanned rather than matched: this suite keeps control characters out of regular expressions, and
+ * the sequences being looked for are exactly the ones that must never come from the renderer.
+ */
+function movesCursor(output: string): boolean {
+	const ESC = "\u001b";
+	for (let at = output.indexOf(`${ESC}[`); at !== -1; at = output.indexOf(`${ESC}[`, at + 1)) {
+		let end = at + 2;
+		while (end < output.length && "0123456789;?".includes(output[end]!)) end += 1;
+		if ("ABCDGJK".includes(output[end] ?? "")) return true;
+	}
+	return false;
+}
+
+test.skipIf(!hasPalacePrerequisite)(
+	"the guided picker moves the cursor in a genuine terminal and gives it back when cancelled",
+	async () => {
+		const f = createCliFixture();
+		const run = startLive([process.execPath, f.cli], liveEnvFor(f.env));
+		try {
+			// The prompt owns the terminal once it has hidden the cursor to draw its menu; sending a
+			// key before that would reach the line discipline instead of the prompt.
+			await run.waitFor("\u001b[?25l");
+			await run.waitFor("Run");
+			run.terminal.write("\u0003");
+			expect(await run.exited).toBe(1);
+			const output = run.text();
+			// Real cursor movement, not just colour: the prompt erased its menu and stepped back
+			// before leaving, which is a sequence no formatting test can see.
+			expect(movesCursor(output)).toBe(true);
+			// The cursor was given back, so a cancelled prompt never leaves a terminal with an
+			// invisible cursor — the state an operator would have to reset by hand.
+			expect(output).toContain("\u001b[?25h");
+			expect(output).toContain("Cancelled; no ingestion started");
+			// Cancelling before ingestion begins reports no ingestion runtime, because none started.
+			expect(output).not.toContain("Total runtime");
+		} finally {
+			if (run.terminal.closed === false) run.kill();
+			run.terminal.close();
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	120_000
+);
+
+test.skipIf(!hasPalacePrerequisite)(
+	"a live session's final screen keeps its evidence and its measured report, above one runtime line",
+	async () => {
+		const f = createCliFixture();
+		// Tall enough to hold the whole session's output at once: an operator with a large window,
+		// and the only way to assert that the evidence and the report are intact rather than merely
+		// scrolled away by a report that is legitimately longer than a small screen.
+		const run = startLive(
+			[process.execPath, f.cli, "https://youtu.be/dQw4w9WgXcQ", "--perf"],
+			liveEnvFor(f.env),
+			100,
+			90
+		);
+		try {
+			await run.waitFor("Change agent/model", 60_000);
+			run.terminal.write("\r");
+			await run.waitFor("Total runtime:", 180_000);
+			expect(await run.exited).toBe(0);
+			// The whole run, read back as the screen it left: the byte stream looked correct for this
+			// defect, so the assertion has to be about what survived the last cursor move.
+			const screen = new TerminalScreen(100, 90);
+			screen.write(run.text());
+			const view = screen.snapshot();
+			// Saved model identity and the source-review evidence: the lines a live region's cleanup
+			// used to erase. This fixture reports no harness identity of its own, and the evidence
+			// says so rather than inventing one — the per-model line is only printed when there is one.
+			expect(view.has("Model identity (saved successful calls for this run):")).toBe(true);
+			expect(view.has("0 harness-reported")).toBe(true);
+			expect(view.has("Source review evidence: 1/1 completed sources recorded")).toBe(true);
+			// The completed run's own summary is still readable above its evidence.
+			expect(view.has("Complete: 2 room/creator publications remotely verified")).toBe(true);
+			// The measured report is output too, and it arrives whole.
+			expect(view.has("Performance (measured):")).toBe(true);
+			// One runtime line, last, with no part of the region left above it.
+			expect(view.rows.filter((row) => row.includes("Total runtime:"))).toHaveLength(1);
+			expect(view.last).toBe(view.rowWith("Total runtime:"));
+			expect(view.has("YTD  /  KNOWLEDGE INGESTION")).toBe(false);
+		} finally {
+			if (run.terminal.closed === false) run.kill();
+			run.terminal.close();
+			rmSync(f.root, { recursive: true, force: true });
+		}
+	},
+	300_000
+);
 
 test.skipIf(!hasPalacePrerequisite)(
 	"the measured performance report precedes exactly one final runtime line",

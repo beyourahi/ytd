@@ -2,6 +2,13 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONCURRENCY } from "../src/config.ts";
+import {
+	Dashboard,
+	DEFAULT_INTERVAL_MS,
+	dashboardStatus,
+	emptyState,
+	renderDashboard
+} from "../src/dashboard.ts";
 import { DiscoveryLog } from "../src/discovery.ts";
 import { normalisePrinciple } from "../src/distill.ts";
 import { discoverStream } from "../src/enumerate.ts";
@@ -345,20 +352,35 @@ function benchPresentation(lines: number): void {
 				err: () => {}
 			}
 		);
-		const started = performance.now();
-		for (let index = 0; index < lines; index++)
-			present.progress(progressSegments(sample(index), view));
-		return { ms: performance.now() - started, chars, writes };
+		// Best of the same `REPEATS` every other workload uses. A single pass measured the JIT
+		// compiling the renderer as much as the renderer itself, which made this row swing by an
+		// order of magnitude between runs and made it useless for judging overhead.
+		let best = Number.POSITIVE_INFINITY;
+		for (let repeat = 0; repeat < REPEATS; repeat++) {
+			chars = 0;
+			writes = 0;
+			const started = performance.now();
+			for (let index = 0; index < lines; index++)
+				present.progress(progressSegments(sample(index), view));
+			best = Math.min(best, performance.now() - started);
+		}
+		return { ms: best, chars, writes };
 	};
 	const plain = render(false);
 	const styled = render(true);
 	const perLine = (ms: number): string => `${((ms * 1000) / lines).toFixed(2)}µs/line`;
 	record("ui: plain progress line", lines, performance.now() - plain.ms, perLine(plain.ms));
+	// The styling cost is also stated against the pipeline's throttle, because that ratio is what a
+	// run actually pays: a live line is drawn on one interval, never per video. It is a number, not
+	// "zero" — the renderer is cheap here, not free.
+	const styledPerLineMs = styled.ms / lines;
 	record(
 		"ui: styled progress line",
 		lines,
 		performance.now() - styled.ms,
-		`${perLine(styled.ms)}, ${styled.chars} chars written`
+		`${perLine(styled.ms)}, ${styled.chars} chars written, ` +
+			`${((styledPerLineMs / CONCURRENCY.progressIntervalMs) * 100).toFixed(4)}% of one ` +
+			`${CONCURRENCY.progressIntervalMs}ms interval per line`
 	);
 	// Derived, not measured on its own: the difference between the two columns above.
 	record(
@@ -366,6 +388,166 @@ function benchPresentation(lines: number): void {
 		lines,
 		performance.now() - (styled.ms - plain.ms),
 		`${((styled.ms - plain.ms) * 1000) / lines >= 0 ? "+" : ""}${(((styled.ms - plain.ms) * 1000) / lines).toFixed(2)}µs/line`
+	);
+}
+
+/**
+ * The live region's cost, and the A/B the structural argument was standing in for.
+ *
+ * Whether the region is attached is decided by the terminal, not by the run, so it is two
+ * production code paths rather than an option: a non-live terminal renders the one progress line
+ * it always had, and a live one renders the region instead. `benchPresentation` above prices the
+ * renderers separately; this prices the *tick* — the whole body a run executes once per interval,
+ * including the status derivation, the stage rows and the frame write — for both, and states the
+ * difference against the interval it has to fit inside. That share is the ceiling on how much a
+ * live interface can slow a run, because everything else happens on the workers either way.
+ *
+ * No terminal, no timer and no provider: frames go to a counting sink and the clock is stepped by
+ * hand, so every tick really does produce a new frame instead of being suppressed as unchanged.
+ */
+function benchLiveRegion(ticks: number): void {
+	const measure = () => ({ width: 100, rows: 30 });
+	const layout = { width: 100, rows: 30, color: true, unicode: true };
+	const view = { discovering: false, discovered: 10_000, totalKnown: true };
+	const stages = [
+		{ label: "Discovery", state: "done" as const, detail: "3,420 found" },
+		{ label: "Fetching", state: "active" as const, detail: "1,200 fetched" },
+		{ label: "Extraction", state: "active" as const, detail: "1,180 extracted" },
+		{ label: "Publication", state: "pending" as const, detail: "waiting" }
+	];
+	// The counts move every tick, which is what makes each tick a real repaint rather than a
+	// frame the region is right to skip.
+	const sample = (index: number): PipelineProgress => ({
+		total: 10_000,
+		fetched: 1_200 + index,
+		noCaptions: 3,
+		distilled: 1_180 + index,
+		failed: 1,
+		blocked: 2,
+		retries: 4,
+		activeFetchers: 3,
+		activeExtractors: 2,
+		queuedFetch: 60,
+		queuedExtract: 55,
+		aiCalls: 300,
+		elapsedMs: 120_000
+	});
+	const best = (run: () => number): number => {
+		let fastest = Number.POSITIVE_INFINITY;
+		for (let repeat = 0; repeat < REPEATS; repeat++) fastest = Math.min(fastest, run());
+		return fastest;
+	};
+	const perTick = (ms: number): number => (ms * 1000) / ticks;
+	// Against the cadence each path is actually driven at: the region repaints on its own one-second
+	// timer, while the log line is written when the pipeline reports, on its own interval.
+	// Per tick, in the interval's own unit: `perTick` is microseconds, so it is divided back down
+	// before the ratio — a tick that costs 170µs is 0.017% of a second, not 17% of it.
+	const share = (ms: number, intervalMs: number): string =>
+		`${(Math.max(0, perTick(ms) / 1000 / intervalMs) * 100).toFixed(4)}% of one ${intervalMs}ms interval`;
+	const microseconds = (ms: number): string => `${perTick(ms).toFixed(2)}µs/tick`;
+
+	// The frame alone: what the region costs to compose, before anything is written.
+	let frameChars = 0;
+	const frameMs = best(() => {
+		frameChars = 0;
+		const started = performance.now();
+		for (let index = 0; index < ticks; index++) {
+			const lines = renderDashboard(
+				{
+					...emptyState(),
+					...dashboardStatus(sample(index), view),
+					source: "https://www.youtube.com/@long-form-creator",
+					model: "a-provider/a-long-model-identifier",
+					stages,
+					elapsedMs: index * 1_000
+				},
+				layout
+			);
+			frameChars += lines.join("\n").length;
+		}
+		return performance.now() - started;
+	});
+	record(
+		"ui: live frame render",
+		ticks,
+		performance.now() - frameMs,
+		`${microseconds(frameMs)}, ${frameChars} chars, ${share(frameMs, DEFAULT_INTERVAL_MS)}`
+	);
+
+	// Detached: the styled one-line path a redirected or non-live terminal takes.
+	let logChars = 0;
+	const detachedMs = best(() => {
+		logChars = 0;
+		const present = new Presenter(
+			{ styled: true, live: false, color: true, unicode: true, width: 100 },
+			{
+				out: (line) => void (logChars += line.length),
+				err: () => {}
+			}
+		);
+		const started = performance.now();
+		for (let index = 0; index < ticks; index++)
+			present.progress(progressSegments(sample(index), view));
+		return performance.now() - started;
+	});
+	record(
+		"ui: tick, log path (detached)",
+		ticks,
+		performance.now() - detachedMs,
+		`${microseconds(detachedMs)}, ${logChars} chars, ` +
+			`${share(detachedMs, CONCURRENCY.progressIntervalMs)}`
+	);
+
+	// Attached: the same tick on a terminal that can hold a region — the status derivation, the
+	// stage rows and a real frame, cursor control included, through the same `Presenter` the run
+	// uses.
+	let frameBytes = 0;
+	const attachedMs = best(() => {
+		frameBytes = 0;
+		let clock = 0;
+		const dashboard = new Dashboard({
+			write: (text) => void (frameBytes += text.length),
+			measure,
+			color: true,
+			unicode: true,
+			intervalMs: DEFAULT_INTERVAL_MS,
+			elapsedMs: () => clock,
+			clock: {
+				now: () => clock,
+				// No real timer: the loop below is the interval, stepped by hand.
+				every: () => ({ cancel: () => {} }),
+				onResize: () => () => {}
+			}
+		});
+		const present = new Presenter(
+			{ styled: true, live: true, color: true, unicode: true, width: 100 },
+			{ out: () => {}, err: () => {}, live: dashboard }
+		);
+		const started = performance.now();
+		for (let index = 0; index < ticks; index++) {
+			clock += DEFAULT_INTERVAL_MS;
+			present.status({ ...dashboardStatus(sample(index), view), stages }, true);
+		}
+		const ms = performance.now() - started;
+		dashboard.close();
+		return ms;
+	});
+	record(
+		"ui: tick, region path (attached)",
+		ticks,
+		performance.now() - attachedMs,
+		`${microseconds(attachedMs)}, ${frameBytes} bytes written, ` +
+			`${share(attachedMs, DEFAULT_INTERVAL_MS)}`
+	);
+	// Derived, not measured on its own: what choosing the region costs against the line it
+	// replaced, in the one unit that matters — the share of a second it occupies.
+	const deltaMs = attachedMs - detachedMs;
+	record(
+		"ui: region delta (derived)",
+		ticks,
+		performance.now() - deltaMs,
+		`${deltaMs >= 0 ? "+" : ""}${microseconds(deltaMs)}, ` +
+			`${share(deltaMs, DEFAULT_INTERVAL_MS)} per tick, ${microseconds(attachedMs)} total`
 	);
 }
 
@@ -554,6 +736,7 @@ async function main(): Promise<void> {
 	console.log(`sizes: ${sizes.join(", ")}`);
 	await benchStartup();
 	benchPresentation(10_000);
+	benchLiveRegion(600);
 	for (const size of sizes) {
 		for (let repeat = 0; repeat < REPEATS; repeat++) {
 			const f = fixture();
@@ -574,6 +757,10 @@ async function main(): Promise<void> {
 		"ui: plain progress line",
 		"ui: styled progress line",
 		"ui: styling delta (derived)",
+		"ui: live frame render",
+		"ui: tick, log path (detached)",
+		"ui: tick, region path (attached)",
+		"ui: region delta (derived)",
 		"listing stub startup",
 		"listing stream + stage",
 		"discovery staging",

@@ -3,7 +3,7 @@ import { main, runSession, type IngestRuntime, type SessionOptions } from "../sr
 import { formatClock, formatDuration, formatTotalRuntime, Metrics } from "../src/metrics.ts";
 import { FatalIngestError } from "../src/pipeline.ts";
 import { Cancelled } from "../src/settings.ts";
-import { Presenter } from "../src/ui.ts";
+import { Presenter, type LiveRegion, type LiveStatus } from "../src/ui.ts";
 import type { AgentProfile } from "../src/agents.ts";
 import type { RunSettings } from "../src/settings.ts";
 
@@ -29,7 +29,7 @@ function capture(styled = false): Capture {
 	const out: string[] = [];
 	const err: string[] = [];
 	const present = new Presenter(
-		{ styled, color: styled, unicode: true, width: 100 },
+		{ styled, live: false, color: styled, unicode: true, width: 100 },
 		{ out: (line) => void out.push(line), err: (line) => void err.push(line) }
 	);
 	return {
@@ -113,7 +113,7 @@ test("interactive selection and URL entry are excluded, the whole automatic run 
 	const clock = fakeClock();
 	const lines: string[] = [];
 	const present = new Presenter(
-		{ styled: false, color: false, unicode: false, width: 100 },
+		{ styled: false, live: false, color: false, unicode: false, width: 100 },
 		{ out: (line) => void lines.push(line), err: () => {} }
 	);
 	await preservingExitCode(async () => {
@@ -278,6 +278,46 @@ test("the session's clock is the one the performance report measures, not a seco
 	});
 	expect(reported).toBe(12_000);
 	expect(c.runtimes()).toEqual(["Total runtime: 00:00:12 (12s)"]);
+});
+
+test("the configuration summary is the log's record, and a region is the terminal's", async () => {
+	// Not the wording: the point is that the selection is said exactly once on each surface. A
+	// terminal already shows the identity in its live frame, so printing the log's block above it
+	// would be the same facts twice — while a redirected log has no frame and must keep it.
+	const session = async (live: boolean): Promise<string[]> => {
+		const out: string[] = [];
+		const updates: Partial<LiveStatus>[] = [];
+		const region: LiveRegion = {
+			update: (next) => void updates.push(next),
+			flash: () => {},
+			warn: () => {},
+			suspend: (action) => action(),
+			close: () => {}
+		};
+		const present = new Presenter(
+			{ styled: live, live, color: live, unicode: true, width: 100 },
+			{
+				out: (line) => void out.push(line),
+				err: () => {},
+				...(live ? { live: region } : {})
+			}
+		);
+		await preservingExitCode(async () => {
+			await runSession(selection, {
+				present,
+				now: fakeClock().read,
+				ingest: fakeIngest(async () => {})
+			});
+		});
+		return out;
+	};
+	const log = await session(false);
+	// A log states the selection once, and it is the only place it can be stated.
+	expect(log.filter((line) => line.startsWith("Selected:"))).toEqual([
+		"Selected: agent fixture \u00b7 model fixture-model \u00b7 context 8k default"
+	]);
+	const terminal = await session(true);
+	expect(terminal.filter((line) => line.includes("Selected:"))).toEqual([]);
 });
 
 test("duration formatting survives a run longer than a day without wrapping", () => {

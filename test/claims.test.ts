@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Claims, acquireLegacyLock } from "../src/claims.ts";
@@ -286,3 +286,44 @@ test("initialization waits for the legacy lock, supports cancellation and preser
 		f.cleanup();
 	}
 });
+
+test("a lock directory whose owner is still being written is waited for, not called ambiguous", async () => {
+	const f = fixture();
+	const lock = join(f.root, "ingest.lock");
+	// Taking the lock is a directory and then an owner file inside it. The loser of that race sees
+	// a directory that exists and an owner that does not yet, which is what two concurrent runs
+	// did — and was reported as uncountable ownership, failing a run that should have waited.
+	mkdirSync(lock);
+	let waits = 0;
+	const release = await acquireLegacyLock(f.root, {
+		onWait: () => {
+			waits++;
+			// The winner finishes writing its owner: a peer that has already exited.
+			writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: deadPid(), token: "peer" }));
+		}
+	});
+	try {
+		// It waited for the owner rather than failing on the empty directory...
+		expect(waits).toBe(1);
+		// ...and then treated the owner it found like any other lock: reclaimed it, because the
+		// peer that held it is gone, and took the lock itself.
+		expect(JSON.parse(readFileSync(join(lock, "owner.json"), "utf8")).pid).toBe(process.pid);
+	} finally {
+		release();
+		f.cleanup();
+	}
+}, 15_000);
+
+test("a lock directory left empty by a crash is preserved, and the wait for its owner is bounded", async () => {
+	const f = fixture();
+	const lock = join(f.root, "ingest.lock");
+	mkdirSync(lock);
+	try {
+		// No owner is coming, so waiting longer would hang every run behind residue. It is still
+		// reported rather than taken: an unreadable lock is never reclaimed automatically.
+		await expect(acquireLegacyLock(f.root, {})).rejects.toThrow("ambiguous ownership");
+		expect(existsSync(lock)).toBe(true);
+	} finally {
+		f.cleanup();
+	}
+}, 15_000);

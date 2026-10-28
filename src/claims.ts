@@ -227,6 +227,18 @@ export class Claims {
 	}
 }
 
+/**
+ * How long a lock directory may exist without an owner file before the lock is uncountable.
+ *
+ * Taking the lock is two syscalls — create the directory, then write the owner inside it — so a
+ * process that loses that race can legitimately read the directory before its winner has written
+ * the owner. Declaring the lock ambiguous there would fail a concurrent run for a window the
+ * winner closes microseconds later; waiting forever would hang every run behind a directory a
+ * crash left empty. The wait is therefore bounded, and past it the lock is still preserved rather
+ * than stolen.
+ */
+const LOCK_SETTLE_MS = 2_000;
+
 /** Called while holding the initialization claim, so new binaries cannot race reclamation. */
 export async function acquireLegacyLock(root: string, options: WaitOptions): Promise<() => void> {
 	mkdirSync(root, { recursive: true });
@@ -234,6 +246,7 @@ export async function acquireLegacyLock(root: string, options: WaitOptions): Pro
 	const ownerPath = join(dir, "owner.json");
 	const token = randomUUID();
 	let waiting = false;
+	let settleUntil: number | undefined;
 	for (;;) {
 		options.signal?.throwIfAborted();
 		try {
@@ -249,9 +262,27 @@ export async function acquireLegacyLock(root: string, options: WaitOptions): Pro
 			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			let raw: string;
+			try {
+				raw = readFileSync(ownerPath, "utf8");
+			} catch (cause) {
+				// No owner file at all. Either the winner of the directory is between its two
+				// syscalls, or the directory is the residue of a crash. Only the second is
+				// ambiguous, and only time tells them apart — so wait for the owner to appear, for
+				// a bounded while, and never take a lock somebody may still be writing.
+				settleUntil ??= Date.now() + LOCK_SETTLE_MS;
+				if ((cause as NodeJS.ErrnoException).code !== "ENOENT" || Date.now() >= settleUntil)
+					throw new Error("Ingestion lock has ambiguous ownership; preserved for recovery.", {
+						cause
+					});
+				if (!waiting) options.onWait?.();
+				waiting = true;
+				await waitForTurn(options);
+				continue;
+			}
 			let owner: { pid?: unknown; token?: unknown };
 			try {
-				owner = JSON.parse(readFileSync(ownerPath, "utf8")) as { pid?: unknown; token?: unknown };
+				owner = JSON.parse(raw) as { pid?: unknown; token?: unknown };
 			} catch (cause) {
 				throw new Error("Ingestion lock has ambiguous ownership; preserved for recovery.", {
 					cause

@@ -71,23 +71,39 @@ never claims success. `help`, `settings`, adapter management, and a cancellation
 begins print no runtime, because no ingestion session started. A `SIGKILL` cannot be reported, and
 nothing is claimed for one.
 
-Progress is append-only: a few stage lines plus one throttled progress line whose numbers are all
-counts this run observed. A growing inventory has no final denominator, so it shows counts instead
-of a percentage until the listing closes; an estimated time remaining appears only once enough
-work has completed for it to mean anything, and is always marked as an estimate. Enumeration,
-fetching and extraction overlap, so the line leads with the dominant activity and shows the
-concurrent counts beside it rather than drawing a stage queue that never happened.
+Progress is reported from measured counts only. On a terminal, a live status region is drawn at the
+bottom of the screen and updated in place: what is being read, the agent/model in force, the
+dominant activity, a progress bar once a denominator is trustworthy, the stage checklist, worker
+and error counts, and the newest warning. The bar is filled from completed work and only ever
+understates it; it never appears while the inventory is still growing. Beneath that, on a
+redirected log, the same facts are one throttled progress line: a growing inventory shows counts
+instead of a fraction until the listing closes, an estimated time remaining appears only once
+enough work has completed for it to mean anything and is always marked as an estimate, and
+enumeration, fetching and extraction overlap — so the line leads with the dominant activity
+instead of drawing a stage queue that never happened.
+
+Nothing is animated, buffered or invented to make a run look busy. Frames are coalesced and
+throttled (at most one ordinary redraw per second, and forced redraws are bounded), a frame that
+would say nothing new is not written, and updates are dropped rather than queued, so the display
+can never delay fetching or extraction. A run that finishes in a second shows one honest frame
+and then gives the screen back; there is no artificial delay anywhere.
 
 Output is styled only where a terminal can be trusted with it. Plain text is used when stdout is
 not a TTY, when `NO_COLOR` is set, when `TERM=dumb`, in CI, and in a window too narrow for
-hierarchy. `YTD_UI=plain` forces plain output and `YTD_UI=styled` forces styling; neither changes
-what a run does. The renderer never redraws a line, never moves the cursor, never hides output, and
-keeps every diagnostic intact — warnings and errors keep their full text on stderr, split into
-bounded chunks when a message is longer than one terminal line, and an omission is only ever made
-at an extreme ceiling and is always stated in the output itself. Trimming to the terminal width
-only ever drops the least important fields of the progress line on a live terminal; a redirected
-log keeps every field. Rendering is best-effort: a broken stream cannot abort
-ingestion, and the pipeline itself has no dependency on the renderer.
+hierarchy, and plain mode never moves the cursor or redraws anything. `YTD_UI=plain` forces plain
+output even on a terminal and `YTD_UI=styled` forces styling for a stream that is not one; neither
+changes what a run does. The live region is used only on a real terminal, is bounded so it never
+reaches the last screen row, drops its least important lines rather than scrolling on a short
+window, and is trimmed to the columns the terminal actually has — characters that occupy two
+columns, such as CJK text, are measured as two. Every other write — warnings, errors, the saved
+model-identity and source-review evidence, the `--perf` report, and waiting messages — is printed
+with the region erased first and redrawn beneath, so no diagnostic is covered or erased by a frame,
+and the region itself is removed before the final runtime line. Warnings and errors keep their full
+text on stderr, split into bounded chunks when a message is longer than one terminal line, and an
+omission is only ever made at an extreme ceiling and is always stated in the output itself.
+Trimming to the terminal width only ever drops the least important fields; a redirected log keeps
+every field. Rendering is best-effort: a broken stream cannot abort ingestion, a renderer failure
+cannot change an exit code, and ingestion itself has no dependency on the renderer.
 
 ## Agents and isolation
 

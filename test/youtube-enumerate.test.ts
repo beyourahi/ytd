@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCommand } from "../src/process.ts";
-import type { enumerate } from "../src/enumerate.ts";
+import { metadataDetail, readSingleMetadata, type enumerate } from "../src/enumerate.ts";
 
 const channel = "https://www.youtube.com/@fixture";
 const video = (id: string, creator: string) => ({
@@ -187,7 +187,87 @@ test("single-video metadata failures preserve the requested identity for fetch r
 	const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
 	const result = await fixture({ [url]: { rows: [second], code: 1 } }, url);
 	expect(result.listing?.items).toEqual([{ id: first.id, title: "", creator: "unknown" }]);
-	expect(result.listing?.listingFailures).toEqual(["single: metadata unavailable"]);
+	// The exit code is named rather than reported as a generic unavailability; this fixture writes
+	// no stderr, so there is no provider line to attach and none is invented.
+	expect(result.listing?.listingFailures).toEqual([
+		"single: metadata lookup exited unsuccessfully (exit 1)"
+	]);
+	// The failed lookup is still reported as a failed lookup, not as a clean listing: the
+	// inventory stays a partial one and fetching still retries the requested identity.
+	expect(result.listing?.items).toHaveLength(1);
+});
+
+/**
+ * The metadata lookup's failure modes, driven through the real reader.
+ *
+ * These are the cases that used to be indistinguishable: every one of them printed the same
+ * `single: metadata unavailable` line, so nothing an operator saw could tell a timed-out lookup
+ * from a challenge, an invalid payload from a video ID that came back as a different video.
+ */
+test("every single-video metadata failure names its own cause", () => {
+	const id = "aaaaaaaaaaa";
+	const result = (over: Partial<Parameters<typeof readSingleMetadata>[0]> = {}) => ({
+		stdout: "",
+		stderr: "",
+		code: 0,
+		timedOut: false,
+		cancelled: false,
+		overflow: false,
+		...over
+	});
+	// A success is silent, and nothing about it changes: the parsed item is returned as-is.
+	const ok = readSingleMetadata(result({ stdout: JSON.stringify(first) }), id);
+	expect(ok.failure).toBeNull();
+	expect(ok.item).toEqual({
+		id: first.id,
+		title: first.title,
+		creator: "Alice",
+		creatorUrl: first.channel_url
+	});
+	// Every case is read through the real reader, and the reader's verdict (both its reason and
+	// whether it produced an item) is kept per case rather than collapsed into one assertion loop.
+	const cases = [
+		result({ timedOut: true }),
+		result({ overflow: true }),
+		result({ code: 2, stderr: "ERROR: Sign in to confirm" }),
+		result({ stdout: "   " }),
+		result({ stdout: "{broken" }),
+		result({ stdout: "{}" }),
+		result({ stdout: JSON.stringify(second) })
+	].map((reading) => readSingleMetadata(reading, id));
+	const reasons = cases.map((reading) => reading.failure);
+	for (const reason of reasons) expect(reason).toBeTruthy();
+	// Recoverability is unchanged in every case: the caller still falls back to the request.
+	for (const reading of cases) expect(reading.item).toBeNull();
+	// Each cause is distinguishable from every other, which is the whole point of the change.
+	expect(new Set(reasons).size).toBe(reasons.length);
+	expect(reasons[0]).toContain("timed out");
+	expect(reasons[1]).toContain("capture limit");
+	expect(reasons[2]).toBe(
+		"single: metadata lookup exited unsuccessfully (exit 2): ERROR: Sign in to confirm"
+	);
+	expect(reasons[3]).toContain("returned no output");
+	expect(reasons[4]).toContain("invalid JSON");
+	expect(reasons[5]).toContain("no usable metadata");
+	// A mismatch names both identities, because the received one is what makes it actionable.
+	expect(reasons[6]).toBe(
+		`single: metadata video ID did not match the requested source (requested ${id}, received ${second.id})`
+	);
+});
+
+test("metadata diagnostics stay one bounded line and never print credentials", () => {
+	// A provider capture is untrusted text: it can be many lines, it can carry the operator's
+	// home directory, and it can echo back a cookie or a token. One sanitised line is attached.
+	expect(metadataDetail("WARNING: noise\nERROR: Sign in to confirm you're not a bot\nmore")).toBe(
+		"ERROR: Sign in to confirm you're not a bot"
+	);
+	expect(metadataDetail("spawn yt-dlp ENOENT")).toBe("spawn yt-dlp ENOENT");
+	expect(metadataDetail("\n\n")).toBe("");
+	const leaky = metadataDetail(`ERROR: bad request --cookies /tmp/c.txt\napi_key: sk-secret-value`);
+	expect(leaky).not.toContain("sk-secret-value");
+	expect(leaky).not.toContain("\n");
+	const long = metadataDetail(`ERROR: ${"x".repeat(900)}`);
+	expect(long.length).toBeLessThanOrEqual(200);
 });
 
 test("cancelling a channel listing stops enumeration before the next tab", async () => {

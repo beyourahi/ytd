@@ -12,10 +12,20 @@
  *  - text that came from outside (titles, creator names, provider labels) is sanitised before it
  *    is printed, so nothing can inject terminal control sequences through a video title.
  *
- * Styling is append-only: this layer never moves the cursor, never hides it, never enters an
- * alternate screen and never redraws a line it wrote. Warnings and errors therefore can never
- * corrupt a live display, and redirected output stays a clean log.
+ * This layer is append-only: it never moves the cursor, never hides it, never enters an
+ * alternate screen and never redraws a line it wrote. The live region (`dashboard.ts`) is the
+ * one surface that does move the cursor, and it owns the screen while it draws — every write
+ * from here goes through it, so a warning or a diagnostic can never land where its erase
+ * arithmetic does not expect it.
  */
+
+/**
+ * Text handling shared with the region and the metadata layer.
+ *
+ * `oneLine` and `sanitize` are imported as well as re-exported: this layer uses them on every
+ * line it prints, and a re-export alone would not bind them here.
+ */
+import { displayWidth, oneLine, sanitize } from "./text.ts";
 
 /** Assumed width when the terminal reports none. */
 export const DEFAULT_WIDTH = 80;
@@ -33,12 +43,28 @@ const SGR = {
 	red: "\u001b[31m"
 } as const;
 
-type Tone = keyof typeof SGR;
+export type Tone = keyof typeof SGR;
 type Marker = "run" | "ok" | "warn" | "fail";
+
+/**
+ * Colour one fragment. The palette lives here and nowhere else, so every surface that colours
+ * text — this presenter and the live region — uses the same six tones.
+ */
+export function paint(text: string, tone: Tone): string {
+	return `${SGR[tone]}${text}${SGR.reset}`;
+}
 
 export interface UiCapabilities {
 	/** The output may be styled at all. False means plain, predictable text. */
 	styled: boolean;
+	/**
+	 * A live, in-place status region is possible: a real terminal that accepts cursor movement.
+	 *
+	 * This is stricter than `styled` on purpose. `YTD_UI=styled` deliberately styles a stream that
+	 * is not a terminal, and a redirected log must never be handed a cursor-movement sequence — so
+	 * the region requires a genuine TTY, not merely permission to colour text.
+	 */
+	live: boolean;
 	color: boolean;
 	unicode: boolean;
 	width: number;
@@ -69,91 +95,20 @@ export function detectCapabilities(options: UiEnvironment = {}): UiCapabilities 
 	const colorOff = Boolean(env.NO_COLOR) || env.FORCE_COLOR === "0" || dumb;
 	const unsuitable =
 		Boolean(env.CI) || Boolean(env.BUILD_NUMBER) || Boolean(env.CONTINUOUS_INTEGRATION);
+	const terminal = Boolean(stdout.isTTY) && !unsuitable && width >= MIN_STYLED_WIDTH;
 	const styled =
-		override === "styled"
-			? true
-			: override === "plain"
-				? false
-				: Boolean(stdout.isTTY) && !colorOff && !unsuitable && width >= MIN_STYLED_WIDTH;
+		override === "styled" ? true : override === "plain" ? false : terminal && !colorOff;
 	const locale = (env.LC_ALL || env.LC_CTYPE || env.LANG || "").trim();
 	// A locale that is not UTF-8 gets ASCII markers: guessing wrong prints mojibake into a log.
 	const unicode =
 		styled && !/^(c|posix)$/i.test(locale) && (/utf-?8/i.test(locale) || platform === "darwin");
-	return { styled, color: styled && !colorOff, unicode, width };
+	return { styled, live: styled && terminal, color: styled && !colorOff, unicode, width };
 }
 
-/**
- * Make external text safe to print.
- *
- * Control characters — including the escape that starts an ANSI sequence — are removed rather
- * than escaped: a title is untrusted input, and no video title needs to move a cursor. Line
- * breaks survive only when asked for, which is the difference between a diagnostic (which keeps
- * its shape) and a single rendered line (which must not become two).
- */
-export function sanitize(value: string, max = 400, options: { breaks?: boolean } = {}): string {
-	const BEL = 7;
-	const CSI = 91;
-	const OSC = 93;
-	const ST_FINAL = 92; // the `\` of the two-byte String Terminator
-	let out = "";
-	// `i` always points at the last byte consumed, because the loop's own increment follows it.
-	for (let i = 0; i < value.length; i++) {
-		const code = value.charCodeAt(i);
-		if (code === 27) {
-			// Drop the whole sequence, not just its escape byte: leaving `[2J` behind would print
-			// the remainder of an attack as text.
-			const next = value.charCodeAt(i + 1);
-			if (next === CSI) {
-				// CSI: parameters and intermediates end at the first byte in 0x40–0x7e.
-				i += 2;
-				while (i < value.length && !(value.charCodeAt(i) >= 0x40 && value.charCodeAt(i) <= 0x7e))
-					i++;
-				continue;
-			}
-			if (next === OSC) {
-				// OSC runs to BEL or to ST, and every byte of it is payload: an unterminated one
-				// swallows the rest of the string here exactly as a terminal would swallow it.
-				i += 2;
-				while (i < value.length && value.charCodeAt(i) !== BEL) {
-					// ST is ESC \: consume both bytes, and leave no stray backslash behind.
-					if (value.charCodeAt(i) === 27 && value.charCodeAt(i + 1) === ST_FINAL) {
-						i += 1;
-						break;
-					}
-					i++;
-				}
-				continue;
-			}
-			// A bare or unrecognised escape (Fp/Fe/Fs, a truncated CSI) has no safe meaning here.
-			// The escape itself is dropped and the text after it is kept: deleting a printable
-			// character would lose a title's own text to defend against a sequence that is gone.
-			continue;
-		}
-		if (code === 10 && options.breaks) {
-			out += "\n";
-			continue;
-		}
-		// A break that is not kept still separates words: removing it outright would join them.
-		if (code === 9 || code === 10 || code === 13) {
-			out += " ";
-			continue;
-		}
-		if (code < 32 || (code >= 127 && code <= 159)) continue;
-		out += value[i];
-	}
-	const collapsed = options.breaks
-		? out
-				.replace(/[^\S\n]+/g, " ")
-				.replace(/\n{3,}/g, "\n\n")
-				.trim()
-		: out.replace(/\s+/g, " ").trim();
-	return collapsed.length > max ? `${collapsed.slice(0, max - 1)}\u2026` : collapsed;
-}
-
-/** External text reduced to a single rendered line. */
-export function oneLine(value: string, max = 400): string {
-	return sanitize(value, max, { breaks: false });
-}
+// Sanitising and column measurement live in `text.ts`, so the metadata layer can use them without
+// importing this one. Re-exported here because this module is what the presenter, the region and
+// their tests reach for, and one import is kinder than two for the same guarantee.
+export { clipToWidth, displayWidth, oneLine, sanitize } from "./text.ts";
 
 /**
  * The longest single line this layer hands a terminal.
@@ -215,28 +170,9 @@ export function renderChunks(text: string, max = MAX_RENDERED_LINE): string[] {
 	return chunks;
 }
 
-/** Length as the terminal sees it: ANSI sequences occupy no columns. */
+/** Length as the terminal sees it: escapes take no columns, a wide character takes two. */
 export function visibleLength(text: string): number {
-	const final = (index: number): boolean =>
-		text.charCodeAt(index) >= 0x40 && text.charCodeAt(index) <= 0x7e;
-	let visible = 0;
-	let index = 0;
-	while (index < text.length) {
-		if (text.charCodeAt(index) === 27) {
-			// Skip the whole sequence rather than counting it: a CSI ends at its first byte in
-			// 0x40–0x7e, and the escape itself takes no column either.
-			index += 1;
-			if (text.charCodeAt(index) === 91) {
-				index += 1;
-				while (index < text.length && !final(index)) index += 1;
-				index += 1;
-			}
-			continue;
-		}
-		visible += 1;
-		index += 1;
-	}
-	return visible;
+	return displayWidth(text);
 }
 
 /**
@@ -259,6 +195,36 @@ export interface UiStreams {
 	 * without the presentation layer polling anything.
 	 */
 	measureWidth?: () => number;
+	/**
+	 * A live status region, when the terminal can hold one. Built by the caller (there is exactly
+	 * one place that decides this) and injected here, so this module stays free of any dependency
+	 * on the renderer and can present identically with or without one.
+	 */
+	live?: LiveRegion;
+}
+
+/**
+ * The little of the live region this layer needs.
+ *
+ * Structural rather than a concrete class, which is what keeps the dependency one-way: the
+ * renderer imports this module's palette, and this module never imports the renderer.
+ */
+export interface LiveRegion {
+	update(next: Partial<LiveStatus>): void;
+	flash(): void;
+	warn(message: string): void;
+	suspend<T>(action: () => T): T;
+	close(): void;
+}
+
+/** What a caller can tell the live region about the run. Every field is measured. */
+export interface LiveStatus {
+	source?: string;
+	model?: string;
+	activity?: string;
+	bar?: { done: number; total: number; label: string } | null;
+	stages?: { label: string; state: "pending" | "active" | "done" | "warn"; detail: string }[];
+	workers?: string[];
 }
 
 /**
@@ -289,16 +255,79 @@ export class Presenter {
 	private readonly out: UiWriter;
 	private readonly err: UiWriter;
 	private readonly measure?: () => number;
+	private region?: LiveRegion;
 
 	constructor(caps: UiCapabilities = detectCapabilities(), streams: UiStreams = {}) {
 		this.caps = caps;
 		this.out = streams.out ?? writeStdout;
 		this.err = streams.err ?? writeStderr;
 		this.measure = streams.measureWidth;
+		this.region = streams.live;
 	}
 
 	get styled(): boolean {
 		return this.caps.styled;
+	}
+
+	/** True when a live region is drawing. False for every redirected or plain run. */
+	get live(): boolean {
+		return Boolean(this.region);
+	}
+
+	/**
+	 * Say what the run is doing, as opposed to what happened to it.
+	 *
+	 * Narration is the one thing the live region replaces rather than decorates: on a terminal it
+	 * is the activity line, which is why the log does not grow a line per stage while a dashboard
+	 * is drawing. In plain output it stays a stage line, because a log has no activity line and
+	 * dropping the message there would lose the only record of what the run was doing.
+	 */
+	narrate(message: string): void {
+		if (this.region) {
+			this.region.update({ activity: oneLine(message, 120) });
+			this.region.flash();
+			return;
+		}
+		this.stage("run", message);
+	}
+
+	/**
+	 * Push measured status into the live region.
+	 *
+	 * A no-op without a region, which is what keeps a redirected run's output exactly what it was:
+	 * this method carries no information a log needs, only the arrangement of information the log
+	 * already prints.
+	 */
+	status(update: LiveStatus, immediate = false): void {
+		if (!this.region) return;
+		this.region.update(update);
+		if (immediate) this.region.flash();
+	}
+
+	/**
+	 * Stop drawing and give the terminal back.
+	 *
+	 * Called at the end of every session, including failed and cancelled ones, so no run leaves a
+	 * timer running or a half-drawn region behind. Safe to call on a presenter that never drew.
+	 */
+	close(): void {
+		this.region?.close();
+		this.region = undefined;
+	}
+
+	/**
+	 * Print through the region's ownership: erased first, repainted beneath afterwards.
+	 *
+	 * A handful of writes are assembled outside this layer — the saved model-identity evidence, the
+	 * measured `--perf` report, and the messages printed while waiting for another session. They
+	 * are still output, so they still have to go through the one surface that owns the screen: the
+	 * region erases from the height it last painted, and a write it never saw would put that erase
+	 * on top of it. Without a region this is the call itself, so a redirected or plain run is
+	 * unchanged.
+	 */
+	suspend<T>(action: () => T): T {
+		const region = this.region;
+		return region ? region.suspend(action) : action();
 	}
 
 	get width(): number {
@@ -310,7 +339,7 @@ export class Presenter {
 
 	private paint(text: string, tone: Tone): string {
 		if (!this.caps.color) return text;
-		return `${SGR[tone]}${text}${SGR.reset}`;
+		return paint(text, tone);
 	}
 
 	private mark(kind: Marker): string {
@@ -326,13 +355,34 @@ export class Presenter {
 		return { run: ">", ok: "+", warn: "!", fail: "x" }[kind];
 	}
 
-	/** Write through the injected stream; a broken one may never fail the run. */
+	/**
+	 * Write through the injected stream; a broken one may never fail the run.
+	 *
+	 * With a live region drawing, the text is printed with the region erased and the region is
+	 * redrawn beneath it afterwards. That single indirection is what makes a growing log and a live
+	 * dashboard coexist: the diagnostic gets clean space, and cannot be overwritten by a frame.
+	 */
 	private emit(writer: UiWriter, text: string): void {
+		const region = this.region;
 		try {
-			writer(text);
+			if (region) region.suspend(() => writer(text));
+			else writer(text);
 		} catch {
 			/* presentation is best-effort by contract */
 		}
+	}
+
+	/**
+	 * Write one line this layer has already sanitised, in bounded chunks.
+	 *
+	 * This is the path for text the presenter assembled itself: external text is sanitised before
+	 * it is painted, so sanitising the painted result again would strip the styling that was just
+	 * added. That is precisely what happened — every coloured surface except the header silently
+	 * lost its colour on a real terminal — which is why sanitising and painting are now separate
+	 * steps and this path never sanitises a second time.
+	 */
+	private write(text: string): void {
+		for (const chunk of renderChunks(text)) this.emit(this.out, chunk);
 	}
 
 	/**
@@ -344,8 +394,7 @@ export class Presenter {
 	 * A long diagnostic is delivered in full, in bounded chunks, so nothing is lost silently.
 	 */
 	line(message = ""): void {
-		for (const chunk of renderChunks(sanitize(message, UNBOUNDED, { breaks: true })))
-			this.emit(this.out, chunk);
+		this.write(sanitize(message, UNBOUNDED, { breaks: true }));
 	}
 
 	/**
@@ -364,6 +413,9 @@ export class Presenter {
 
 	/** A warning. Goes to stderr, exactly as it always has, and keeps its own line breaks. */
 	warn(message: string): void {
+		// Recorded before it is printed, so the region's warning slot is current even while the
+		// warning itself is being written above it. The full text is printed either way.
+		this.region?.warn(oneLine(message, 120));
 		const chunks = renderChunks(sanitize(message, UNBOUNDED, { breaks: true }));
 		for (const [index, chunk] of chunks.entries())
 			this.emit(
@@ -377,6 +429,7 @@ export class Presenter {
 	 * length: a truncated provider message is a run nobody can debug.
 	 */
 	fail(message: string): void {
+		this.region?.warn(oneLine(message, 120));
 		const chunks = renderChunks(sanitize(message, UNBOUNDED, { breaks: true }));
 		for (const [index, chunk] of chunks.entries())
 			this.emit(
@@ -399,7 +452,7 @@ export class Presenter {
 		}
 		const tone: Tone =
 			kind === "fail" ? "red" : kind === "warn" ? "yellow" : kind === "ok" ? "green" : "cyan";
-		this.line(`${this.paint(this.mark(kind), tone)} ${text}`);
+		this.write(`${this.paint(this.mark(kind), tone)} ${text}`);
 	}
 
 	/** A compact set of labelled values, aligned only as far as the content needs. */
@@ -411,7 +464,7 @@ export class Presenter {
 			return;
 		}
 		// Quiet on purpose: this is context, not an event, so it carries no marker of its own.
-		this.line(this.paint(`${title} \u00b7 ${line(rows)}`, "dim"));
+		this.write(this.paint(`${oneLine(title, 40)} \u00b7 ${line(rows)}`, "dim"));
 	}
 
 	/**
@@ -441,10 +494,12 @@ export class Presenter {
 			this.line(complete.join(" \u00b7 "));
 			return;
 		}
-		const shown = this.fit(complete);
+		// Each segment is sanitised before it is painted: it can carry a phase name chosen by the
+		// caller, and the paint has to happen last for the colour to survive to the terminal.
+		const shown = this.fit(complete.map((segment) => oneLine(segment, 400)));
 		const [head, ...rest] = shown;
 		const body = [this.paint(head!, "cyan"), ...rest.map((segment) => this.paint(segment, "dim"))];
-		this.line(`${this.paint(this.mark("run"), "cyan")} ${body.join(" \u00b7 ")}`);
+		this.write(`${this.paint(this.mark("run"), "cyan")} ${body.join(" \u00b7 ")}`);
 	}
 
 	/**
@@ -454,6 +509,10 @@ export class Presenter {
 	 * and a live terminal say exactly the same thing.
 	 */
 	runtime(text: string): void {
-		this.line(this.styled ? this.paint(text, "green") : text);
+		if (!this.styled) {
+			this.line(text);
+			return;
+		}
+		this.write(this.paint(oneLine(text, 200), "green"));
 	}
 }

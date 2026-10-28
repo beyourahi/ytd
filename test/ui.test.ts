@@ -2,16 +2,28 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	Dashboard,
+	dashboardStatus,
+	emptyState,
+	renderDashboard,
+	type DashboardClock
+} from "../src/dashboard.ts";
+import { formatProgress, progressSegments, shouldAggregate, summarise } from "../src/progress.ts";
+import type { PipelineProgress } from "../src/pipeline.ts";
+import {
 	MAX_DIAGNOSTIC_CHARS,
 	MAX_RENDERED_LINE,
 	MIN_STYLED_WIDTH,
 	Presenter,
+	clipToWidth,
 	detectCapabilities,
+	displayWidth,
 	oneLine,
 	renderChunks,
 	sanitize,
 	visibleLength,
-	type UiCapabilities
+	type UiCapabilities,
+	type LiveRegion
 } from "../src/ui.ts";
 
 /**
@@ -22,8 +34,14 @@ import {
  * sequence into plain output, move the cursor, drop a diagnostic, or fail a run.
  */
 
-const styled: UiCapabilities = { styled: true, color: true, unicode: true, width: 100 };
-const plain: UiCapabilities = { styled: false, color: false, unicode: false, width: 100 };
+const styled: UiCapabilities = { styled: true, live: true, color: true, unicode: true, width: 100 };
+const plain: UiCapabilities = {
+	styled: false,
+	live: false,
+	color: false,
+	unicode: false,
+	width: 100
+};
 
 interface Capture {
 	present: Presenter;
@@ -122,16 +140,35 @@ test("plain output never carries an ANSI sequence, whatever was printed", () => 
 });
 
 test("styled output uses colour only, and never moves the cursor", () => {
+	// Every surface is captured on its own. Asserting on the whole stream let the header stand in
+	// for the rest, which hid the fact that the coloured surfaces were routing their own painted
+	// text back through the sanitiser and losing the styling it had just applied.
+	const surfaces: [string, (present: Presenter) => void][] = [
+		["header", (present) => present.header("ytd — YouTube to verified field notes", "Choose.")],
+		["stage", (present) => present.stage("ok", "Complete")],
+		["progress", (present) => present.progress(["Fetching", "12 fetched"])],
+		["entries", (present) => present.entries("Selected", [["agent", "pi"]])],
+		["runtime", (present) => present.runtime("Total runtime: 00:00:03 (3s)")]
+	];
+	for (const [surface, render] of surfaces) {
+		const c = capture(styled);
+		render(c.present);
+		expect(onlySgr(c.text()), `${surface} emits colour only`).toBe(true);
+		expect(escapeSequences(c.text()).length, `${surface} keeps its styling`).toBeGreaterThan(0);
+	}
 	const c = capture(styled);
-	c.present.header("ytd — YouTube to verified field notes", "Choose the agent and model.");
-	c.present.stage("ok", "Complete");
-	c.present.progress(["Fetching", "12 fetched"]);
 	c.present.warn("careful");
 	c.present.fail("broken");
-	c.present.runtime("Total runtime: 00:00:03 (3s)");
-	expect(onlySgr(c.text())).toBe(true);
 	expect(onlySgr(c.errors())).toBe(true);
-	expect(escapeSequences(c.text()).length).toBeGreaterThan(0);
+	expect(escapeSequences(c.errors()).length).toBeGreaterThan(0);
+	// Styling never adds information: strip it and what remains is the plain line, with only the
+	// run marker in front of it.
+	const styledLine = capture(styled);
+	styledLine.present.progress(["Fetching", "12 fetched"]);
+	const plainLine = capture(plain);
+	plainLine.present.progress(["Fetching", "12 fetched"]);
+	expect(stripSgr(styledLine.text()).endsWith(plainLine.text())).toBe(true);
+	expect(plainLine.text()).toBe("Fetching · 12 fetched");
 });
 
 test("external text cannot inject control sequences through a title or a label", () => {
@@ -253,9 +290,28 @@ test("output is written one line at a time, with no queue to grow", () => {
 	expect(writes.at(-1)).toBe("Fetching · 49 fetched");
 });
 
-test("the ingestion pipeline carries no dependency on the renderer", () => {
+test("no ingestion module depends on the renderer", () => {
+	// Ingestion reports what it measured and prints nothing: text handling it needs (sanitising a
+	// provider's own error line) comes from `text.ts`, so the dependency runs one way and a terminal
+	// cannot be a reason for a fetch or a model call to behave differently. `palace.ts` and
+	// `settings.ts` are excluded because they present their own output by design.
+	for (const module of [
+		"pipeline",
+		"fetch",
+		"distill",
+		"manifest",
+		"enumerate",
+		"discovery",
+		"scheduler",
+		"transcribe",
+		"claims"
+	]) {
+		const source = readFileSync(join(import.meta.dir, "..", "src", `${module}.ts`), "utf8");
+		expect(source, `${module} does not import the presenter`).not.toContain('from "./ui.ts"');
+		expect(source, `${module} does not import the region`).not.toContain('from "./dashboard.ts"');
+	}
+	// The pipeline also carries no formatting: its counts are described by whoever shows them.
 	const pipeline = readFileSync(join(import.meta.dir, "..", "src", "pipeline.ts"), "utf8");
-	expect(pipeline).not.toContain("./ui.ts");
 	expect(pipeline).not.toContain("./progress.ts");
 });
 
@@ -342,4 +398,354 @@ test("chunked diagnostics are bounded per call and never queued", () => {
 	expect(errors).toHaveLength(expected * 2);
 	expect(writes.join("")).not.toContain("\u001b");
 	expect(errors.join("")).not.toContain("\u001b");
+});
+
+/** A pipeline tally, with only the counts a test is about filled in. */
+function tally(overrides: Partial<PipelineProgress> = {}): PipelineProgress {
+	return {
+		total: 0,
+		fetched: 0,
+		noCaptions: 0,
+		distilled: 0,
+		failed: 0,
+		blocked: 0,
+		retries: 0,
+		activeFetchers: 0,
+		activeExtractors: 0,
+		queuedFetch: 0,
+		queuedExtract: 0,
+		aiCalls: 0,
+		elapsedMs: 0,
+		...overrides
+	};
+}
+
+test("the renderer cannot delay a run: it holds no timer, no wait and nothing a worker can block on", () => {
+	// The pipeline owns the cadence; the renderer only draws what it is handed. Nothing here may
+	// introduce a delay of its own, so the cost of a live line can never be paid by fetch or
+	// extraction. This is checked against the source because it is a property of the whole module,
+	// not of one call: a single `setTimeout` added later would break it invisibly.
+	for (const file of ["ui.ts", "progress.ts"]) {
+		const source = readFileSync(join(import.meta.dir, "..", "src", file), "utf8");
+		for (const delaying of [
+			"setTimeout",
+			"setInterval",
+			"setImmediate",
+			"process.nextTick",
+			"queueMicrotask",
+			"Bun.sleep",
+			"Atomics.wait"
+		])
+			expect(source, `${file} holds no ${delaying}`).not.toContain(delaying);
+		expect(/\basync\s/.test(source), `${file} awaits nothing`).toBe(false);
+	}
+	// The cadence lives in the pipeline, driven by one configured interval.
+	const pipeline = readFileSync(join(import.meta.dir, "..", "src", "pipeline.ts"), "utf8");
+	expect(pipeline).toContain("setInterval");
+	expect(pipeline).toContain("settings.progressIntervalMs");
+});
+
+test("a fast or touched-nothing run is not narrated by invented progress", () => {
+	// A run with nothing to report draws no line at all rather than a zeroed one.
+	const silent = capture(styled);
+	silent.present.progress(["", ""]);
+	expect(silent.out).toEqual([]);
+
+	// A run that finished before its first interval, and one that found every video already done,
+	// both report measured counts. There is no percentage anywhere: a growing inventory has no
+	// final denominator, so a proportion would be a wrong answer dressed as a precise one.
+	const finished = tally({ total: 3, fetched: 3, distilled: 3, aiCalls: 4, elapsedMs: 4_000 });
+	const cacheOnly = tally({ total: 12, fetched: 12, distilled: 12, elapsedMs: 900 });
+	for (const progress of [finished, cacheOnly, tally()]) {
+		const line = formatProgress(progress);
+		expect(line).not.toContain("%");
+		// An estimate is withheld until enough work has completed for it to mean anything, and is
+		// always labelled when it is shown.
+		expect(line).not.toContain("est.");
+		expect(summarise(progress).remainingSeconds).toBeNull();
+	}
+	// Zero model calls is left out rather than printed as a meaningless zero.
+	expect(formatProgress(tally())).not.toContain("AI calls");
+	// With enough completed work the estimate appears, marked as one and stated as a duration.
+	const steady = tally({ total: 100, fetched: 60, distilled: 60, aiCalls: 60, elapsedMs: 300_000 });
+	expect(progressSegments(steady)).toContain("60/100 extracted");
+	expect(formatProgress(steady)).toMatch(/~\d+m\d+s left \(est\.\)/);
+});
+
+test("aggregate progress is bounded by a threshold, so a small run is never spammed by it", () => {
+	// The CLI only attaches the throttled line above the threshold; below it a short run keeps its
+	// per-video narration, which is what makes a seconds-long run readable rather than noisy.
+	expect(shouldAggregate(10, 10)).toBe(false);
+	expect(shouldAggregate(11, 10)).toBe(true);
+	expect(shouldAggregate(1, 10)).toBe(false);
+});
+
+/**
+ * The live region, driven by a fake clock.
+ *
+ * A region's whole risk is that it is *on the path* — that a burst of progress queues frames,
+ * that a tick repaints a still screen, or that a run which finishes in a second is shown a bar it
+ * never earned. Those are properties of the scheduler, not of the drawing, so they are checked
+ * with the clock under the test's control rather than by watching a real terminal and hoping to
+ * catch a burst.
+ */
+function liveRegion(options: { intervalMs?: number; immediateMs?: number } = {}) {
+	const writes: string[] = [];
+	const timers: { fn: () => void; cancelled: boolean }[] = [];
+	const resizes: (() => void)[] = [];
+	let now = 0;
+	const clock: DashboardClock = {
+		now: () => now,
+		every: (_ms, fn) => {
+			const timer = { fn, cancelled: false };
+			timers.push(timer);
+			return { cancel: () => void (timer.cancelled = true) };
+		},
+		onResize: (fn) => {
+			resizes.push(fn);
+			return () => void resizes.splice(resizes.indexOf(fn), 1);
+		}
+	};
+	const dashboard = new Dashboard({
+		write: (text) => void writes.push(text),
+		measure: () => ({ width: 100, rows: 30 }),
+		color: true,
+		unicode: true,
+		elapsedMs: () => 0,
+		clock,
+		...(options.intervalMs === undefined ? {} : { intervalMs: options.intervalMs }),
+		...(options.immediateMs === undefined ? {} : { immediateMs: options.immediateMs })
+	});
+	/** Move time forward and let the interval the region registered fire. */
+	const advance = (ms: number): void => {
+		now += ms;
+		for (const timer of timers) if (!timer.cancelled) timer.fn();
+	};
+	return {
+		dashboard,
+		writes,
+		resizes,
+		timers,
+		advance,
+		frame: () => writes.at(-1) ?? "",
+		frames: () => writes.filter((write) => write.includes("YTD")).length
+	};
+}
+
+const stage = (label: string, state: "pending" | "active" | "done" | "warn") => ({
+	label,
+	state,
+	detail: "measured"
+});
+
+test("a burst of progress is coalesced into one frame per interval and no worker ever waits on it", () => {
+	const region = liveRegion();
+	// The first state draws at once: a run that lasts two seconds still shows an interface.
+	region.dashboard.update({ activity: "step 0", stages: [stage("Extraction", "active")] });
+	expect(region.writes).toHaveLength(1);
+	expect(region.frame()).toContain("step 0");
+
+	// A tick with nothing new writes nothing: a still screen is not repainted once a second.
+	region.advance(1_000);
+	expect(region.writes).toHaveLength(1);
+
+	// Two hundred updates inside one interval produce no frames at all, and no backlog: the
+	// region stores the newest state and drops everything it replaced.
+	for (let index = 1; index < 200; index++) {
+		region.dashboard.update({
+			activity: `step ${index}`,
+			bar: { done: index, total: 200, label: "extracted" }
+		});
+	}
+	expect(region.writes).toHaveLength(1);
+
+	// The single frame the next tick draws is the newest state, not a replay of the burst — which
+	// is what "obsolete frames are dropped" has to mean if it is to mean anything.
+	region.advance(1_000);
+	expect(region.writes).toHaveLength(2);
+	expect(region.frame()).toContain("step 199");
+	expect(region.frame()).toContain("199/200 extracted");
+
+	// And the same state again for several intervals stays one frame: a repaint that says nothing
+	// new costs a terminal write and buys an operator nothing.
+	for (let interval = 0; interval < 5; interval++) region.advance(1_000);
+	expect(region.writes).toHaveLength(2);
+
+	// No worker can be delayed by any of this: the module holds nothing to wait on. The cadence
+	// itself comes from the injected clock, which is the one delaying primitive in the design.
+	const source = readFileSync(join(import.meta.dir, "..", "src", "dashboard.ts"), "utf8");
+	for (const delaying of ["setTimeout", "Bun.sleep", "Atomics.wait", "process.nextTick"])
+		expect(source, `dashboard.ts holds no ${delaying}`).not.toContain(delaying);
+	expect(/\bawait\s/.test(source)).toBe(false);
+});
+
+test("a flurry of stage changes cannot outrun the immediate throttle", () => {
+	const region = liveRegion({ immediateMs: 150 });
+	region.dashboard.update({ activity: "starting", stages: [stage("Discovery", "active")] });
+	expect(region.writes).toHaveLength(1);
+
+	// A stage change inside the throttle window is dropped rather than drawn: it is one frame on
+	// the next tick away, and nobody needs to see it sixteenth of a second sooner.
+	region.dashboard.update({ stages: [stage("Discovery", "done"), stage("Fetching", "active")] });
+	region.dashboard.flash();
+	expect(region.writes).toHaveLength(1);
+
+	// Once the window has passed, a stage change gets the frame it asked for — once.
+	region.advance(150);
+	expect(region.writes).toHaveLength(2);
+	expect(region.frame()).toContain("Fetching");
+	for (let change = 0; change < 50; change++) {
+		region.dashboard.update({ activity: `change ${change}` });
+		region.dashboard.flash();
+	}
+	expect(region.writes).toHaveLength(2);
+});
+
+test("a run that finishes in seconds, or reuses everything it already had, is shown one true frame and no invented progress", () => {
+	// A cache-only run: every source already distilled, no model call made. It completes before
+	// the first interval, so the only frame is the one the first update drew — and that frame
+	// says what was measured, not a percentage that flatters it.
+	const cached = tally({ total: 12, fetched: 12, distilled: 12, elapsedMs: 900 });
+	const status = dashboardStatus(cached, { phase: "Finalizing" });
+	expect(status.bar).toEqual({ done: 12, total: 12, label: "extracted" });
+
+	const region = liveRegion();
+	region.dashboard.update(status);
+	expect(region.writes).toHaveLength(1);
+	const frame = region.frame();
+	expect(frame).toContain("12/12 extracted");
+	expect(frame).toContain("0 errors");
+	// No percentage anywhere, and the clock is the run's own measurement rather than a tick count.
+	expect(frame).not.toContain("%");
+	expect(frame).toContain("00:00");
+
+	// Closing a run this short leaves nothing behind: one erase, no leftover timer, and no write
+	// after the session has ended.
+	region.dashboard.close();
+	expect(region.writes).toHaveLength(2);
+	expect(region.frame()).not.toContain("YTD");
+	expect(region.timers.every((timer) => timer.cancelled)).toBe(true);
+	region.dashboard.update({ activity: "after the run" });
+	region.dashboard.flash();
+	expect(region.writes).toHaveLength(2);
+	expect(region.dashboard.isClosed).toBe(true);
+	expect(region.dashboard.lines).toBe(0);
+});
+
+test("a denominator that can still grow gets counts and a stated reason, never a bar", () => {
+	// While the listing is still producing sources the total is a moving target, so a fraction
+	// against it would be a wrong answer dressed as a precise one.
+	const discovering = dashboardStatus(tally({ total: 4_200, fetched: 90, distilled: 12 }), {
+		discovering: true,
+		discovered: 4_200,
+		totalKnown: false
+	});
+	expect(discovering.bar).toBeNull();
+	expect(discovering.activity).toBe("Discovering sources");
+
+	const frame = renderDashboard(
+		{ ...emptyState(), ...discovering, elapsedMs: 30_000 },
+		{ width: 100, rows: 30, color: false, unicode: true }
+	).join("\n");
+	expect(frame).toContain("Total still growing");
+	expect(frame).not.toContain("\u2588");
+	expect(frame).not.toContain("\u2591");
+	expect(frame).not.toContain("%");
+
+	// A run whose every source ended without knowledge has no eligible work left: an empty bar
+	// there would read as stalled progress rather than as a finished inventory.
+	const terminalOnly = dashboardStatus(
+		tally({ total: 3, fetched: 3, distilled: 0, failed: 1, noCaptions: 2 })
+	);
+	expect(terminalOnly.bar).toBeNull();
+});
+
+test("terminal columns are measured rather than characters counted", () => {
+	// A character is not a column. The region's height arithmetic is the reason it matters: a line
+	// that says it fits but wraps puts every later cursor move a row out.
+	expect(displayWidth("Fetching 12/20")).toBe(14);
+	expect(displayWidth("\u65e5\u672c\u8a9e")).toBe(6);
+	expect(displayWidth("\u{1f680}")).toBe(2);
+	// A combining mark decorates the character before it and takes no column of its own.
+	expect(displayWidth("e\u0301")).toBe(1);
+	expect(displayWidth("a\u0301b")).toBe(2);
+	// Colour is not width, however many bytes it adds.
+	expect(visibleLength("\u001b[36m\u65e5\u672c\u8a9e\u001b[0m")).toBe(6);
+	expect(visibleLength("\u001b[32m\u2714\u001b[0m Fetching")).toBe(10);
+
+	// Clipping is by columns, and the marker is inside the budget it was given.
+	expect(clipToWidth("abcdef", 4)).toBe("abc\u2026");
+	expect(clipToWidth("abc", 4)).toBe("abc");
+	expect(clipToWidth("\u65e5\u672c\u8a9e", 4)).toBe("\u65e5\u2026");
+	expect(clipToWidth("\u65e5\u672c\u8a9e", 2)).toBe("\u2026");
+	expect(clipToWidth("\u65e5\u672c\u8a9e", 0)).toBe("");
+	// A cut never splits a surrogate pair or a combining sequence.
+	expect(clipToWidth("a\u{1f680}\u{1f680}", 3)).toBe("a\u2026");
+	expect(clipToWidth("e\u0301x", 1)).toBe("\u2026");
+	expect(displayWidth(clipToWidth("\u65e5".repeat(40), 20))).toBeLessThanOrEqual(20);
+});
+
+test("a frame carrying wide characters still fits the terminal it was measured against", () => {
+	const render = (width: number, source: string, detail: string) =>
+		renderDashboard(
+			{
+				...emptyState(),
+				source,
+				model: "fixture \u00b7 fixture-model",
+				workers: [detail],
+				elapsedMs: 30_000
+			},
+			{ width, rows: 24, color: false, unicode: true }
+		);
+	// A Japanese channel name, a combining accent and an emoji: every one of them is wider or
+	// narrower than its character count, and none of them may push a line past the terminal.
+	for (const width of [100, 60, 24]) {
+		for (const line of render(
+			width,
+			`YouTube \u00b7 Channel ${"\u65e5\u672c\u8a9e".repeat(20)}`,
+			`2 fetching \u00b7 ${"\u{1f680}".repeat(20)} \u00b7 e\u0301`
+		))
+			expect(displayWidth(line), `width ${width}`).toBeLessThanOrEqual(width);
+	}
+	// The frame is still what it says it is: identity and activity are not the lines that go.
+	const narrow = render(24, "YouTube \u00b7 Channel \u65e5\u672c\u8a9e", "2 fetching");
+	expect(narrow[0]).toContain("YTD");
+	expect(narrow.some((line) => line.includes("\u25cf"))).toBe(true);
+});
+
+test("output assembled elsewhere is printed inside the region's ownership, and unchanged without one", () => {
+	const order: string[] = [];
+	const region: LiveRegion = {
+		update: () => {},
+		flash: () => {},
+		warn: () => {},
+		suspend<T>(action: () => T): T {
+			order.push("erased");
+			try {
+				return action();
+			} finally {
+				order.push("repainted");
+			}
+		},
+		close: () => {}
+	};
+	// The evidence block and the measured report are written by their own code; what the presenter
+	// adds is the ownership: the region is taken down before the write and put back after it.
+	const withRegion = new Presenter(styled, { out: () => {}, live: region });
+	let printed = false;
+	expect(
+		withRegion.suspend(() => {
+			printed = true;
+			return "evidence";
+		})
+	).toBe("evidence");
+	expect(printed).toBe(true);
+	expect(order).toEqual(["erased", "repainted"]);
+
+	// A redirected or plain run has no region, so the write is the whole of it: no sequence, no
+	// extra call, and nothing that could fail for a reason of its own.
+	const writes: string[] = [];
+	const bare = new Presenter(plain, { out: (line) => void writes.push(line) });
+	expect(bare.suspend(() => "evidence")).toBe("evidence");
+	expect(writes).toEqual([]);
 });
