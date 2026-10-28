@@ -1,8 +1,33 @@
-# ytd
+# YTD
+
+> Distills YouTube channels into cited, deduplicated field notes.
+
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Bun](https://img.shields.io/badge/Bun-1.4-000000.svg)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)
 
 A local Bun/TypeScript terminal app: ingest a YouTube channel, playlist, video, or Short,
 extract useful wisdom, deduplicate it against the Mind Palace, apply the halal gate, and
-publish append-only field notes to the best-fit rooms.
+publish append-only field notes to the best-fit rooms. It runs your own installed coding-agent
+CLI (Claude, Codex, Pi, OpenCode, or a trusted custom command) with the model you choose — no
+API keys of its own, no hosted service, nothing deployed.
+
+Part of the [Dropout Studio tools](https://dropoutstudio.co/tools-apps), alongside
+[Day Zero](https://github.com/beyourahi/day-zero),
+[Order Processor](https://github.com/beyourahi/order-processor),
+[Invoice Generator](https://github.com/beyourahi/invoice-generator) and
+[Username Extractor](https://github.com/beyourahi/username-extractor).
+
+## Requirements
+
+- [Bun](https://bun.sh) 1.4+, [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), and Node.js (or
+  Deno) as yt-dlp's YouTube JavaScript runtime.
+- One installed, already-authenticated coding-agent CLI (see
+  [Agents and isolation](#agents-and-isolation)).
+- A Git-backed Mind Palace at `~/Desktop/mind-palace` with `content`, `craft`, `business` and
+  `design-systems` rooms and an executable `scripts/mind-palace-sync` publication script (see
+  [Recovery and publication](#recovery-and-publication)). YTD was built for one such palace;
+  the location and rooms live in `src/config.ts` if yours differs.
 
 ## Run
 
@@ -357,3 +382,17 @@ bun run lint
 TypeScript 7 checks source; TypeScript 6 supports ESLint compatibility. Keep that split.
 Tests use fake harnesses and temporary SQLite/Git repositories; real subscription/model and
 YouTube availability are separate live checks. There is no deploy target: this is a local CLI.
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for local setup, coding standards, and the commit and
+PR workflow. [AGENTS.md](./AGENTS.md) documents the architecture and the Palace contract for
+coding agents.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
+
+## Author
+
+**Rahi Khan** · [beyourahi.com](https://beyourahi.com) · [beyourahi@gmail.com](mailto:beyourahi@gmail.com)
