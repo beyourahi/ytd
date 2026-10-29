@@ -28,6 +28,8 @@ See README.md for user commands, recovery, settings, and isolation details. Pres
 - Ingestion reports total wall-clock runtime once after cleanup; progress and diagnostics use the
   sanitising presenter, with plain output for redirected or unsupported terminals.
 - `bun install --frozen-lockfile`, `bun test`, `bun run check`, `bun run lint` before landing.
+  `bun run bench` runs local synthetic benchmarks (`bench/`; compiled Rust kernels are untracked).
+- Terminal UI changes need the real-PTY suite (`test/ui-pty*.test.ts`), not only `test/ui.test.ts`.
 - Keep TypeScript 7 compiler / TypeScript 6 ESLint compatibility; no unrelated upgrades.
 - Tests use fake processes and temporary SQLite/Git fixtures; never publish test notes to Palace.
 
@@ -38,12 +40,17 @@ See README.md for user commands, recovery, settings, and isolation details. Pres
 - `agents.ts`: installed protocol restrictions/preflight, routing snapshots, output validation/discovery.
 - `opencode.ts`: isolated install/auth inspection, guided `opencode auth login`, provider grouping.
 - `process.ts`: concurrent stdout/stderr, owned process cancellation/timeouts, exit checking.
-- `ui.ts` / `progress.ts` / `metrics.ts`: terminal presentation, progress and session timing.
+- `ui.ts` / `progress.ts` / `metrics.ts`: append-only presenter, progress/outcome, session timing.
+- `dashboard.ts`: live bottom-of-screen region — the only module that writes control sequences;
+  all other output goes through its `suspend`.
+- `text.ts`: shared terminal sanitising and column width (no imports, no presentation policy).
 - `enumerate.ts`: validated hostname/path parsing, playlists, actual creators, collision-safe identities.
 - `discovery.ts`: staged streaming listing log (`<slug>.list.partial` → `<slug>.list.jsonl`), batch reads.
 - `fetch.ts`: paced captions/description/pinned comments, tolerant parsers and atomic global video caches.
 - `transcribe.ts`: optional local whisper.cpp transcription — opt-in, provider-neutral, cached, labelled.
 - `pipeline.ts` / `scheduler.ts` / `limits.ts`: durable job queue, stage checkpoints, concurrency leases.
+- `concurrency.ts`: bounded pools/queues; results keyed by input index, first failure stops work.
+- `claims.ts`: cross-session identity claims and bounded waits (`ClaimWaitTimeout`), legacy lock.
 - `manifest.ts`: SQLite transactions for runs, candidates, stages, migrations and publication receipts.
 - `distill.ts`: extraction/glean, complete validation, prompt budgeting, synthesis and cached shard comparisons.
 - `palace.ts`: deterministic rendering, canonical snapshots, locked append/publication and remote verification.
